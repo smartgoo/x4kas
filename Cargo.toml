@@ -30,6 +30,7 @@ kaspa-utils = { git = "https://github.com/kaspanet/rusty-kaspa.git", rev = "1011
 kaspa-wrpc-server = { git = "https://github.com/kaspanet/rusty-kaspa.git", rev = "10116df" }
 log = "0.4"
 log4rs = { version = "1.2", features = ["all_components", "gzip", "background_rotation"] }
+eframe = "0.33"
 
 # Patch workflow-perf-monitor for macOS 15+ compatibility (opaque malloc_zone_t)
 [patch.crates-io]

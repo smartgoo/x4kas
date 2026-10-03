@@ -175,6 +175,11 @@ impl Tab {
             Tab::IntegratedNode => "6:Node",
         }
     }
+
+    /// Title without the numeric shortcut prefix.
+    pub fn label(&self) -> &'static str {
+        self.title().split_once(':').map_or(self.title(), |(_, name)| name)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -631,6 +636,13 @@ mod tests {
         assert_eq!(Tab::Analytics.title(), "4:Analytics");
         assert_eq!(Tab::RpcExplorer.title(), "5:RPC Cmds");
         assert_eq!(Tab::IntegratedNode.title(), "6:Node");
+    }
+
+    #[test]
+    fn tab_labels_strip_shortcut_prefix() {
+        assert_eq!(Tab::Dashboard.label(), "Dashboard");
+        assert_eq!(Tab::RpcExplorer.label(), "RPC Cmds");
+        assert_eq!(Tab::IntegratedNode.label(), "Node");
     }
 
     #[test]

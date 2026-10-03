@@ -1,7 +1,7 @@
 use clap::Parser;
 
 #[derive(Parser, Debug, Clone)]
-#[command(name = "tui4kas", version, about = "Terminal UI for Kaspa L1")]
+#[command(name = "tui4kas", version, about = "Desktop monitor for Kaspa L1")]
 pub struct CliArgs {
     /// wRPC endpoint URL (e.g., ws://127.0.0.1:17110).
     /// If omitted, connects via Kaspa Public Node Network Resolver.
@@ -15,6 +15,10 @@ pub struct CliArgs {
     /// Auto-refresh interval in milliseconds
     #[arg(short = 'r', long, default_value = "1000")]
     pub refresh_interval_ms: u64,
+
+    /// Run the legacy terminal UI instead of the GUI
+    #[arg(long)]
+    pub tui: bool,
 }
 
 #[cfg(test)]
@@ -27,6 +31,7 @@ mod tests {
         assert_eq!(args.url, None);
         assert_eq!(args.network, "mainnet");
         assert_eq!(args.refresh_interval_ms, 1000);
+        assert!(!args.tui);
     }
 
     #[test]

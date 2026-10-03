@@ -134,16 +134,16 @@ impl From<RpcFeeEstimate> for FeeEstimateInfo {
             priority_feerate: r.priority_bucket.feerate,
             normal_feerate: r.normal_buckets.first().map(|b| b.feerate),
             low_feerate: r.low_buckets.first().map(|b| b.feerate),
-            priority_bucket: format!("{:.8} KAS/gram", r.priority_bucket.feerate / 1e8),
+            priority_bucket: format!("{:.2} sompi/gram", r.priority_bucket.feerate),
             normal_buckets: r
                 .normal_buckets
                 .iter()
-                .map(|b| format!("{:.8} KAS/gram", b.feerate / 1e8))
+                .map(|b| format!("{:.2} sompi/gram", b.feerate))
                 .collect(),
             low_buckets: r
                 .low_buckets
                 .iter()
-                .map(|b| format!("{:.8} KAS/gram", b.feerate / 1e8))
+                .map(|b| format!("{:.2} sompi/gram", b.feerate))
                 .collect(),
         }
     }
@@ -369,12 +369,12 @@ mod tests {
             low_buckets: vec![],
         };
         let info: FeeEstimateInfo = estimate.into();
-        assert_eq!(info.priority_bucket, "1.00000000 KAS/gram");
+        assert_eq!(info.priority_bucket, "100000000.00 sompi/gram");
         assert_eq!(info.priority_feerate, 100_000_000.0);
         assert_eq!(info.normal_feerate, Some(50_000_000.0));
         assert_eq!(info.low_feerate, None);
         assert_eq!(info.normal_buckets.len(), 1);
-        assert_eq!(info.normal_buckets[0], "0.50000000 KAS/gram");
+        assert_eq!(info.normal_buckets[0], "50000000.00 sompi/gram");
         assert!(info.low_buckets.is_empty());
     }
 

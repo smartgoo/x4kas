@@ -1,6 +1,13 @@
 //! egui/eframe desktop frontend.
 
+mod analytics;
+mod blockdag;
+mod dashboard;
+mod mempool;
+mod node;
+mod rpc_explorer;
 mod theme;
+mod widgets;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -121,10 +128,13 @@ impl eframe::App for GuiApp {
 
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| top_bar(ui, &mut app));
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading(app.active_tab.label());
-            ui.separator();
-            ui.label(RichText::new("Coming soon in the GUI. Run with --tui for the full view.").weak());
+        egui::CentralPanel::default().show(ctx, |ui| match app.active_tab {
+            Tab::Dashboard => dashboard::show(ui, &app),
+            Tab::Mempool => mempool::show(ui, &mut app),
+            Tab::RpcExplorer => rpc_explorer::show(ui, &mut app, &self.cmd_tx),
+            Tab::IntegratedNode => node::show(ui, &mut app, &self.cmd_tx),
+            Tab::Analytics => analytics::show(ui, &mut app),
+            Tab::BlockDag => blockdag::show(ui, &mut app, &self.cmd_tx),
         });
 
         if self.is_shutting_down() {

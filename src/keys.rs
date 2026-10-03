@@ -3,7 +3,6 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use crate::app::{App, DagFocus, DaemonStatus, IntegratedNodeState, Tab};
 use crate::config::DaemonConfig;
 use crate::controller::{CommandSender, UiCommand};
-use crate::rpc::types::sompi_to_kas;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigField {
@@ -325,19 +324,7 @@ pub fn handle_mempool_keys(app: &mut App, key: KeyCode) {
             }
         }
         KeyCode::Enter => {
-            if let Some(ref mempool) = app.node.mempool_state
-                && app.mempool_selected < mempool.entries.len()
-            {
-                let entry = &mempool.entries[app.mempool_selected];
-                let detail = format!(
-                    "Transaction ID: {}\nFee: {:.8} KAS ({} sompi)\nOrphan: {}",
-                    entry.transaction_id,
-                    sompi_to_kas(entry.fee),
-                    entry.fee,
-                    if entry.is_orphan { "Yes" } else { "No" },
-                );
-                app.mempool_detail = Some(detail);
-            }
+            app.open_mempool_detail(app.mempool_selected);
         }
         _ => {}
     }
@@ -475,17 +462,10 @@ pub fn handle_analytics_keys(app: &mut App, key: KeyCode) {
         }
         // Cycle time window for focused panel
         KeyCode::Char('t') => {
-            app.analytics.time_windows[app.analytics.focus].cycle();
-            // Refresh the cached view for this panel immediately
-            if let Some(ref engine) = app.analytics.engine
-                && let Ok(eng) = engine.try_read()
-            {
-                let focus = app.analytics.focus;
-                let new_view = eng.get_view(app.analytics.time_windows[focus]);
-                if let Some(ref mut views) = app.analytics.cached_views {
-                    views[focus] = new_view;
-                }
-            }
+            let focus = app.analytics.focus;
+            let mut window = app.analytics.time_windows[focus];
+            window.cycle();
+            app.set_analytics_window(focus, window);
         }
         _ => {}
     }

@@ -599,6 +599,39 @@ impl App {
                 .is_some_and(|s| s.is_synced)
     }
 
+    /// Open the detail popup for the mempool entry at `index`, if it exists.
+    pub fn open_mempool_detail(&mut self, index: usize) {
+        let Some(entry) = self
+            .node
+            .mempool_state
+            .as_ref()
+            .and_then(|m| m.entries.get(index))
+        else {
+            return;
+        };
+        self.mempool_detail = Some(format!(
+            "Transaction ID: {}\nFee: {:.8} KAS ({} sompi)\nOrphan: {}",
+            entry.transaction_id,
+            sompi_to_kas(entry.fee),
+            entry.fee,
+            if entry.is_orphan { "Yes" } else { "No" },
+        ));
+    }
+
+    /// Change an analytics panel's time window and refresh its cached view immediately
+    /// (instead of waiting for the next streaming update).
+    pub fn set_analytics_window(&mut self, panel: usize, window: TimeWindow) {
+        self.analytics.time_windows[panel] = window;
+        if let Some(ref engine) = self.analytics.engine
+            && let Ok(eng) = engine.try_read()
+        {
+            let new_view = eng.get_view(window);
+            if let Some(ref mut views) = self.analytics.cached_views {
+                views[panel] = new_view;
+            }
+        }
+    }
+
     pub fn tab_index(&self) -> usize {
         Tab::all()
             .iter()
@@ -1132,5 +1165,36 @@ mod tests {
                 method
             );
         }
+    }
+
+    #[test]
+    fn open_mempool_detail_formats_entry_and_ignores_out_of_range() {
+        let mut app = App::new(DaemonConfig::default());
+        app.node.mempool_state = Some(MempoolState {
+            entry_count: 1,
+            entries: vec![MempoolEntryInfo {
+                transaction_id: "abc123".to_string(),
+                fee: 150_000_000,
+                is_orphan: true,
+            }],
+            total_fees: 150_000_000,
+        });
+
+        app.open_mempool_detail(5);
+        assert!(app.mempool_detail.is_none());
+
+        app.open_mempool_detail(0);
+        let detail = app.mempool_detail.as_deref().unwrap();
+        assert!(detail.contains("Transaction ID: abc123"));
+        assert!(detail.contains("1.50000000 KAS (150000000 sompi)"));
+        assert!(detail.contains("Orphan: Yes"));
+    }
+
+    #[test]
+    fn set_analytics_window_updates_window_without_engine() {
+        let mut app = App::new(DaemonConfig::default());
+        app.set_analytics_window(2, TimeWindow::TwentyFourHour);
+        assert_eq!(app.analytics.time_windows[2], TimeWindow::TwentyFourHour);
+        assert_eq!(app.analytics.time_windows[0], TimeWindow::OneMin);
     }
 }

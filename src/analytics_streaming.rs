@@ -9,7 +9,7 @@ use crate::config;
 use crate::polling::PollingHandles;
 use crate::rpc::client::RpcManager;
 
-/// Where the analytics engine is persisted (`~/.tui4kas/analytics_cache.bin`).
+/// Where the analytics engine is persisted (`~/.x4kas/analytics_cache.bin`).
 pub fn cache_path() -> PathBuf {
     config::data_dir().join("analytics_cache.bin")
 }

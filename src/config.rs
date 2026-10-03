@@ -3,11 +3,11 @@ use std::path::PathBuf;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-/// The app's data directory, `~/.tui4kas`.
+/// The app's data directory, `~/.x4kas`.
 pub fn data_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".tui4kas")
+        .join(".x4kas")
 }
 
 pub fn valid_networks() -> &'static [&'static str] {
@@ -25,7 +25,7 @@ pub enum ConnectionKind {
     Resolver,
 }
 
-/// The last-used connection choice, persisted at `~/.tui4kas/connection.toml`.
+/// The last-used connection choice, persisted at `~/.x4kas/connection.toml`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ConnectionSettings {

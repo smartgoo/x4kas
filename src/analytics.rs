@@ -667,7 +667,7 @@ mod tests {
             m.protocols.insert(TransactionProtocol::Krc, 1);
         }));
 
-        let dir = std::env::temp_dir().join("tui4kas_test_analytics");
+        let dir = std::env::temp_dir().join("x4kas_test_analytics");
         let path = dir.join("test_cache.bin");
         engine.save(&path).unwrap();
 

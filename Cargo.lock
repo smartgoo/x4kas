@@ -6254,28 +6254,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
 
 [[package]]
-name = "tui4kas"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bincode",
- "clap",
- "dirs",
- "eframe",
- "egui_extras",
- "egui_plot",
- "futures",
- "indexmap 2.13.0",
- "kaspa-rpc-core",
- "kaspa-wrpc-client",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
- "toml",
-]
-
-[[package]]
 name = "tungstenite"
 version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7910,6 +7888,28 @@ name = "x11rb-protocol"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ea6fc2961e4ef194dcbfe56bb845534d0dc8098940c7e5c012a258bfec6701bd"
+
+[[package]]
+name = "x4kas"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "clap",
+ "dirs",
+ "eframe",
+ "egui_extras",
+ "egui_plot",
+ "futures",
+ "indexmap 2.13.0",
+ "kaspa-rpc-core",
+ "kaspa-wrpc-client",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+]
 
 [[package]]
 name = "xcursor"

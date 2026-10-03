@@ -1,4 +1,4 @@
-# tui4kas - Kaspa Node Monitor
+# x4kas - Kaspa Node Monitor
 
 A native desktop app for monitoring Kaspa L1 nodes via wRPC, connecting to a node by URL or through the public resolver.
 
@@ -23,7 +23,7 @@ Built with [egui/eframe](https://github.com/emilk/egui) and [rusty-kaspa](https:
 
 ```bash
 cargo build --release
-./target/release/tui4kas
+./target/release/x4kas
 ```
 
 ### CLI Options
@@ -45,19 +45,19 @@ Click the connection status in the top bar to open the window again at any time.
 
 ```bash
 # Connect to a local node
-tui4kas --url ws://127.0.0.1:17110
+x4kas --url ws://127.0.0.1:17110
 
 # Connect to testnet with 2s refresh
-tui4kas --url ws://127.0.0.1:17210 --network testnet-10 --refresh-interval-ms 2000
+x4kas --url ws://127.0.0.1:17210 --network testnet-10 --refresh-interval-ms 2000
 
 # Pick a connection in the app (URL or public resolver)
-tui4kas
+x4kas
 ```
 
 ### Files
 
-- `~/.tui4kas/connection.toml`: last connection choice (URL, network, mode)
-- `~/.tui4kas/analytics_cache.bin`: analytics cache, saved on exit
+- `~/.x4kas/connection.toml`: last connection choice (URL, network, mode)
+- `~/.x4kas/analytics_cache.bin`: analytics cache, saved on exit
 
 ## Keyboard Shortcuts
 
@@ -82,7 +82,7 @@ src/
   app.rs                Shared App state (Arc<RwLock<App>>), tabs, command line
   controller.rs         UiCommand handling: connections, RPC calls, shutdown
   cli.rs                CLI argument parsing (clap)
-  config.rs             Saved connection choice (~/.tui4kas/connection.toml)
+  config.rs             Saved connection choice (~/.x4kas/connection.toml)
   polling.rs            RPC creation and background polling tasks
   analytics.rs          Chain analytics aggregation
   analytics_streaming.rs Analytics streaming task

@@ -1,4 +1,4 @@
-# tui4kas - Claude Code Instructions
+# x4kas - Claude Code Instructions
 
 ## Build & Check
 
@@ -12,7 +12,7 @@ cargo run -- --url ws://127.0.0.1:17110   # run against a node
 
 ## Architecture
 
-egui/eframe desktop GUI for monitoring a Kaspa L1 node via wRPC, connecting by URL or through the public resolver. (The name is historical; the Ratatui TUI was replaced by the GUI.)
+egui/eframe desktop GUI for monitoring a Kaspa L1 node via wRPC, connecting by URL or through the public resolver.
 
 ### Threading model
 
@@ -31,8 +31,8 @@ egui/eframe desktop GUI for monitoring a Kaspa L1 node via wRPC, connecting by U
 - `src/cli.rs`: clap args (`--url`, `--network`, `--refresh-interval-ms`).
 - `src/controller.rs`: the `UiCommand` enum, `RemoteTarget`, and the controller task. Owns the RPC manager and polling handles. Handles startup (`--url`, or idle with the connection window open), connect/disconnect, command-line execution, and shutdown.
 - `src/polling.rs`: `PollingHandles`, RPC creation (`create_and_start_rpc`) and mining polling.
-- `src/config.rs`: `data_dir()` (`~/.tui4kas`), `valid_networks()`, and `ConnectionSettings`/`ConnectionKind`, the last connection choice (`~/.tui4kas/connection.toml`).
-- `src/analytics.rs` / `src/analytics_streaming.rs`: chain analytics (per-chain-block `Metrics` rolled into 1m/10m buckets, `AggregatedView` per window) and its VSPC v2 streaming task (cache at `~/.tui4kas/analytics_cache.bin`, versioned by `CACHE_MAGIC`; bump it when the format changes). All data comes from the connected node.
+- `src/config.rs`: `data_dir()` (`~/.x4kas`), `valid_networks()`, and `ConnectionSettings`/`ConnectionKind`, the last connection choice (`~/.x4kas/connection.toml`).
+- `src/analytics.rs` / `src/analytics_streaming.rs`: chain analytics (per-chain-block `Metrics` rolled into 1m/10m buckets, `AggregatedView` per window) and its VSPC v2 streaming task (cache at `~/.x4kas/analytics_cache.bin`, versioned by `CACHE_MAGIC`; bump it when the format changes). All data comes from the connected node.
 - `src/tx_inspect.rs`: per-transaction classification, mirroring Kaspalytics: protocol detection, output script classes, covenant/introspection/ZK opcode scanning, coinbase node-version parsing.
 - `src/format.rs`: pure formatting helpers (`format_hashrate`, `format_usd`, `format_kas`, …).
 - `src/rpc/client.rs`: `RpcManager`. Connect, background polling, RPC execution, mining/analytics fetches, block lookup.

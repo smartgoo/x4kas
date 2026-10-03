@@ -1,7 +1,7 @@
 use clap::Parser;
 
 #[derive(Parser, Debug, Clone)]
-#[command(name = "tui4kas", version, about = "Desktop monitor for Kaspa L1")]
+#[command(name = "x4kas", version, about = "Desktop monitor for Kaspa L1")]
 pub struct CliArgs {
     /// wRPC endpoint URL (e.g., ws://127.0.0.1:17110).
     /// If omitted, choose a connection (URL or public resolver) in the app.
@@ -23,7 +23,7 @@ mod tests {
 
     #[test]
     fn cli_defaults() {
-        let args = CliArgs::parse_from(["tui4kas"]);
+        let args = CliArgs::parse_from(["x4kas"]);
         assert_eq!(args.url, None);
         assert_eq!(args.network, "mainnet");
         assert_eq!(args.refresh_interval_ms, 1000);
@@ -32,7 +32,7 @@ mod tests {
     #[test]
     fn cli_custom_values() {
         let args = CliArgs::parse_from([
-            "tui4kas",
+            "x4kas",
             "--url",
             "ws://127.0.0.1:17110",
             "--network",
@@ -48,7 +48,7 @@ mod tests {
     #[test]
     fn cli_short_flags() {
         let args = CliArgs::parse_from([
-            "tui4kas",
+            "x4kas",
             "-u",
             "ws://localhost:17110",
             "-n",

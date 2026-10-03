@@ -6,7 +6,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  BINARY_NAME: tui4kas
+  BINARY_NAME: x4kas
 
 permissions:
   contents: write

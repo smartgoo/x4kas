@@ -27,7 +27,7 @@ pub fn start_market_polling(app_state: Arc<RwLock<App>>, interval: Duration) {
     tokio::spawn(async move {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
-            .user_agent("tui4kas")
+            .user_agent("x4kas")
             .build()
             .unwrap();
         let mut ticker = tokio::time::interval(interval);

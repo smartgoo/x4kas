@@ -62,7 +62,7 @@ pub fn run(rt: &tokio::runtime::Runtime, args: CliArgs) -> Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("tui4kas")
+            .with_title("x4kas")
             .with_inner_size([1280.0, 820.0])
             .with_min_inner_size([800.0, 500.0])
             // macOS: hide the title bar and draw under it, so the window buttons sit on
@@ -74,7 +74,7 @@ pub fn run(rt: &tokio::runtime::Runtime, args: CliArgs) -> Result<()> {
     };
 
     eframe::run_native(
-        "tui4kas",
+        "x4kas",
         options,
         Box::new(move |cc| {
             theme::apply(&cc.egui_ctx);
@@ -312,11 +312,10 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App, show_help: &mut bool) {
     });
 }
 
-/// `$ tui4kas`
+/// `x4kas`, with the 4 accented.
 fn brand(ui: &mut egui::Ui) {
     ui.spacing_mut().item_spacing.x = 0.0;
-    ui.label(RichText::new("$ ").color(theme::TEXT_DIM).size(15.0));
-    ui.label(RichText::new("tui").color(theme::TEXT_BRIGHT).size(15.0));
+    ui.label(RichText::new("x").color(theme::TEXT_BRIGHT).size(15.0));
     ui.label(RichText::new("4").color(theme::ACCENT_BRIGHT).size(15.0));
     ui.label(RichText::new("kas").color(theme::TEXT_BRIGHT).size(15.0));
 }

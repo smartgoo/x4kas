@@ -73,7 +73,7 @@ impl From<RpcMempoolEntry> for MempoolEntryInfo {
             .verbose_data
             .as_ref()
             .map(|v| v.transaction_id.to_string())
-            .unwrap_or_else(|| format!("mass:{}", e.transaction.mass));
+            .unwrap_or_else(|| format!("mass:{}", e.transaction.storage_mass));
         Self {
             transaction_id,
             fee: e.fee,
@@ -321,7 +321,7 @@ mod tests {
             subnetwork_id: RpcSubnetworkId::from_byte(0),
             gas: 0,
             payload: vec![],
-            mass: 42,
+            storage_mass: 42,
             verbose_data,
         }
     }

@@ -6,8 +6,8 @@ edition = "2024"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-kaspa-rpc-core = { git = "https://github.com/kaspanet/rusty-kaspa.git", rev = "10116df" }
-kaspa-wrpc-client = { git = "https://github.com/kaspanet/rusty-kaspa.git", rev = "10116df" }
+kaspa-rpc-core = { git = "https://github.com/kaspanet/rusty-kaspa.git", rev = "01b532e" }
+kaspa-wrpc-client = { git = "https://github.com/kaspanet/rusty-kaspa.git", rev = "01b532e" }
 serde = { version = "1", features = ["derive"] }
 reqwest = { version = "0.12", features = ["json"] }
 tokio = { version = "1", features = ["full"] }
@@ -18,11 +18,11 @@ futures = "0.3"
 indexmap = { version = "2", features = ["serde"] }
 
 # Integrated node dependencies
-kaspad-lib = { git = "https://github.com/kaspanet/rusty-kaspa.git", rev = "10116df", package = "kaspad" }
-kaspa-core = { git = "https://github.com/kaspanet/rusty-kaspa.git", rev = "10116df" }
-kaspa-rpc-service = { git = "https://github.com/kaspanet/rusty-kaspa.git", rev = "10116df" }
-kaspa-utils = { git = "https://github.com/kaspanet/rusty-kaspa.git", rev = "10116df" }
-kaspa-wrpc-server = { git = "https://github.com/kaspanet/rusty-kaspa.git", rev = "10116df" }
+kaspad-lib = { git = "https://github.com/kaspanet/rusty-kaspa.git", rev = "01b532e", package = "kaspad" }
+kaspa-core = { git = "https://github.com/kaspanet/rusty-kaspa.git", rev = "01b532e" }
+kaspa-rpc-service = { git = "https://github.com/kaspanet/rusty-kaspa.git", rev = "01b532e" }
+kaspa-utils = { git = "https://github.com/kaspanet/rusty-kaspa.git", rev = "01b532e" }
+kaspa-wrpc-server = { git = "https://github.com/kaspanet/rusty-kaspa.git", rev = "01b532e" }
 log = "0.4"
 log4rs = { version = "1.2", features = ["all_components", "gzip", "background_rotation"] }
 eframe = "0.33"
@@ -31,7 +31,3 @@ egui_plot = "0.34"
 
 [dev-dependencies]
 serde_json = "1"
-
-# Patch workflow-perf-monitor for macOS 15+ compatibility (opaque malloc_zone_t)
-[patch.crates-io]
-workflow-perf-monitor = { path = "patches/workflow-perf-monitor" }

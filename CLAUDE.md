@@ -54,8 +54,8 @@ egui/eframe desktop GUI for monitoring a Kaspa L1 node via wRPC, with an optiona
 ### Dependencies
 
 - `eframe` / `egui_extras` 0.33, `egui_plot` 0.34. Upgrade them in lockstep; import egui as `eframe::egui`.
-- Kaspa crates (`kaspa-rpc-core`, `kaspa-wrpc-client`, `kaspad`, …) pinned to git rev `10116df`.
-- `reqwest` for CoinGecko; `[patch.crates-io]` patches `workflow-perf-monitor` for macOS 15+.
+- Kaspa crates (`kaspa-rpc-core`, `kaspa-wrpc-client`, `kaspad`, …) pinned to git rev `01b532e` (rusty-kaspa v2.1.0). Bump all of them together.
+- `reqwest` for CoinGecko.
 - Rust edition 2024. Let-chains are fine, and clippy prefers them over nested `if let`.
 
 ## Conventions

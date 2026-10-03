@@ -2,7 +2,12 @@
 name = "x4kas"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.91"
 license = "MIT"
+description = "Desktop GUI for monitoring Kaspa L1 nodes over wRPC"
+repository = "https://github.com/smartgoo/x4kas"
+readme = "README.md"
+publish = false
 
 [dependencies]
 anyhow = "1"

@@ -10,10 +10,12 @@ mod polling;
 mod rpc;
 mod tx_inspect;
 
+use std::time::Duration;
+
 use anyhow::Result;
 use clap::Parser;
 
-use crate::cli::CliArgs;
+use crate::cli::{CliArgs, Command};
 
 fn main() -> Result<()> {
     let args = CliArgs::parse();
@@ -24,5 +26,13 @@ fn main() -> Result<()> {
         .enable_all()
         .build()?;
 
-    gui::run(&rt, args)
+    match args.command.clone() {
+        Some(Command::Rpc { timeout, call }) => rt.block_on(cli::rpc::run(
+            args.url.as_deref(),
+            &args.network,
+            Duration::from_secs(timeout),
+            call,
+        )),
+        None => gui::run(&rt, args),
+    }
 }

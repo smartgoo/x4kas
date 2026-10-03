@@ -1,20 +1,41 @@
-use clap::Parser;
+pub mod rpc;
+
+use clap::{Parser, Subcommand};
+
+use crate::cli::rpc::RpcCall;
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "x4kas", version, about = "Desktop monitor for Kaspa L1")]
 pub struct CliArgs {
     /// wRPC endpoint URL (e.g., ws://127.0.0.1:17110).
-    /// If omitted, choose a connection (URL or public resolver) in the app.
-    #[arg(short, long)]
+    /// If omitted, the GUI lets you choose a connection and CLI commands use the public resolver.
+    #[arg(short, long, global = true)]
     pub url: Option<String>,
 
     /// Network: mainnet, testnet-10, testnet-11
-    #[arg(short, long, default_value = "mainnet")]
+    #[arg(short, long, default_value = "mainnet", global = true)]
     pub network: String,
 
     /// Auto-refresh interval in milliseconds
     #[arg(short = 'r', long, default_value = "1000")]
     pub refresh_interval_ms: u64,
+
+    /// Run a command and exit instead of opening the GUI.
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum Command {
+    /// Run a read-only RPC method (the RPC Cmds tab) and print its JSON response
+    Rpc {
+        /// Connect timeout in seconds
+        #[arg(short, long, default_value = "20", global = true)]
+        timeout: u64,
+
+        #[command(subcommand)]
+        call: RpcCall,
+    },
 }
 
 #[cfg(test)]
@@ -27,6 +48,7 @@ mod tests {
         assert_eq!(args.url, None);
         assert_eq!(args.network, "mainnet");
         assert_eq!(args.refresh_interval_ms, 1000);
+        assert!(args.command.is_none());
     }
 
     #[test]

@@ -61,12 +61,27 @@ x4kas --url ws://127.0.0.1:17210 --network testnet-10 --refresh-interval-ms 2000
 x4kas
 ```
 
+### RPC Commands
+
+Every method in the **RPC Cmds** tab can also be run from the command line. It connects, prints the JSON response to stdout and exits, with a nonzero exit code on error. Without `--url` it goes through the public resolver.
+
+```bash
+x4kas rpc --help                      # list all methods
+x4kas rpc get_block --help            # a method's arguments and defaults
+x4kas rpc get_block_dag_info --url ws://127.0.0.1:17110
+x4kas rpc get_block <hash> false      # optional arguments are positional
+x4kas rpc get_balances_by_addresses kaspa:qa… kaspa:qb…   # lists: separate words or commas
+x4kas rpc get_sink -n testnet-10 -u ws://127.0.0.1:17210 -t 5   # -t: connect timeout (s), default 20
+```
+
+Responses are never truncated (the GUI cuts them at 1 MB).
+
 ### Network Access
 
 Besides the node you connect to, x4kas contacts:
 
 - the CoinGecko API every 60s for market data ([data provided by CoinGecko](https://www.coingecko.com/en/api))
-- the public Kaspa resolver, only when you choose it
+- the public Kaspa resolver, only when you choose it (or run `x4kas rpc` without `--url`)
 
 ### Files
 

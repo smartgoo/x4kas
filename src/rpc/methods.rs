@@ -106,6 +106,28 @@ impl RpcMethod {
             })
             .collect()
     }
+
+    /// `resolve_args`, then check each argument parses as its kind, so bad input is
+    /// reported before connecting. Choice and text values are checked by the call itself.
+    pub fn validate_args(&self, args: &[String]) -> Result<Vec<String>> {
+        let args = self.resolve_args(args)?;
+        for (p, a) in self.params.iter().zip(&args) {
+            if a.is_empty() {
+                continue;
+            }
+            match p.kind {
+                ParamKind::Hash => parse_hash(a).map(drop),
+                ParamKind::Address => parse_address(a).map(drop),
+                ParamKind::Addresses => parse_addresses(a).map(drop),
+                ParamKind::Number => parse_u64(a).map(drop),
+                ParamKind::Numbers => parse_u64_list(a).map(drop),
+                ParamKind::Bool => parse_bool(a).map(drop),
+                ParamKind::Text | ParamKind::Choice(_) => Ok(()),
+            }
+            .map_err(|e| anyhow!("<{}>: {e}", p.name))?;
+        }
+        Ok(args)
+    }
 }
 
 const fn req(name: &'static str, kind: ParamKind) -> RpcParam {
@@ -477,6 +499,25 @@ mod tests {
             m.resolve_args(&args(&[ADDR, ADDR, "true", "false"]))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn validate_args_checks_kinds() {
+        let m = find("get_block").unwrap();
+        assert_eq!(
+            m.validate_args(&args(&[HASH])).unwrap(),
+            args(&[HASH, "true"])
+        );
+        assert!(
+            m.validate_args(&args(&["nothex"]))
+                .unwrap_err()
+                .to_string()
+                .contains("<hash>")
+        );
+        assert!(m.validate_args(&args(&[HASH, "maybe"])).is_err());
+        let m = find("get_virtual_chain_from_block_v2").unwrap();
+        assert!(m.validate_args(&args(&[HASH])).is_ok());
+        assert!(m.validate_args(&args(&[HASH, "low", "x"])).is_err());
     }
 
     #[test]

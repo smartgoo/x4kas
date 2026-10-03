@@ -8,6 +8,7 @@ cargo fmt                # format (CI runs `cargo fmt --all -- --check`)
 cargo clippy --all-targets -- -D warnings  # lint incl. tests (treat warnings as errors)
 cargo test               # run test suite (100+ tests)
 cargo run -- --url ws://127.0.0.1:17110   # run against a node
+cargo run -- rpc get_info                 # one-shot RPC call (public resolver without --url)
 ```
 
 ## Architecture
@@ -26,16 +27,17 @@ egui/eframe desktop GUI for monitoring a Kaspa L1 node via wRPC, connecting by U
 
 ### Module Layout
 
-- `src/main.rs`: entry point. Parses CLI, builds the runtime, calls `gui::run`.
+- `src/main.rs`: entry point. Parses CLI, builds the runtime, then runs a CLI subcommand (`block_on`) or calls `gui::run`.
 - `src/app.rs`: central state, free of GUI types so the CLI can share it. `App`, `Tab` (5 tabs), `RpcExplorerState`, `DagVisualizer`, `DagSelection`, analytics state (`TimeWindow`, `AnalyticsPanel` windows), and `mark_dirty()`.
-- `src/cli.rs`: clap args (`--url`, `--network`, `--refresh-interval-ms`).
+- `src/cli/mod.rs`: clap args (`--url`, `--network` (both global), `--refresh-interval-ms`) and the `Command` subcommands that run headless and exit instead of opening the GUI.
+- `src/cli/rpc.rs`: `x4kas rpc <method> [args…]`. `RpcCall` implements clap's `Subcommand` by hand, generating one subcommand per `RPC_METHODS` entry (positional args; a trailing list takes several words), so the CLI and RPC Cmds tab never drift. `run` validates args (`RpcMethod::validate_args`), connects (`RpcManager::connect_once`; resolver attempts retry until `--timeout`, since it sometimes hands out a dead node), and prints `rpc_json` untruncated.
 - `src/controller.rs`: the `UiCommand` enum, `RemoteTarget`, and the controller task. Owns the RPC manager and polling handles. Handles startup (`--url`, or idle with the connection window open), connect/disconnect, RPC execution, and shutdown.
 - `src/polling.rs`: `PollingHandles` (task handles plus a `JoinSet` of one-off requests), RPC creation (`create_and_start_rpc`) and hashrate polling.
 - `src/config.rs`: `data_dir()` (`~/.x4kas`), `valid_networks()`, and `ConnectionSettings`/`ConnectionKind`, the last connection choice (`~/.x4kas/connection.toml`).
 - `src/analytics.rs` / `src/analytics_streaming.rs`: chain analytics (`summarize_chain_blocks` turns VSPC v2 responses into per-chain-block `Metrics`, incl. miners from coinbases; rolled into 1m/10m buckets; `AggregatedView` per window) and its VSPC v2 streaming task (cache at `~/.x4kas/analytics_cache.bin`, versioned by `CACHE_MAGIC`; bump it when the format changes). The task reports its progress in `app.analytics.status` (`AnalyticsStatus`/`AnalyticsPhase`), waits for a connected, synced node, and retries failed requests instead of exiting. All data comes from the connected node.
 - `src/tx_inspect.rs`: per-transaction classification, mirroring Kaspalytics: protocol detection, output script classes, covenant/introspection/ZK opcode scanning, coinbase node-version parsing.
 - `src/format.rs`: pure formatting helpers shared by GUI and CLI (`format_number`, `format_kas`, `sompi_to_kas`, `format_hashrate`, `format_usd`, `format_duration`, explorer URLs, `now_ms`). Show KAS amounts with `format_kas`.
-- `src/rpc/client.rs`: `RpcManager`. Connect, background polling, the `BlockAdded` stream that feeds the DAG visualizer (`stream_blocks`, joined with polling in the `handles.node` task, resubscribing on every connect), RPC execution (`execute_rpc_call`, also used for Block Info's `get_block`), hashrate estimate, VSPC v2 fetches.
+- `src/rpc/client.rs`: `RpcManager`. Connect (`connect` retries forever for the GUI; `connect_once` fails fast for the CLI), background polling, the `BlockAdded` stream that feeds the DAG visualizer (`stream_blocks`, joined with polling in the `handles.node` task, resubscribing on every connect), RPC execution (`rpc_json` returns the full response; `execute_rpc_call` truncates it for the GUI and is also used for Block Info's `get_block`), hashrate estimate, VSPC v2 fetches.
 - `src/rpc/market.rs`: CoinGecko market polling (every 60s).
 - `src/rpc/methods.rs`: `RPC_METHODS` catalog (name, description, typed params with defaults), `resolve_args`, and argument parsers.
 - `src/rpc/hash_links.rs`: finds block hashes (by field name) in JSON responses so the result viewer can link them to `get_block`.
@@ -71,4 +73,4 @@ egui/eframe desktop GUI for monitoring a Kaspa L1 node via wRPC, connecting by U
 - Use `theme::*` colors and `widgets::*` helpers for a consistent look; never hard-code `Color32`s in views. Labels use `.weak()`. All text is already monospace, so don't add `.monospace()`.
 - Shortcuts are ignored while a text field or the terminal has focus (`ctx.wants_keyboard_input()`, `TerminalPane::has_focus`), except Ctrl+`.
 - Shortcuts: `1`–`5` tabs, Ctrl+Tab / Ctrl+Shift+Tab cycle, `p` pause, Ctrl+` terminal, `?`/F1 help, Esc closes popups.
-- 36 read-only RPC methods (listed in `rpc/methods.rs`) are available in the RPC Cmds tab (lists are comma-separated). Responses are pretty-printed JSON (`to_json`; wrap bare values in a `json!` object). To add one, add it to `RPC_METHODS` and a match arm in `RpcManager::execute_rpc_call`; a test checks every method has an arm. State-changing calls (`submit_*`, `add_peer`, `ban`/`unban`, `resolve_finality_conflict`, `shutdown`) are intentionally not exposed.
+- 36 read-only RPC methods (listed in `rpc/methods.rs`) are available in the RPC Cmds tab and as `x4kas rpc <method>` (lists are comma-separated). Responses are pretty-printed JSON (`to_json`; wrap bare values in a `json!` object). To add one, add it to `RPC_METHODS` and a match arm in `RpcManager::rpc_json`; a test checks every method has an arm. It then appears in the CLI (`x4kas rpc <method>`) automatically. State-changing calls (`submit_*`, `add_peer`, `ban`/`unban`, `resolve_finality_conflict`, `shutdown`) are intentionally not exposed.

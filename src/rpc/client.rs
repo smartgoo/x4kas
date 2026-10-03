@@ -40,7 +40,21 @@ impl RpcManager {
     /// Connect, recording the outcome in `connection_status` (the controller has already
     /// set it to `Connecting`).
     pub async fn connect(&self) -> Result<()> {
-        match self.client.connect(None).await {
+        self.connect_with(None).await
+    }
+
+    /// Connect once, failing after `timeout` instead of retrying (for one-shot CLI calls).
+    pub async fn connect_once(&self, timeout: Duration) -> Result<()> {
+        self.connect_with(Some(ConnectOptions {
+            strategy: ConnectStrategy::Fallback,
+            connect_timeout: Some(timeout),
+            ..Default::default()
+        }))
+        .await
+    }
+
+    async fn connect_with(&self, options: Option<ConnectOptions>) -> Result<()> {
+        match self.client.connect(options).await {
             Ok(_) => {
                 let mut app = self.app_state.write().await;
                 app.node.connection_status = ConnectionStatus::Connected;
@@ -209,15 +223,17 @@ impl RpcManager {
         }
     }
 
-    /// Run a read-only RPC method from the RPC Cmds tab. Missing or
-    /// empty arguments take the defaults declared in `methods::RPC_METHODS`.
+    /// Run a read-only RPC method from the RPC Cmds tab, truncating long responses so
+    /// the result viewer stays responsive.
     pub async fn execute_rpc_call(&self, method: &str, args: &[String]) -> Result<String> {
-        let spec = methods::find(method).ok_or_else(|| {
-            anyhow::anyhow!(
-                "Unknown command: '{}'. Type 'help' for available commands.",
-                method
-            )
-        })?;
+        Ok(truncate_response(self.rpc_json(method, args).await?))
+    }
+
+    /// Run a read-only RPC method and return its full pretty-printed JSON response.
+    /// Missing or empty arguments take the defaults declared in `methods::RPC_METHODS`.
+    pub async fn rpc_json(&self, method: &str, args: &[String]) -> Result<String> {
+        let spec = methods::find(method)
+            .ok_or_else(|| anyhow::anyhow!("Unknown RPC method: '{}'", method))?;
         let args = spec.resolve_args(args)?;
         let arg = |i: usize| args[i].as_str();
         let c = &self.client;
@@ -351,7 +367,7 @@ impl RpcManager {
             }))?,
             _ => anyhow::bail!("No handler for RPC method '{}'", method),
         };
-        Ok(truncate_response(out))
+        Ok(out)
     }
 
     /// Network hashrate (hashes per second) estimated over the last 1000 blocks.
@@ -416,18 +432,18 @@ mod tests {
     use super::{MAX_RESPONSE_CHARS, truncate_response};
     use crate::rpc::methods::RPC_METHODS;
 
-    /// Every method in `RPC_METHODS` must have a match arm in `execute_rpc_call`.
+    /// Every method in `RPC_METHODS` must have a match arm in `rpc_json`.
     /// Checked against the source so a missing arm fails without a live node.
     #[test]
     fn all_rpc_methods_have_handler() {
         let src = include_str!("client.rs");
-        let start = src.find("pub async fn execute_rpc_call").unwrap();
+        let start = src.find("pub async fn rpc_json").unwrap();
         let end = start + src[start..].find("No handler for RPC method").unwrap();
         let body = &src[start..end];
         for m in RPC_METHODS {
             assert!(
                 body.contains(&format!("\"{}\" =>", m.name)),
-                "RPC method '{}' has no handler in execute_rpc_call",
+                "RPC method '{}' has no handler in rpc_json",
                 m.name
             );
         }

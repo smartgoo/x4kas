@@ -111,13 +111,6 @@ pub fn start_analytics_streaming(
                         .max()
                         .unwrap_or(0);
 
-                    // Snapshot time windows before acquiring engine lock
-                    // to avoid holding both locks simultaneously
-                    let time_windows = {
-                        let app_guard = app.read().await;
-                        app_guard.analytics.time_windows
-                    };
-
                     // Process blocks and compute views under engine write lock
                     let (reorg_msg, sync_progress, cached_views) = {
                         let mut eng = engine.write().await;
@@ -159,13 +152,7 @@ pub fn start_analytics_streaming(
                             None
                         };
 
-                        let cached_views = [
-                            eng.get_view(time_windows[0]),
-                            eng.get_view(time_windows[1]),
-                            eng.get_view(time_windows[2]),
-                            eng.get_view(time_windows[3]),
-                            eng.get_view(time_windows[4]),
-                        ];
+                        let cached_views = eng.views(now_ms);
 
                         (reorg_msg, sync_progress, cached_views)
                     }; // engine lock released

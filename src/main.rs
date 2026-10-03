@@ -9,6 +9,7 @@ mod daemon_lifecycle;
 mod format;
 mod gui;
 mod rpc;
+mod tx_inspect;
 
 use anyhow::Result;
 use clap::Parser;

@@ -119,6 +119,10 @@ impl From<GetCoinSupplyResponse> for CoinSupplyInfo {
 
 #[derive(Debug, Clone)]
 pub struct FeeEstimateInfo {
+    /// Fee rates in sompi/gram: priority, first normal and first low bucket.
+    pub priority_feerate: f64,
+    pub normal_feerate: Option<f64>,
+    pub low_feerate: Option<f64>,
     pub priority_bucket: String,
     pub normal_buckets: Vec<String>,
     pub low_buckets: Vec<String>,
@@ -127,6 +131,9 @@ pub struct FeeEstimateInfo {
 impl From<RpcFeeEstimate> for FeeEstimateInfo {
     fn from(r: RpcFeeEstimate) -> Self {
         Self {
+            priority_feerate: r.priority_bucket.feerate,
+            normal_feerate: r.normal_buckets.first().map(|b| b.feerate),
+            low_feerate: r.low_buckets.first().map(|b| b.feerate),
             priority_bucket: format!("{:.8} KAS/gram", r.priority_bucket.feerate / 1e8),
             normal_buckets: r
                 .normal_buckets
@@ -363,6 +370,9 @@ mod tests {
         };
         let info: FeeEstimateInfo = estimate.into();
         assert_eq!(info.priority_bucket, "1.00000000 KAS/gram");
+        assert_eq!(info.priority_feerate, 100_000_000.0);
+        assert_eq!(info.normal_feerate, Some(50_000_000.0));
+        assert_eq!(info.low_feerate, None);
         assert_eq!(info.normal_buckets.len(), 1);
         assert_eq!(info.normal_buckets[0], "0.50000000 KAS/gram");
         assert!(info.low_buckets.is_empty());

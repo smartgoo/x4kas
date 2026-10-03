@@ -1,24 +1,29 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
 use futures::stream::{self, StreamExt};
 use kaspa_rpc_core::api::rpc::RpcApi;
-use kaspa_rpc_core::{GetVirtualChainFromBlockV2Response, RpcDataVerbosityLevel, RpcHash};
+use kaspa_rpc_core::{
+    GetVirtualChainFromBlockV2Response, RpcDataVerbosityLevel, RpcHash, RpcOptionalTransaction,
+};
 use kaspa_wrpc_client::prelude::*;
 use serde::Serialize;
 use serde_json::json;
 use std::str::FromStr;
 use tokio::sync::RwLock;
 
-use crate::analytics::{BlockSummary, detect_protocol};
+use crate::analytics::{BlockSummary, Metrics};
 use crate::app::{App, ConnectionStatus};
 use crate::rpc::methods::{
     self, parse_address, parse_addresses, parse_bool, parse_hash, parse_opt_u64,
     parse_subnetwork_id, parse_u64, parse_u64_list, parse_verbosity,
 };
 use crate::rpc::types::{shorten_address, sompi_to_kas};
+use crate::tx_inspect::{
+    OpcodeUsage, ScriptClass, coinbase_node_version, detect_protocol, output_script_opcodes,
+    redeem_script_opcodes, script_class,
+};
 
 pub struct RpcManager {
     client: Arc<KaspaRpcClient>,
@@ -455,94 +460,25 @@ impl RpcManager {
             .map(|h| h.to_string())
             .collect();
 
-        let mut summaries = Vec::new();
-
-        for chain_block in response.chain_block_accepted_transactions.iter() {
-            let header = &chain_block.chain_block_header;
-            let hash = header.hash.map(|h| h.to_string()).unwrap_or_default();
-            let timestamp_ms = header.timestamp.unwrap_or(0);
-            let daa_score = header.daa_score.unwrap_or(0);
-            let _ = daa_score; // available for sync progress tracking
-
-            let mut tx_count: usize = 0;
-            let mut total_fees: u64 = 0;
-            let mut min_fee: u64 = u64::MAX;
-            let mut max_fee: u64 = 0;
-            let mut fee_count: usize = 0;
-            let mut sender_counts: HashMap<String, usize> = HashMap::new();
-            let mut receiver_counts: HashMap<String, usize> = HashMap::new();
-            let mut protocol_counts: HashMap<crate::analytics::TransactionProtocol, usize> =
-                HashMap::new();
-
-            for (i, tx) in chain_block.accepted_transactions.iter().enumerate() {
-                // Skip coinbase (first transaction)
-                if i == 0 {
-                    continue;
+        let summaries = response
+            .chain_block_accepted_transactions
+            .iter()
+            .map(|chain_block| {
+                let header = &chain_block.chain_block_header;
+                let mut metrics = Metrics {
+                    chain_blocks: 1,
+                    ..Default::default()
+                };
+                for tx in chain_block.accepted_transactions.iter() {
+                    record_transaction(&mut metrics, tx);
                 }
-                tx_count += 1;
-
-                // Extract fee from compute_mass (High verbosity)
-                if let Some(ref verbose) = tx.verbose_data
-                    && let Some(mass) = verbose.compute_mass
-                    && mass > 0
-                {
-                    total_fees += mass;
-                    fee_count += 1;
-                    min_fee = min_fee.min(mass);
-                    max_fee = max_fee.max(mass);
+                BlockSummary {
+                    hash: header.hash.map(|h| h.to_string()).unwrap_or_default(),
+                    timestamp_ms: header.timestamp.unwrap_or(0),
+                    metrics,
                 }
-
-                // Extract sender addresses from input UTXO verbose data
-                for input in &tx.inputs {
-                    if let Some(ref vd) = input.verbose_data
-                        && let Some(ref utxo) = vd.utxo_entry
-                        && let Some(ref uvd) = utxo.verbose_data
-                        && let Some(ref addr) = uvd.script_public_key_address
-                    {
-                        let short = shorten_address(&addr.to_string(), 10, 6);
-                        *sender_counts.entry(short).or_insert(0) += 1;
-                    }
-                }
-
-                // Extract receiver addresses from output verbose data
-                for output in &tx.outputs {
-                    if let Some(ref vd) = output.verbose_data
-                        && let Some(ref addr) = vd.script_public_key_address
-                    {
-                        let short = shorten_address(&addr.to_string(), 10, 6);
-                        *receiver_counts.entry(short).or_insert(0) += 1;
-                    }
-                }
-
-                // Protocol detection from payload and input scripts
-                let payload = tx.payload.as_deref().unwrap_or(&[]);
-                let input_scripts: Vec<&[u8]> = tx
-                    .inputs
-                    .iter()
-                    .filter_map(|inp| inp.signature_script.as_deref())
-                    .collect();
-                if let Some(proto) = detect_protocol(payload, &input_scripts) {
-                    *protocol_counts.entry(proto).or_insert(0) += 1;
-                }
-            }
-
-            if min_fee == u64::MAX {
-                min_fee = 0;
-            }
-
-            summaries.push(BlockSummary {
-                hash,
-                timestamp_ms,
-                tx_count,
-                total_fees,
-                min_fee,
-                max_fee,
-                fee_count,
-                sender_counts,
-                receiver_counts,
-                protocol_counts,
-            });
-        }
+            })
+            .collect();
 
         (summaries, removed)
     }
@@ -552,6 +488,90 @@ impl RpcManager {
             .map_err(|e| anyhow::anyhow!("Invalid hash: {}", e))?;
         let block = self.client.get_block(hash, true).await?;
         Ok(format!("{:#?}", block))
+    }
+}
+
+/// Count one accepted transaction into a chain block's metrics.
+fn record_transaction(metrics: &mut Metrics, tx: &RpcOptionalTransaction) {
+    let payload = tx.payload.as_deref().unwrap_or(&[]);
+
+    // Coinbase: no inputs. Its payload carries the miner's node version.
+    if tx.inputs.is_empty() {
+        if let Some(version) = coinbase_node_version(payload) {
+            *metrics.node_versions.entry(version).or_insert(0) += 1;
+        }
+        return;
+    }
+    metrics.tx_count += 1;
+
+    let mut usage = OpcodeUsage::default();
+    let mut covenant_created = 0;
+    let mut covenant_spent = 0;
+    // Fee = inputs - outputs, known only if every spent UTXO's amount is.
+    let mut input_sum = Some(0u64);
+
+    for input in &tx.inputs {
+        let utxo = input
+            .verbose_data
+            .as_ref()
+            .and_then(|vd| vd.utxo_entry.as_ref());
+        input_sum = input_sum
+            .zip(utxo.and_then(|u| u.amount))
+            .map(|(a, b)| a + b);
+        let Some(utxo) = utxo else { continue };
+
+        if let Some(addr) = utxo
+            .verbose_data
+            .as_ref()
+            .and_then(|uvd| uvd.script_public_key_address.as_ref())
+        {
+            let short = shorten_address(&addr.to_string(), 10, 6);
+            *metrics.senders.entry(short).or_insert(0) += 1;
+        }
+        if utxo.covenant_id.is_some() {
+            covenant_spent += 1;
+        }
+        // Covenant opcodes live in the redeem script a P2SH spend reveals.
+        if let Some(spk) = &utxo.script_public_key
+            && script_class(spk.script()) == ScriptClass::ScriptHash
+            && let Some(sig) = &input.signature_script
+        {
+            usage |= redeem_script_opcodes(sig);
+        }
+    }
+
+    let mut output_sum = 0u64;
+    for output in &tx.outputs {
+        output_sum += output.value.unwrap_or(0);
+        if let Some(spk) = &output.script_public_key {
+            metrics.script_classes.record(script_class(spk.script()));
+            usage |= output_script_opcodes(spk.script());
+        }
+        if output.covenant.as_ref().is_some_and(|c| c.0.is_some()) {
+            covenant_created += 1;
+        }
+        if let Some(addr) = output
+            .verbose_data
+            .as_ref()
+            .and_then(|vd| vd.script_public_key_address.as_ref())
+        {
+            let short = shorten_address(&addr.to_string(), 10, 6);
+            *metrics.receivers.entry(short).or_insert(0) += 1;
+        }
+    }
+
+    metrics.record_fee(input_sum.map(|i| i.saturating_sub(output_sum)));
+    metrics
+        .inspection
+        .record_tx(usage, covenant_created, covenant_spent);
+
+    let input_scripts: Vec<&[u8]> = tx
+        .inputs
+        .iter()
+        .filter_map(|inp| inp.signature_script.as_deref())
+        .collect();
+    if let Some(proto) = detect_protocol(payload, &input_scripts) {
+        *metrics.protocols.entry(proto).or_insert(0) += 1;
     }
 }
 

@@ -207,11 +207,35 @@ pub enum TimeWindow {
 }
 
 impl TimeWindow {
+    pub const ALL: [Self; 3] = [Self::OneMin, Self::OneHour, Self::TwentyFourHour];
+
     pub fn label(&self) -> &'static str {
         match self {
             Self::OneMin => "1m",
             Self::OneHour => "1h",
             Self::TwentyFourHour => "24h",
+        }
+    }
+
+    /// Position in [`Self::ALL`].
+    pub fn index(&self) -> usize {
+        *self as usize
+    }
+
+    pub fn duration_ms(&self) -> u64 {
+        match self {
+            Self::OneMin => 60_000,
+            Self::OneHour => 3_600_000,
+            Self::TwentyFourHour => 86_400_000,
+        }
+    }
+
+    /// Width of one bar in the transaction chart.
+    pub fn series_bin_ms(&self) -> u64 {
+        match self {
+            Self::OneMin => 5_000,
+            Self::OneHour => 60_000,
+            Self::TwentyFourHour => 3_600_000,
         }
     }
 }
@@ -524,14 +548,63 @@ impl Default for NodeState {
     }
 }
 
-#[derive(Default)]
+/// Analytics cards with their own time window and table/chart toggle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnalyticsPanel {
+    TxSummary,
+    Inspection,
+    NodeVersions,
+    TopSenders,
+    TopReceivers,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PanelState {
+    pub window: TimeWindow,
+    pub mode: ViewMode,
+}
+
 pub struct AnalyticsState {
     pub engine: Option<Arc<tokio::sync::RwLock<AnalyticsEngine>>>,
-    pub view_modes: [ViewMode; 5],
-    pub time_windows: [TimeWindow; 5],
+    /// Indexed by [`AnalyticsPanel`].
+    pub panels: [PanelState; 5],
     pub sync_progress: Option<(u64, u64)>,
     pub reorg_notification: Option<String>,
-    pub cached_views: Option<[AggregatedView; 5]>,
+    /// One view per window, indexed by [`TimeWindow::index`].
+    pub cached_views: Option<[AggregatedView; 3]>,
+}
+
+impl Default for AnalyticsState {
+    fn default() -> Self {
+        let panel = |window| PanelState {
+            window,
+            mode: ViewMode::Table,
+        };
+        Self {
+            engine: None,
+            // Same windows as the Kaspalytics home page
+            panels: [
+                panel(TimeWindow::TwentyFourHour),
+                panel(TimeWindow::TwentyFourHour),
+                panel(TimeWindow::OneHour),
+                panel(TimeWindow::OneHour),
+                panel(TimeWindow::OneHour),
+            ],
+            sync_progress: None,
+            reorg_notification: None,
+            cached_views: None,
+        }
+    }
+}
+
+impl AnalyticsState {
+    pub fn panel(&mut self, panel: AnalyticsPanel) -> &mut PanelState {
+        &mut self.panels[panel as usize]
+    }
+
+    pub fn view(&self, window: TimeWindow) -> Option<&AggregatedView> {
+        self.cached_views.as_ref().map(|v| &v[window.index()])
+    }
 }
 
 #[derive(Default)]
@@ -643,20 +716,6 @@ impl App {
             entry.fee,
             if entry.is_orphan { "Yes" } else { "No" },
         ));
-    }
-
-    /// Change an analytics panel's time window and refresh its cached view immediately
-    /// (instead of waiting for the next streaming update).
-    pub fn set_analytics_window(&mut self, panel: usize, window: TimeWindow) {
-        self.analytics.time_windows[panel] = window;
-        if let Some(ref engine) = self.analytics.engine
-            && let Ok(eng) = engine.try_read()
-        {
-            let new_view = eng.get_view(window);
-            if let Some(ref mut views) = self.analytics.cached_views {
-                views[panel] = new_view;
-            }
-        }
     }
 
     pub fn tab_index(&self) -> usize {
@@ -1196,10 +1255,24 @@ mod tests {
     }
 
     #[test]
-    fn set_analytics_window_updates_window_without_engine() {
-        let mut app = App::new(DaemonConfig::default());
-        app.set_analytics_window(2, TimeWindow::TwentyFourHour);
-        assert_eq!(app.analytics.time_windows[2], TimeWindow::TwentyFourHour);
-        assert_eq!(app.analytics.time_windows[0], TimeWindow::OneMin);
+    fn time_window_index_matches_all() {
+        for (i, w) in TimeWindow::ALL.iter().enumerate() {
+            assert_eq!(w.index(), i);
+            assert_eq!(w.duration_ms() % w.series_bin_ms(), 0);
+        }
+    }
+
+    #[test]
+    fn analytics_panels_default_to_kaspalytics_windows() {
+        let mut state = AnalyticsState::default();
+        assert_eq!(
+            state.panel(AnalyticsPanel::TxSummary).window,
+            TimeWindow::TwentyFourHour
+        );
+        assert_eq!(
+            state.panel(AnalyticsPanel::NodeVersions).window,
+            TimeWindow::OneHour
+        );
+        assert!(state.view(TimeWindow::OneMin).is_none());
     }
 }

@@ -33,8 +33,9 @@ egui/eframe desktop GUI for monitoring a Kaspa L1 node via wRPC, with an optiona
 - `src/daemon.rs`: embedded kaspad (`DaemonHandle`).
 - `src/daemon_lifecycle.rs`: RPC creation, mining polling, log tailing, start-daemon-and-connect helpers.
 - `src/config.rs`: `DaemonConfig` (`~/.tui4kas/config.toml`) and `ConnectionSettings`/`ConnectionKind`, the last connection choice (`~/.tui4kas/connection.toml`).
-- `src/analytics.rs` / `src/analytics_streaming.rs`: chain analytics aggregation and its streaming task (cache at `~/.tui4kas/analytics_cache.bin`).
-- `src/format.rs`: pure formatting helpers (`format_hashrate`, `format_usd`, …).
+- `src/analytics.rs` / `src/analytics_streaming.rs`: chain analytics (per-chain-block `Metrics` rolled into 1m/10m buckets, `AggregatedView` per window) and its VSPC v2 streaming task (cache at `~/.tui4kas/analytics_cache.bin`, versioned by `CACHE_MAGIC`; bump it when the format changes). All data comes from the connected node.
+- `src/tx_inspect.rs`: per-transaction classification, mirroring Kaspalytics: protocol detection, output script classes, covenant/introspection/ZK opcode scanning, coinbase node-version parsing.
+- `src/format.rs`: pure formatting helpers (`format_hashrate`, `format_usd`, `format_kas`, …).
 - `src/rpc/client.rs`: `RpcManager`. Connect, background polling, RPC execution, mining/analytics fetches, block lookup.
 - `src/rpc/market.rs`: CoinGecko market polling (every 60s).
 - `src/rpc/methods.rs`: `RPC_METHODS` catalog (name, description, typed params with defaults), `resolve_args`, and argument parsers.
@@ -44,7 +45,7 @@ egui/eframe desktop GUI for monitoring a Kaspa L1 node via wRPC, with an optiona
 - `src/gui/dashboard.rs`: Dashboard tab (node info + block counts, markets, network stats + hashrate + supply, mempool & fees cards).
 - `src/gui/mempool.rs`: Mempool tab (`egui_extras` table, click a row for the detail window).
 - `src/gui/blockdag.rs`: BlockDAG tab (custom painter DAG visualizer, metrics, GHOSTDAG stats, tip/parent lists, Block Info window).
-- `src/gui/analytics.rs`: Analytics tab. Rows: Tx Summary / Protocol Activity / Fee Analysis, Top Senders / Top Receivers (each with a Table/Chart toggle and time window; `egui_plot` charts), then Mining Analysis (hashrate, unique miners, top miners).
+- `src/gui/analytics.rs`: Analytics tab, modeled on the Kaspalytics home page. Rows: Transaction Summary (tx count, TPS, output script classes; chart of txs per bin) / Fees (node fee-rate estimate, average and total accepted fees per window), Transaction Inspection (opcodes, covenants, protocols), Mining Share by Node Version / Mining Analysis, Top Senders / Top Receivers. Panels have a time window (`AnalyticsPanel`/`PanelState`) and most a Table/Chart toggle.
 - `src/gui/rpc_explorer.rs`: RPC Cmds tab (method list, argument form, Loop toggle, read-only JSON result viewer with 🔍 links on block hashes that run `get_block`).
 - `src/gui/node.rs`: Node tab (settings form bound to a `DaemonConfig` copy, Start/Stop/Save, status, log viewer).
 - `src/gui/connection.rs`: `ConnectionWindow`, opened from the status-bar connection button. Custom URL / public resolver / embedded node, network, Connect/Disconnect.

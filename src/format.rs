@@ -30,10 +30,30 @@ pub fn format_usd(value: f64) -> String {
     }
 }
 
+/// Sompi as KAS with a fixed number of decimals and thousands separators,
+/// e.g. `format_kas(1_234_567_800_000.0, 3)` → `"12,345.678"`.
+pub fn format_kas(sompi: f64, decimals: usize) -> String {
+    let s = format!("{:.*}", decimals, sompi / 1e8);
+    let (int, frac) = s.split_once('.').unwrap_or((&s, ""));
+    let int = crate::rpc::types::format_number(int.parse().unwrap_or(0));
+    if frac.is_empty() {
+        int
+    } else {
+        format!("{int}.{frac}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::rpc::types::format_number;
+
+    #[test]
+    fn format_kas_decimals_and_separators() {
+        assert_eq!(format_kas(1_234_567_800_000.0, 3), "12,345.678");
+        assert_eq!(format_kas(1_500.0, 6), "0.000015");
+        assert_eq!(format_kas(100_000_000.0, 0), "1");
+    }
 
     #[test]
     fn format_number_zero() {

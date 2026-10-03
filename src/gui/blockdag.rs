@@ -56,7 +56,7 @@ fn legend(ui: &mut Ui) {
 /// Draw tip snapshots as columns of blocks. Returns the hash of a clicked block.
 fn visualizer(ui: &mut Ui, vis: &DagVisualizer) -> Option<String> {
     if vis.columns.is_empty() {
-        placeholder(ui, "Collecting DAG data…");
+        placeholder(ui, "Collecting data…");
         return None;
     }
 
@@ -136,7 +136,7 @@ fn visualizer(ui: &mut Ui, vis: &DagVisualizer) -> Option<String> {
 
 fn metrics(ui: &mut Ui, app: &App) {
     let Some(ref dag) = app.node.dag_info else {
-        placeholder(ui, "Waiting for DAG data…");
+        placeholder(ui, "Collecting data…");
         return;
     };
     kv_grid(ui, "dag_metrics", |ui| {
@@ -165,7 +165,7 @@ fn hash_kv(ui: &mut Ui, label: &str, hash: &str) {
 
 fn ghostdag(ui: &mut Ui, app: &App) {
     if app.node.dag_info.is_none() {
-        placeholder(ui, "Waiting for DAG data…");
+        placeholder(ui, "Collecting data…");
         return;
     }
     let stats = &app.node.dag_stats;

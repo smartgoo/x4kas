@@ -1,7 +1,7 @@
 use eframe::egui::{self, Pos2, Rect, RichText, Sense, Stroke, Ui, vec2};
 
 use super::theme;
-use super::widgets::{CARD_GAP, card, kv, kv_grid, placeholder, syncing_guard};
+use super::widgets::{CARD_GAP, card, field_label, kv, kv_grid, placeholder, syncing_guard};
 use crate::app::{App, DagFocus, DagVisualizer};
 use crate::controller::{CommandSender, UiCommand};
 use crate::format::truncate_hash;
@@ -163,7 +163,7 @@ fn metrics(ui: &mut Ui, app: &App) {
 }
 
 fn hash_kv(ui: &mut Ui, label: &str, hash: &str) {
-    ui.label(RichText::new(label).weak());
+    field_label(ui, label);
     ui.label(truncate_hash(hash)).on_hover_text(hash);
     ui.end_row();
 }

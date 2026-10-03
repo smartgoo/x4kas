@@ -7,6 +7,7 @@ mod connection;
 mod dashboard;
 mod help;
 mod mempool;
+mod mining;
 mod node;
 mod rpc_explorer;
 mod theme;
@@ -160,6 +161,7 @@ impl eframe::App for GuiApp {
         egui::CentralPanel::default().show(ctx, |ui| match app.active_tab {
             Tab::Dashboard => dashboard::show(ui, &app),
             Tab::Mempool => mempool::show(ui, &mut app),
+            Tab::Mining => mining::show(ui, &app),
             Tab::RpcExplorer => rpc_explorer::show(ui, &mut app, &self.cmd_tx),
             Tab::IntegratedNode => node::show(ui, &mut app, &self.cmd_tx),
             Tab::Analytics => analytics::show(ui, &mut app),
@@ -189,13 +191,14 @@ impl eframe::App for GuiApp {
 }
 
 fn handle_shortcuts(ctx: &egui::Context, app: &mut App, show_help: &mut bool) {
-    const TAB_KEYS: [Key; 6] = [
+    const TAB_KEYS: [Key; 7] = [
         Key::Num1,
         Key::Num2,
         Key::Num3,
         Key::Num4,
         Key::Num5,
         Key::Num6,
+        Key::Num7,
     ];
 
     // Works even while the palette input has focus.
@@ -345,7 +348,7 @@ fn status_bar(ui: &mut egui::Ui, app: &mut App, connection: &mut ConnectionWindo
         if app.integrated_node.status != DaemonStatus::Stopped {
             widgets::divider(ui);
             let (text, color) = theme::daemon_status(&app.integrated_node.status);
-            ui.label(RichText::new("node").weak());
+            widgets::field_label(ui, "node");
             ui.label(RichText::new(text).color(color));
         }
 
@@ -367,12 +370,12 @@ fn status_bar(ui: &mut egui::Ui, app: &mut App, connection: &mut ConnectionWindo
                 ui.label(RichText::new("PAUSED").color(theme::WARN));
             } else if let Some(ms) = app.node.last_poll_duration_ms {
                 ui.label(format!("{ms:.0} ms"));
-                ui.label(RichText::new("poll").weak());
+                widgets::field_label(ui, "poll");
             }
             if let Some(ref info) = app.node.server_info {
                 widgets::divider(ui);
                 ui.label(format_number(info.virtual_daa_score));
-                ui.label(RichText::new("daa").weak());
+                widgets::field_label(ui, "daa");
                 widgets::divider(ui);
                 ui.label(RichText::new(&info.network_id).color(theme::ACCENT));
             }

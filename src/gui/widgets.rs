@@ -65,9 +65,14 @@ pub fn kv_grid(ui: &mut Ui, id: &str, add_rows: impl FnOnce(&mut Ui)) {
         .show(ui, add_rows);
 }
 
+/// A dim field label with a trailing colon, e.g. `Network:`.
+pub fn field_label(ui: &mut Ui, label: &str) -> egui::Response {
+    ui.label(RichText::new(format!("{label}:")).weak())
+}
+
 /// One row of a [`kv_grid`].
 pub fn kv(ui: &mut Ui, label: &str, value: impl Into<WidgetText>) {
-    ui.label(RichText::new(label).weak());
+    field_label(ui, label);
     ui.label(value);
     ui.end_row();
 }

@@ -1,7 +1,9 @@
 use eframe::egui::{self, Color32, ComboBox, DragValue, RichText, TextEdit, Ui};
 
 use super::theme;
-use super::widgets::{CARD_GAP, card, danger_button, kv, kv_grid, placeholder, primary_button};
+use super::widgets::{
+    CARD_GAP, card, danger_button, field_label, kv, kv_grid, placeholder, primary_button,
+};
 use crate::app::{App, DaemonStatus, IntegratedNodeState};
 use crate::config::DaemonConfig;
 use crate::controller::{CommandSender, UiCommand};
@@ -174,7 +176,7 @@ fn section(ui: &mut Ui, title: &str, add_rows: impl FnOnce(&mut Ui)) {
 }
 
 fn field(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui) -> egui::Response) -> bool {
-    ui.label(RichText::new(label).weak());
+    field_label(ui, label);
     let changed = add(ui).changed();
     ui.end_row();
     changed
@@ -277,7 +279,7 @@ fn status_rows(ui: &mut Ui, app: &App) {
         Some(_) => ("Syncing…", theme::WARN),
         None => ("Waiting…", theme::TEXT_DIM),
     };
-    ui.label(RichText::new("Status").weak());
+    field_label(ui, "Status");
     ui.horizontal(|ui| {
         ui.label(RichText::new(status).color(status_color));
         ui.label(RichText::new(sync).color(sync_color));

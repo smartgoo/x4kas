@@ -3,7 +3,9 @@ use std::time::Instant;
 use eframe::egui::{self, Button, ComboBox, RichText, TextEdit, Ui, text::CCursor};
 
 use super::theme;
-use super::widgets::{kv_grid, placeholder, primary_button, section_title, syncing_guard};
+use super::widgets::{
+    field_label, kv_grid, placeholder, primary_button, section_title, syncing_guard,
+};
 use crate::app::{App, RpcExplorerState};
 use crate::controller::{CommandSender, UiCommand};
 use crate::rpc::hash_links::HashLink;
@@ -14,10 +16,13 @@ pub fn show(ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
         return;
     }
 
+    let list_width = method_list_width(ui);
     egui::SidePanel::left("rpc_methods")
         .resizable(true)
-        .default_width(260.0)
+        .min_width(list_width)
+        .default_width(list_width)
         .show_inside(ui, |ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
             section_title(ui, "RPC Methods");
             ui.add_space(4.0);
             egui::ScrollArea::vertical().show(ui, |ui| method_list(ui, app, cmd_tx));
@@ -139,22 +144,41 @@ fn response_view(ui: &mut Ui, response: &str, links: &[HashLink]) -> Option<Stri
     clicked
 }
 
+/// List entry: methods that take arguments get a trailing ellipsis.
+fn method_label(method: &RpcMethod) -> String {
+    if method.params.is_empty() {
+        method.name.to_string()
+    } else {
+        format!("{} …", method.name)
+    }
+}
+
+/// Side panel width that fits the longest method label on one line.
+fn method_list_width(ui: &Ui) -> f32 {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let text = methods::RPC_METHODS
+        .iter()
+        .map(|m| {
+            ui.painter()
+                .layout_no_wrap(method_label(m), font.clone(), egui::Color32::WHITE)
+                .size()
+                .x
+        })
+        .fold(0.0, f32::max);
+    let spacing = &ui.style().spacing;
+    // Label padding, the panel's inner margins, and room for the scroll bar.
+    text + 2.0 * spacing.button_padding.x + 16.0 + spacing.scroll.allocated_width() + 8.0
+}
+
 fn method_list(ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
     for i in 0..app.rpc_explorer.available_methods.len() {
         let Some(method) = methods::find(app.rpc_explorer.available_methods[i]) else {
             continue;
         };
         let selected = i == app.rpc_explorer.selected_method;
-        let text = if method.params.is_empty() {
-            RichText::new(method.name)
-        } else {
-            RichText::new(format!("{} …", method.name))
-        };
-        let response = ui.selectable_label(selected, text).on_hover_text(format!(
-            "{}\n\n{}",
-            method.description,
-            method.usage()
-        ));
+        let response = ui
+            .selectable_label(selected, method_label(method))
+            .on_hover_text(format!("{}\n\n{}", method.description, method.usage()));
         if response.clicked() {
             if !selected {
                 app.rpc_explorer.select(i);
@@ -176,11 +200,10 @@ fn arg_form(ui: &mut Ui, app: &mut App, method: &'static RpcMethod) -> bool {
 
     kv_grid(ui, &format!("rpc_args_{}", method.name), |ui| {
         for (param, value) in method.params.iter().zip(args.iter_mut()) {
-            let label = match param.default {
-                None => RichText::new(format!("{}*", param.name)).weak(),
-                Some(_) => RichText::new(param.name).weak(),
+            match param.default {
+                None => field_label(ui, &format!("{}*", param.name)),
+                Some(_) => field_label(ui, param.name),
             };
-            ui.label(label);
             match param.kind {
                 ParamKind::Bool => {
                     let mut checked = methods::parse_bool(value).unwrap_or(false);

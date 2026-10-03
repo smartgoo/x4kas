@@ -27,7 +27,7 @@ egui/eframe desktop GUI for monitoring a Kaspa L1 node via wRPC, with an optiona
 ### Module Layout
 
 - `src/main.rs`: entry point. Parses CLI, loads `DaemonConfig`, builds the runtime, calls `gui::run`.
-- `src/app.rs`: central state. `App`, `Tab` (6 tabs), `CommandLine`, `RpcExplorerState`, `DagVisualizer`, `DagSelection`, analytics state (`TimeWindow`, `ViewMode`), and `mark_dirty()`.
+- `src/app.rs`: central state. `App`, `Tab` (7 tabs), `CommandLine`, `RpcExplorerState`, `DagVisualizer`, `DagSelection`, analytics state (`TimeWindow`, `ViewMode`), and `mark_dirty()`.
 - `src/cli.rs`: clap args (`--url`, `--network`, `--refresh-interval-ms`).
 - `src/controller.rs`: the `UiCommand` enum, `RemoteTarget`, and the controller task. Owns the RPC manager, daemon handle, polling and log-tail handles. Handles the startup modes (`--url`, auto-start daemon, or idle with the connection window open), connect/disconnect, daemon start/stop, command-line execution, and shutdown.
 - `src/daemon.rs`: embedded kaspad (`DaemonHandle`).
@@ -41,7 +41,8 @@ egui/eframe desktop GUI for monitoring a Kaspa L1 node via wRPC, with an optiona
 - `src/rpc/hash_links.rs`: finds block hashes (by field name) in JSON responses so the result viewer can link them to `get_block`.
 - `src/rpc/types.rs`: UI-friendly structs with `From` impls for kaspa RPC types.
 - `src/gui/mod.rs`: `GuiApp` (`eframe::App`). Frame loop, top bar (brand, tab strip, palette/help buttons), bottom status bar (connection, node, network, DAA, poll latency, pause), keyboard shortcuts, quit handling.
-- `src/gui/dashboard.rs`: Dashboard tab (node info, network + supply, markets, mining, mempool & fees cards).
+- `src/gui/dashboard.rs`: Dashboard tab (node info + block counts, markets, network stats + hashrate + supply, mempool & fees cards).
+- `src/gui/mining.rs`: Mining tab (hashrate, unique miners, top miners).
 - `src/gui/mempool.rs`: Mempool tab (`egui_extras` table, click a row for the detail window).
 - `src/gui/blockdag.rs`: BlockDAG tab (custom painter DAG visualizer, metrics, GHOSTDAG stats, tip/parent lists, Block Info window).
 - `src/gui/analytics.rs`: Analytics tab (5 panels with a Table/Chart toggle and time window; `egui_plot` charts).
@@ -69,5 +70,5 @@ egui/eframe desktop GUI for monitoring a Kaspa L1 node via wRPC, with an optiona
 - All RPC types have UI-friendly wrapper structs in `rpc/types.rs`. Don't use raw kaspa types in UI code.
 - Use `theme::*` colors and `widgets::*` helpers for a consistent look; never hard-code `Color32`s in views. Labels use `.weak()`. All text is already monospace, so don't add `.monospace()`.
 - Shortcuts are ignored while a text field has focus (`ctx.wants_keyboard_input()`), except Cmd/Ctrl+K.
-- Shortcuts: `1`–`6` tabs, Ctrl+Tab / Ctrl+Shift+Tab cycle, `p` pause, `:` or Cmd/Ctrl+K palette, `?`/F1 help, Esc closes popups.
+- Shortcuts: `1`–`7` tabs, Ctrl+Tab / Ctrl+Shift+Tab cycle, `p` pause, `:` or Cmd/Ctrl+K palette, `?`/F1 help, Esc closes popups.
 - 36 read-only RPC methods (listed in `rpc/methods.rs`) are available in both the RPC Cmds tab and the command palette (`method arg1 arg2 …`; lists are comma-separated). Responses are pretty-printed JSON (`to_json`; wrap bare values in a `json!` object). To add one, add it to `RPC_METHODS` and a match arm in `RpcManager::execute_rpc_call`; a test checks every method has an arm. State-changing calls (`submit_*`, `add_peer`, `ban`/`unban`, `resolve_finality_conflict`, `shutdown`) are intentionally not exposed.

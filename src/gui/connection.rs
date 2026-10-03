@@ -2,7 +2,7 @@
 
 use eframe::egui::{self, Button, ComboBox, RichText, TextEdit, Ui};
 
-use super::widgets::{kv_grid, primary_button};
+use super::widgets::{field_label, kv_grid, primary_button};
 use super::{node, theme};
 use crate::app::{ActiveConnection, App, ConnectionStatus, DaemonStatus, Tab};
 use crate::config::{ConnectionKind, ConnectionSettings, DaemonConfig};
@@ -70,14 +70,14 @@ impl ConnectionWindow {
         match self.form.kind {
             ConnectionKind::Url => {
                 kv_grid(ui, "connection_url", |ui| {
-                    ui.label(RichText::new("URL").weak());
+                    field_label(ui, "URL");
                     ui.add(
                         TextEdit::singleline(&mut self.form.url)
                             .hint_text("ws://host:17110")
                             .desired_width(280.0),
                     );
                     ui.end_row();
-                    ui.label(RichText::new("Network").weak());
+                    field_label(ui, "Network");
                     network_combo(ui, &mut self.form.network);
                     ui.end_row();
                 });
@@ -85,7 +85,7 @@ impl ConnectionWindow {
             }
             ConnectionKind::Resolver => {
                 kv_grid(ui, "connection_resolver", |ui| {
-                    ui.label(RichText::new("Network").weak());
+                    field_label(ui, "Network");
                     network_combo(ui, &mut self.form.network);
                     ui.end_row();
                 });

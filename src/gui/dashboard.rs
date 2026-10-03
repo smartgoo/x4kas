@@ -1,9 +1,7 @@
 use eframe::egui::{self, RichText, Ui};
 
 use super::theme;
-use super::widgets::{
-    CARD_GAP, card, direct_node_placeholder, kv, kv_grid, placeholder, syncing_note, yes_no,
-};
+use super::widgets::{CARD_GAP, card, field_label, kv, kv_grid, placeholder, syncing_note, yes_no};
 use crate::app::App;
 use crate::format::{format_hashrate, format_usd};
 use crate::rpc::types::{format_number, sompi_to_kas};
@@ -12,17 +10,15 @@ pub fn show(ui: &mut Ui, app: &App) {
     egui::ScrollArea::vertical().show(ui, |ui| {
         ui.columns(2, |cols| {
             card(&mut cols[0], "Node Info", |ui| node_info(ui, app));
-            cols[0].add_space(CARD_GAP);
-            card(&mut cols[0], "Markets", |ui| markets(ui, app));
-
-            card(&mut cols[1], "Network Stats", |ui| network_stats(ui, app));
-            cols[1].add_space(CARD_GAP);
+            card(&mut cols[1], "Markets", |ui| markets(ui, app));
+        });
+        ui.add_space(CARD_GAP);
+        ui.columns(2, |cols| {
+            card(&mut cols[0], "Network Stats", |ui| network_stats(ui, app));
             card(&mut cols[1], "Mempool & Fees", |ui| {
                 mempool_summary(ui, app)
             });
         });
-        ui.add_space(CARD_GAP);
-        card(ui, "Mining Info", |ui| mining_info(ui, app));
     });
 }
 
@@ -45,6 +41,10 @@ fn node_info(ui: &mut Ui, app: &App) {
             RichText::new(yes_no(info.is_synced)).color(synced_color),
         );
         kv(ui, "UTXO Index", yes_no(info.has_utxo_index));
+        if let Some(ref dag) = app.node.dag_info {
+            kv(ui, "Block Count", format_number(dag.block_count));
+            kv(ui, "Header Count", format_number(dag.header_count));
+        }
         if app.is_daemon_active() {
             kv(ui, "Mode", RichText::new("Embedded node").color(theme::OK));
         }
@@ -73,9 +73,14 @@ fn network_stats(ui: &mut Ui, app: &App) {
         return;
     };
     kv_grid(ui, "network_stats", |ui| {
-        kv(ui, "Block Count", format_number(dag.block_count));
-        kv(ui, "Header Count", format_number(dag.header_count));
         kv(ui, "Difficulty", format_number(dag.difficulty as u64));
+        let hashrate = app
+            .node
+            .mining_info
+            .as_ref()
+            .map(|m| format_hashrate(m.hashrate))
+            .unwrap_or_else(|| "—".to_string());
+        kv(ui, "Hashrate", hashrate);
         kv(ui, "DAA Score", format_number(dag.virtual_daa_score));
         kv(ui, "Tips", dag.tip_hashes.len().to_string());
 
@@ -114,7 +119,7 @@ fn markets(ui: &mut Ui, app: &App) {
         (format!("{change:.2}%"), theme::ERROR)
     };
     kv_grid(ui, "markets", |ui| {
-        ui.label(RichText::new("Price (USD)").weak());
+        field_label(ui, "Price (USD)");
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new(format!("${:.6}", market.price_usd)).color(theme::ACCENT_BRIGHT),
@@ -158,41 +163,4 @@ fn mempool_summary(ui: &mut Ui, app: &App) {
             }
         }
     });
-}
-
-fn mining_info(ui: &mut Ui, app: &App) {
-    if app.is_node_syncing() {
-        syncing_note(ui);
-        return;
-    }
-    let Some(ref mining) = app.node.mining_info else {
-        placeholder(ui, direct_node_placeholder(app, "Collecting mining data…"));
-        return;
-    };
-    kv_grid(ui, "mining_info", |ui| {
-        kv(
-            ui,
-            "Hashrate",
-            RichText::new(format_hashrate(mining.hashrate)).color(theme::ACCENT_BRIGHT),
-        );
-        kv(
-            ui,
-            "Unique Miners",
-            format!(
-                "{} (last {} blocks)",
-                mining.unique_miners, mining.blocks_analyzed
-            ),
-        );
-    });
-    if !mining.top_miners.is_empty() {
-        ui.add_space(6.0);
-        ui.label(RichText::new("Top Miners").weak());
-        kv_grid(ui, "top_miners", |ui| {
-            for (addr, count) in &mining.top_miners {
-                ui.label(addr);
-                ui.label(format!("{count} blocks"));
-                ui.end_row();
-            }
-        });
-    }
 }

@@ -1,7 +1,7 @@
-use eframe::egui::{self, Color32, Pos2, Rect, RichText, Sense, Stroke, Ui, vec2};
+use eframe::egui::{self, Pos2, Rect, RichText, Sense, Stroke, Ui, vec2};
 
 use super::theme;
-use super::widgets::{card, kv, kv_grid, placeholder, syncing_guard};
+use super::widgets::{CARD_GAP, card, kv, kv_grid, placeholder, syncing_guard};
 use crate::app::{App, DagFocus, DagVisualizer};
 use crate::controller::{CommandSender, UiCommand};
 use crate::format::truncate_hash;
@@ -11,7 +11,6 @@ const CANVAS_HEIGHT: f32 = 170.0;
 const COL_WIDTH: f32 = 40.0;
 const ROW_HEIGHT: f32 = 24.0;
 const BLOCK_SIZE: f32 = 18.0;
-const OTHER_TIP: Color32 = Color32::from_rgb(0x5a, 0x6b, 0x8c);
 
 pub fn show(ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
     if syncing_guard(ui, app, "BlockDAG") {
@@ -27,13 +26,13 @@ pub fn show(ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
                 lookup = Some(hash);
             }
         });
-        ui.add_space(8.0);
+        ui.add_space(CARD_GAP);
 
         ui.columns(2, |cols| {
             card(&mut cols[0], "BlockDAG Metrics", |ui| metrics(ui, app));
             card(&mut cols[1], "GHOSTDAG", |ui| ghostdag(ui, app));
         });
-        ui.add_space(8.0);
+        ui.add_space(CARD_GAP);
 
         if let Some(hash) = hash_lists(ui, app) {
             lookup = Some(hash);
@@ -53,9 +52,9 @@ fn legend(ui: &mut Ui) {
     ui.horizontal(|ui| {
         ui.label(RichText::new("■").color(theme::ACCENT));
         ui.label(RichText::new("selected parent").weak());
-        ui.label(RichText::new("■").color(OTHER_TIP));
+        ui.label(RichText::new("■").color(theme::SLATE));
         ui.label(RichText::new("other tip").weak());
-        ui.label(RichText::new("· older → newer · click a block for details").weak());
+        ui.label(RichText::new("│ older → newer │ click a block for details").weak());
     });
 }
 
@@ -119,7 +118,7 @@ fn visualizer(ui: &mut Ui, vis: &DagVisualizer) -> Option<String> {
         let fill = if block.is_selected_parent {
             theme::ACCENT
         } else {
-            OTHER_TIP
+            theme::SLATE
         };
         painter.rect_filled(*r, 3.0, fill);
         if is_hovered {
@@ -135,7 +134,7 @@ fn visualizer(ui: &mut Ui, vis: &DagVisualizer) -> Option<String> {
 
     let clicked = response.clicked();
     if let Some(ref hash) = hovered {
-        response.on_hover_text_at_pointer(RichText::new(hash).monospace());
+        response.on_hover_text_at_pointer(hash);
     }
     if clicked { hovered } else { None }
 }
@@ -149,7 +148,7 @@ fn metrics(ui: &mut Ui, app: &App) {
         kv(ui, "Network", &dag.network);
         kv(ui, "Block Count", format_number(dag.block_count));
         kv(ui, "Header Count", format_number(dag.header_count));
-        kv(ui, "Difficulty", format!("{:.4}", dag.difficulty));
+        kv(ui, "Difficulty", format_number(dag.difficulty as u64));
         kv(ui, "DAA Score", format_number(dag.virtual_daa_score));
         kv(ui, "Past Median Time", dag.past_median_time.to_string());
         hash_kv(ui, "Pruning Point", &dag.pruning_point_hash);
@@ -165,8 +164,7 @@ fn metrics(ui: &mut Ui, app: &App) {
 
 fn hash_kv(ui: &mut Ui, label: &str, hash: &str) {
     ui.label(RichText::new(label).weak());
-    ui.label(RichText::new(truncate_hash(hash)).monospace())
-        .on_hover_text(hash);
+    ui.label(truncate_hash(hash)).on_hover_text(hash);
     ui.end_row();
 }
 
@@ -240,7 +238,7 @@ fn hash_lists(ui: &mut Ui, app: &mut App) -> Option<String> {
             for (i, hash) in dag.tip_hashes.iter().enumerate() {
                 let selected = sel.focus == DagFocus::Tips && sel.tip_selected == i;
                 if ui
-                    .selectable_label(selected, RichText::new(hash).monospace())
+                    .selectable_label(selected, hash.as_str())
                     .on_hover_text("Click for block info")
                     .clicked()
                 {
@@ -254,7 +252,7 @@ fn hash_lists(ui: &mut Ui, app: &mut App) -> Option<String> {
             for (i, hash) in dag.virtual_parent_hashes.iter().enumerate() {
                 let selected = sel.focus == DagFocus::Parents && sel.parent_selected == i;
                 if ui
-                    .selectable_label(selected, RichText::new(hash).monospace())
+                    .selectable_label(selected, hash.as_str())
                     .on_hover_text("Click for block info")
                     .clicked()
                 {

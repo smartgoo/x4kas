@@ -2,7 +2,7 @@
 
 use eframe::egui::{self, Button, ComboBox, RichText, TextEdit, Ui};
 
-use super::widgets::kv_grid;
+use super::widgets::{kv_grid, primary_button};
 use super::{node, theme};
 use crate::app::{ActiveConnection, App, ConnectionStatus, DaemonStatus, Tab};
 use crate::config::{ConnectionKind, ConnectionSettings, DaemonConfig};
@@ -53,6 +53,7 @@ impl ConnectionWindow {
 
     fn contents(&mut self, ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
         current(ui, app);
+        ui.add_space(4.0);
         ui.separator();
 
         ui.horizontal(|ui| {
@@ -73,7 +74,6 @@ impl ConnectionWindow {
                     ui.add(
                         TextEdit::singleline(&mut self.form.url)
                             .hint_text("ws://host:17110")
-                            .font(egui::TextStyle::Monospace)
                             .desired_width(280.0),
                     );
                     ui.end_row();
@@ -127,10 +127,7 @@ impl ConnectionWindow {
                     !daemon_running && !app.integrated_node.config.app_dir.trim().is_empty(),
                 ),
             };
-            if ui
-                .add_enabled(can_connect, Button::new(RichText::new(label).strong()))
-                .clicked()
-            {
+            if ui.add_enabled(can_connect, primary_button(label)).clicked() {
                 self.connect(app, cmd_tx);
             }
             let connected = app.connection != ActiveConnection::None || daemon_running;
@@ -172,10 +169,10 @@ fn current(ui: &mut Ui, app: &App) {
     ui.horizontal(|ui| {
         ui.label(RichText::new("●").color(color));
         ui.label(RichText::new(text).color(color));
-        ui.label(RichText::new(app.connection.label()).monospace());
+        ui.label(RichText::new(app.connection.label()).weak());
     });
     if let ConnectionStatus::Error(ref e) = app.node.connection_status {
-        ui.label(RichText::new(e).color(theme::ERROR).small());
+        ui.label(RichText::new(e).color(theme::ERROR));
     }
 }
 
@@ -190,5 +187,5 @@ fn network_combo(ui: &mut Ui, network: &mut String) {
 }
 
 fn note(ui: &mut Ui, text: &str) {
-    ui.label(RichText::new(text).weak().small());
+    ui.label(RichText::new(text).weak());
 }

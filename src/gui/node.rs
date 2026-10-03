@@ -1,7 +1,7 @@
 use eframe::egui::{self, Color32, ComboBox, DragValue, RichText, TextEdit, Ui};
 
 use super::theme;
-use super::widgets::{card, kv, kv_grid, placeholder};
+use super::widgets::{CARD_GAP, card, danger_button, kv, kv_grid, placeholder, primary_button};
 use crate::app::{App, DaemonStatus, IntegratedNodeState};
 use crate::config::DaemonConfig;
 use crate::controller::{CommandSender, UiCommand};
@@ -22,10 +22,7 @@ fn settings(ui: &mut Ui, state: &mut IntegratedNodeState, cmd_tx: &CommandSender
     ui.horizontal(|ui| {
         let can_start = !state.config.app_dir.trim().is_empty();
         let start = ui
-            .add_enabled(
-                can_start,
-                egui::Button::new(RichText::new("▶ Start Node").strong().color(theme::OK)),
-            )
+            .add_enabled(can_start, primary_button("▶ Start node"))
             .on_disabled_hover_text("App Dir must not be empty");
         if start.clicked() {
             start_daemon(state, cmd_tx);
@@ -165,7 +162,7 @@ fn config_form(ui: &mut Ui, cfg: &mut DaemonConfig) -> bool {
 }
 
 fn section(ui: &mut Ui, title: &str, add_rows: impl FnOnce(&mut Ui)) {
-    egui::CollapsingHeader::new(RichText::new(title).strong().color(theme::ACCENT))
+    egui::CollapsingHeader::new(RichText::new(title).color(theme::ACCENT))
         .default_open(true)
         .show(ui, |ui| {
             egui::Grid::new(title)
@@ -259,10 +256,7 @@ fn running(ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
                 let state = &mut app.integrated_node;
                 let can_stop = state.status == DaemonStatus::Running;
                 if ui
-                    .add_enabled(
-                        can_stop,
-                        egui::Button::new(RichText::new("■ Stop Node").color(theme::ERROR)),
-                    )
+                    .add_enabled(can_stop, danger_button("■ Stop node"))
                     .clicked()
                     && cmd_tx.send(UiCommand::StopDaemon).is_ok()
                 {
@@ -271,7 +265,7 @@ fn running(ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
             });
         });
     });
-    ui.add_space(8.0);
+    ui.add_space(CARD_GAP);
     card(ui, "Node Logs", |ui| logs(ui, &app.integrated_node));
 }
 
@@ -281,7 +275,7 @@ fn status_rows(ui: &mut Ui, app: &App) {
     let (sync, sync_color) = match app.node.server_info {
         Some(ref info) if info.is_synced => ("Synced", theme::OK),
         Some(_) => ("Syncing…", theme::WARN),
-        None => ("Waiting…", Color32::GRAY),
+        None => ("Waiting…", theme::TEXT_DIM),
     };
     ui.label(RichText::new("Status").weak());
     ui.horizontal(|ui| {
@@ -323,7 +317,7 @@ fn logs(ui: &mut Ui, state: &IntegratedNodeState) {
         .stick_to_bottom(true)
         .show_rows(ui, row_height, state.log_lines.len(), |ui, range| {
             for line in state.log_lines.range(range) {
-                ui.label(RichText::new(line).monospace().color(log_color(line)));
+                ui.label(RichText::new(line).color(log_color(line)));
             }
         });
 }
@@ -333,9 +327,9 @@ fn log_color(line: &str) -> Color32 {
         theme::ERROR
     } else if line.contains("WARN") {
         theme::WARN
-    } else if line.contains("INFO") {
-        theme::OK
+    } else if line.contains("DEBUG") || line.contains("TRACE") {
+        theme::TEXT_DIM
     } else {
-        Color32::GRAY
+        theme::TEXT
     }
 }

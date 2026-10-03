@@ -1,9 +1,12 @@
 use eframe::egui::{self, RichText, Sense, Ui};
 use egui_extras::{Column, TableBuilder};
 
-use super::widgets::{card, kv, kv_grid, placeholder, syncing_guard};
+use super::theme;
+use super::widgets::{
+    CARD_GAP, card, column_header, kv, kv_grid, placeholder, syncing_guard, yes_no,
+};
 use crate::app::App;
-use crate::rpc::types::sompi_to_kas;
+use crate::rpc::types::{format_number, sompi_to_kas};
 
 pub fn show(ui: &mut Ui, app: &mut App) {
     if syncing_guard(ui, app, "Mempool") {
@@ -11,7 +14,7 @@ pub fn show(ui: &mut Ui, app: &mut App) {
     }
 
     card(ui, "Mempool Summary", |ui| summary(ui, app));
-    ui.add_space(8.0);
+    ui.add_space(CARD_GAP);
 
     let Some(ref mempool) = app.node.mempool_state else {
         return;
@@ -31,13 +34,13 @@ pub fn show(ui: &mut Ui, app: &mut App) {
         .column(Column::auto().at_least(70.0))
         .header(22.0, |mut header| {
             header.col(|ui| {
-                ui.strong("Transaction ID");
+                column_header(ui, "Transaction ID");
             });
             header.col(|ui| {
-                ui.strong("Fee (KAS)");
+                column_header(ui, "Fee (KAS)");
             });
             header.col(|ui| {
-                ui.strong("Orphan");
+                column_header(ui, "Orphan");
             });
         })
         .body(|body| {
@@ -46,13 +49,18 @@ pub fn show(ui: &mut Ui, app: &mut App) {
                 let entry = &mempool.entries[i];
                 row.set_selected(i == app.mempool_selected);
                 row.col(|ui| {
-                    ui.label(RichText::new(&entry.transaction_id).monospace());
+                    ui.label(&entry.transaction_id);
                 });
                 row.col(|ui| {
                     ui.label(format!("{:.8}", sompi_to_kas(entry.fee)));
                 });
                 row.col(|ui| {
-                    ui.label(if entry.is_orphan { "Yes" } else { "No" });
+                    let color = if entry.is_orphan {
+                        theme::WARN
+                    } else {
+                        theme::TEXT_DIM
+                    };
+                    ui.label(RichText::new(yes_no(entry.is_orphan)).color(color));
                 });
                 if row.response().clicked() {
                     clicked = Some(i);
@@ -78,7 +86,7 @@ fn summary(ui: &mut Ui, app: &App) {
         kv(
             ui,
             "Total Entries",
-            RichText::new(mempool.entry_count.to_string()).strong(),
+            RichText::new(format_number(mempool.entry_count as u64)).color(theme::ACCENT_BRIGHT),
         );
         kv(ui, "Orphans", orphan_count.to_string());
         kv(

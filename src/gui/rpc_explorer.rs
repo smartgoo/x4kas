@@ -3,7 +3,7 @@ use std::time::Instant;
 use eframe::egui::{self, Button, ComboBox, RichText, TextEdit, Ui, text::CCursor};
 
 use super::theme;
-use super::widgets::{kv_grid, placeholder, syncing_guard};
+use super::widgets::{kv_grid, placeholder, primary_button, section_title, syncing_guard};
 use crate::app::{App, RpcExplorerState};
 use crate::controller::{CommandSender, UiCommand};
 use crate::rpc::hash_links::HashLink;
@@ -18,7 +18,7 @@ pub fn show(ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
         .resizable(true)
         .default_width(260.0)
         .show_inside(ui, |ui| {
-            ui.label(RichText::new("RPC Methods").strong());
+            section_title(ui, "RPC Methods");
             ui.add_space(4.0);
             egui::ScrollArea::vertical().show(ui, |ui| method_list(ui, app, cmd_tx));
         });
@@ -27,7 +27,11 @@ pub fn show(ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
         let Some(method) = app.rpc_explorer.method() else {
             return;
         };
-        ui.label(RichText::new(method.name).strong().monospace());
+        ui.label(
+            RichText::new(method.name)
+                .color(theme::ACCENT_BRIGHT)
+                .size(15.0),
+        );
         ui.label(RichText::new(method.description).weak());
         ui.add_space(4.0);
         let submitted = if method.params.is_empty() {
@@ -49,11 +53,11 @@ pub fn show(ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
         ui.horizontal(|ui| {
             let can_run = !app.rpc_explorer.is_loading && required_filled(app, method);
             let label = if method.params.is_empty() {
-                "Run again"
+                "▶ Run again"
             } else {
                 "▶ Run"
             };
-            if ui.add_enabled(can_run, Button::new(label)).clicked() || (submitted && can_run) {
+            if ui.add_enabled(can_run, primary_button(label)).clicked() || (submitted && can_run) {
                 run(app, cmd_tx, method);
             }
             if method.params.is_empty() {
@@ -173,7 +177,7 @@ fn arg_form(ui: &mut Ui, app: &mut App, method: &'static RpcMethod) -> bool {
     kv_grid(ui, &format!("rpc_args_{}", method.name), |ui| {
         for (param, value) in method.params.iter().zip(args.iter_mut()) {
             let label = match param.default {
-                None => RichText::new(param.name).weak().strong(),
+                None => RichText::new(format!("{}*", param.name)).weak(),
                 Some(_) => RichText::new(param.name).weak(),
             };
             ui.label(label);
@@ -206,11 +210,7 @@ fn arg_form(ui: &mut Ui, app: &mut App, method: &'static RpcMethod) -> bool {
                         } else {
                             TextEdit::singleline(value)
                         };
-                        let response = ui.add(
-                            edit.hint_text(hint)
-                                .font(egui::TextStyle::Monospace)
-                                .desired_width(460.0),
-                        );
+                        let response = ui.add(edit.hint_text(hint).desired_width(460.0));
                         if !multiline
                             && response.lost_focus()
                             && ui.input(|i| i.key_pressed(egui::Key::Enter))

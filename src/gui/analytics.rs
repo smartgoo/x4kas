@@ -4,7 +4,9 @@ use eframe::egui::{self, Color32, RichText, Ui};
 use egui_plot::{Bar, BarChart, GridMark, Line, Plot, PlotPoints};
 
 use super::theme;
-use super::widgets::{card, direct_node_placeholder, kv, kv_grid, placeholder, syncing_guard};
+use super::widgets::{
+    CARD_GAP, card, column_header, direct_node_placeholder, kv, kv_grid, placeholder, syncing_guard,
+};
 use crate::analytics::AggregatedView;
 use crate::app::{App, TimeWindow, ViewMode};
 use crate::rpc::types::format_number;
@@ -17,14 +19,6 @@ const PANELS: [&str; 5] = [
     "Top Receivers",
 ];
 const CHART_HEIGHT: f32 = 200.0;
-const BAR_COLORS: [Color32; 6] = [
-    theme::ACCENT,
-    theme::OK,
-    theme::WARN,
-    Color32::from_rgb(0xb0, 0x7c, 0xe8),
-    theme::ERROR,
-    Color32::from_rgb(0x4a, 0x90, 0xe2),
-];
 
 pub fn show(ui: &mut Ui, app: &mut App) {
     if syncing_guard(ui, app, "Analytics") {
@@ -40,14 +34,14 @@ pub fn show(ui: &mut Ui, app: &mut App) {
     egui::ScrollArea::vertical().show(ui, |ui| {
         ui.columns(2, |cols| {
             panel(&mut cols[0], app, 0);
-            cols[0].add_space(8.0);
+            cols[0].add_space(CARD_GAP);
             panel(&mut cols[0], app, 2);
 
             panel(&mut cols[1], app, 1);
-            cols[1].add_space(8.0);
+            cols[1].add_space(CARD_GAP);
             panel(&mut cols[1], app, 3);
         });
-        ui.add_space(8.0);
+        ui.add_space(CARD_GAP);
         panel(ui, app, 4);
     });
 }
@@ -83,7 +77,7 @@ fn banners(ui: &mut Ui, app: &mut App) {
                     .strong()
                     .color(theme::WARN),
             );
-            dismiss = ui.small_button("Dismiss").clicked();
+            dismiss = ui.button("Dismiss").clicked();
         });
         ui.add_space(4.0);
     }
@@ -127,7 +121,7 @@ fn panel(ui: &mut Ui, app: &mut App, i: usize) {
             }
             (1, ViewMode::Table) => tx_table(ui, &id, view),
             (1, ViewMode::Chart) => {
-                time_chart(ui, &id, "Transactions", &view.tx_over_time, theme::OK)
+                time_chart(ui, &id, "Transactions", &view.tx_over_time, theme::INFO)
             }
             (2, ViewMode::Table) => protocol_table(ui, &id, view),
             (2, ViewMode::Chart) => protocol_chart(ui, &id, view),
@@ -178,7 +172,7 @@ fn tx_table(ui: &mut Ui, id: &str, view: &AggregatedView) {
 
 fn protocol_table(ui: &mut Ui, id: &str, view: &AggregatedView) {
     if view.protocol_counts.is_empty() {
-        placeholder(ui, "No protocol activity detected");
+        placeholder(ui, "No protocol activity yet");
         return;
     }
     count_grid(
@@ -191,7 +185,7 @@ fn protocol_table(ui: &mut Ui, id: &str, view: &AggregatedView) {
 
 fn address_table(ui: &mut Ui, id: &str, entries: &[(String, usize)], kind: &str) {
     if entries.is_empty() {
-        placeholder(ui, &format!("No {kind} data available"));
+        placeholder(ui, &format!("No {kind} data yet"));
         return;
     }
     egui::ScrollArea::vertical()
@@ -218,12 +212,12 @@ fn count_grid<'a>(
         .striped(true)
         .spacing([24.0, 4.0])
         .show(ui, |ui| {
-            ui.label(RichText::new(name_header).strong());
-            ui.label(RichText::new("Txs").strong());
+            column_header(ui, name_header);
+            column_header(ui, "Txs");
             ui.end_row();
             for (name, count) in rows {
-                ui.label(RichText::new(name).monospace());
-                ui.label(RichText::new(format_number(count as u64)).strong());
+                ui.label(name);
+                ui.label(format_number(count as u64));
                 ui.end_row();
             }
         });
@@ -234,7 +228,7 @@ fn count_grid<'a>(
 /// Line chart of `(timestamp_ms, value)` points, with the x axis shown relative to now.
 fn time_chart(ui: &mut Ui, id: &str, name: &str, data: &[(f64, f64)], color: Color32) {
     if data.is_empty() {
-        placeholder(ui, "No data for chart yet");
+        placeholder(ui, "No data yet");
         return;
     }
     let now_ms = SystemTime::now()
@@ -272,7 +266,7 @@ fn relative_time_label(minutes: f64) -> String {
 
 fn protocol_chart(ui: &mut Ui, id: &str, view: &AggregatedView) {
     if view.protocol_counts.is_empty() {
-        placeholder(ui, "No protocol data for chart");
+        placeholder(ui, "No protocol activity yet");
         return;
     }
     let labels: Vec<String> = view
@@ -287,7 +281,7 @@ fn protocol_chart(ui: &mut Ui, id: &str, view: &AggregatedView) {
         .map(|(i, (p, count))| {
             Bar::new(i as f64, *count as f64)
                 .name(p.label())
-                .fill(BAR_COLORS[i % BAR_COLORS.len()])
+                .fill(theme::SERIES[i % theme::SERIES.len()])
         })
         .collect();
     bar_chart(ui, id, bars, labels);
@@ -295,7 +289,7 @@ fn protocol_chart(ui: &mut Ui, id: &str, view: &AggregatedView) {
 
 fn address_chart(ui: &mut Ui, id: &str, entries: &[(String, usize)], kind: &str) {
     if entries.is_empty() {
-        placeholder(ui, &format!("No {kind} data for chart"));
+        placeholder(ui, &format!("No {kind} data yet"));
         return;
     }
     let top: Vec<_> = entries.iter().take(10).collect();

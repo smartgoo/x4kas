@@ -19,11 +19,16 @@ pub fn show(ctx: &egui::Context, cl: &mut CommandLine, cmd_tx: &CommandSender) {
     }
 
     egui::TopBottomPanel::bottom("command_palette")
+        .frame(
+            egui::Frame::new()
+                .fill(theme::BG_DEEP)
+                .stroke(egui::Stroke::new(1.0_f32, theme::BORDER_HI))
+                .inner_margin(egui::Margin::symmetric(10, 6)),
+        )
         .resizable(true)
         .default_height(220.0)
         .min_height(80.0)
         .show(ctx, |ui| {
-            ui.add_space(4.0);
             input_row(ui, cl, cmd_tx);
             suggestions(ui, cl);
             ui.separator();
@@ -51,10 +56,9 @@ fn input_row(ui: &mut Ui, cl: &mut CommandLine, cmd_tx: &CommandSender) {
     }
 
     ui.horizontal(|ui| {
-        ui.label(RichText::new(":").monospace().strong().color(theme::ACCENT));
+        ui.label(RichText::new(":").color(theme::ACCENT_BRIGHT));
         let edit = TextEdit::singleline(&mut cl.input)
             .id_salt("command_input")
-            .font(egui::TextStyle::Monospace)
             .hint_text("command — Tab to complete, ↑/↓ history, Esc to close")
             .desired_width(f32::INFINITY);
         let response = ui.add(edit);
@@ -95,11 +99,7 @@ fn suggestions(ui: &mut Ui, cl: &mut CommandLine) {
     if let Some(m) = methods::find(first)
         && !m.params.is_empty()
     {
-        ui.label(
-            RichText::new(format!("usage: {}", m.usage()))
-                .monospace()
-                .weak(),
-        );
+        ui.label(RichText::new(format!("usage: {}", m.usage())).weak());
         return;
     }
     let matches = cl.suggestions();
@@ -108,11 +108,7 @@ fn suggestions(ui: &mut Ui, cl: &mut CommandLine) {
     }
     ui.horizontal_wrapped(|ui| {
         for (name, desc) in matches.iter().take(MAX_SUGGESTIONS) {
-            if ui
-                .small_button(RichText::new(*name).monospace())
-                .on_hover_text(*desc)
-                .clicked()
-            {
+            if ui.small_button(*name).on_hover_text(*desc).clicked() {
                 cl.input = name.to_string();
             }
         }
@@ -124,11 +120,7 @@ fn suggestions(ui: &mut Ui, cl: &mut CommandLine) {
 
 fn output(ui: &mut Ui, cl: &CommandLine) {
     if cl.output.is_empty() {
-        ui.label(
-            RichText::new("Type `help` to list commands.")
-                .weak()
-                .italics(),
-        );
+        ui.label(RichText::new("Type `help` to list commands.").weak());
         return;
     }
     egui::ScrollArea::vertical()
@@ -136,17 +128,13 @@ fn output(ui: &mut Ui, cl: &CommandLine) {
         .stick_to_bottom(true)
         .show(ui, |ui| {
             for entry in &cl.output {
-                ui.label(
-                    RichText::new(format!("> {}", entry.command))
-                        .monospace()
-                        .color(theme::ACCENT),
-                );
+                ui.label(RichText::new(format!("> {}", entry.command)).color(theme::ACCENT));
                 let color = if entry.is_error {
                     theme::ERROR
                 } else {
                     ui.visuals().text_color()
                 };
-                ui.label(RichText::new(&entry.result).monospace().color(color));
+                ui.label(RichText::new(&entry.result).color(color));
                 ui.add_space(6.0);
             }
         });

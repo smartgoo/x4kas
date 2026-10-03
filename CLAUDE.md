@@ -40,18 +40,18 @@ egui/eframe desktop GUI for monitoring a Kaspa L1 node via wRPC, with an optiona
 - `src/rpc/methods.rs`: `RPC_METHODS` catalog (name, description, typed params with defaults), `resolve_args`, and argument parsers.
 - `src/rpc/hash_links.rs`: finds block hashes (by field name) in JSON responses so the result viewer can link them to `get_block`.
 - `src/rpc/types.rs`: UI-friendly structs with `From` impls for kaspa RPC types.
-- `src/gui/mod.rs`: `GuiApp` (`eframe::App`). Frame loop, top bar (status, network, pause, tabs, help/palette buttons), keyboard shortcuts, quit handling.
+- `src/gui/mod.rs`: `GuiApp` (`eframe::App`). Frame loop, top bar (brand, tab strip, palette/help buttons), bottom status bar (connection, node, network, DAA, poll latency, pause), keyboard shortcuts, quit handling.
 - `src/gui/dashboard.rs`: Dashboard tab (node info, network + supply, markets, mining, mempool & fees cards).
 - `src/gui/mempool.rs`: Mempool tab (`egui_extras` table, click a row for the detail window).
 - `src/gui/blockdag.rs`: BlockDAG tab (custom painter DAG visualizer, metrics, GHOSTDAG stats, tip/parent lists, Block Info window).
 - `src/gui/analytics.rs`: Analytics tab (5 panels with a Table/Chart toggle and time window; `egui_plot` charts).
 - `src/gui/rpc_explorer.rs`: RPC Cmds tab (method list, argument form, Loop toggle, read-only JSON result viewer with 🔍 links on block hashes that run `get_block`).
 - `src/gui/node.rs`: Node tab (settings form bound to a `DaemonConfig` copy, Start/Stop/Save, status, log viewer).
-- `src/gui/connection.rs`: `ConnectionWindow`, opened from the top-bar status button. Custom URL / public resolver / embedded node, network, Connect/Disconnect.
+- `src/gui/connection.rs`: `ConnectionWindow`, opened from the status-bar connection button. Custom URL / public resolver / embedded node, network, Connect/Disconnect.
 - `src/gui/command.rs`: command palette (bottom panel: input, suggestions, output).
 - `src/gui/help.rs`: help window (shortcuts).
-- `src/gui/theme.rs`: color constants and status → label/color mapping.
-- `src/gui/widgets.rs`: shared building blocks (`card`, `kv_grid`/`kv`, `placeholder`, `syncing_guard`).
+- `src/gui/theme.rs`: palette constants, `apply` (monospace fonts + dark visuals, installed at startup), and status → label/color mapping.
+- `src/gui/widgets.rs`: shared building blocks (`card` with the title set into its border, `kv_grid`/`kv`, `section_title`, `column_header`, `primary_button`/`danger_button`, `placeholder`, `syncing_guard`/`syncing_note`, `CARD_GAP`).
 
 ### Dependencies
 
@@ -67,7 +67,7 @@ egui/eframe desktop GUI for monitoring a Kaspa L1 node via wRPC, with an optiona
 - Background code that mutates `App` must call `app.mark_dirty()` so the GUI repaints.
 - GUI-only view state (popups open, help visible) lives in `GuiApp` or egui memory, not `App`, unless tests need it.
 - All RPC types have UI-friendly wrapper structs in `rpc/types.rs`. Don't use raw kaspa types in UI code.
-- Use `theme::*` colors and `widgets::*` helpers for a consistent look. Labels use `.weak()`.
+- Use `theme::*` colors and `widgets::*` helpers for a consistent look; never hard-code `Color32`s in views. Labels use `.weak()`. All text is already monospace, so don't add `.monospace()`.
 - Shortcuts are ignored while a text field has focus (`ctx.wants_keyboard_input()`), except Cmd/Ctrl+K.
 - Shortcuts: `1`–`6` tabs, Ctrl+Tab / Ctrl+Shift+Tab cycle, `p` pause, `:` or Cmd/Ctrl+K palette, `?`/F1 help, Esc closes popups.
 - 36 read-only RPC methods (listed in `rpc/methods.rs`) are available in both the RPC Cmds tab and the command palette (`method arg1 arg2 …`; lists are comma-separated). Responses are pretty-printed JSON (`to_json`; wrap bare values in a `json!` object). To add one, add it to `RPC_METHODS` and a match arm in `RpcManager::execute_rpc_call`; a test checks every method has an arm. State-changing calls (`submit_*`, `add_peer`, `ban`/`unban`, `resolve_finality_conflict`, `shutdown`) are intentionally not exposed.

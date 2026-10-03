@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use eframe::egui::{self, Event, Key, Modifiers, RichText, ViewportCommand};
+use eframe::egui::{self, Button, Event, Key, Modifiers, RichText, Stroke, ViewportCommand};
 use tokio::sync::{RwLock, oneshot};
 
 use crate::app::{App, DaemonStatus, Tab};
@@ -24,6 +24,7 @@ use crate::cli::CliArgs;
 use crate::config::{ConnectionKind, ConnectionSettings, DaemonConfig};
 use crate::controller::{self, CommandSender, ControllerArgs, RemoteTarget, UiCommand};
 use crate::rpc::market;
+use crate::rpc::types::format_number;
 use connection::ConnectionWindow;
 
 /// Start background tasks on `rt` and run the GUI on the current (main) thread.
@@ -76,6 +77,7 @@ pub fn run(rt: &tokio::runtime::Runtime, args: CliArgs, daemon_config: DaemonCon
         "tui4kas",
         options,
         Box::new(move |cc| {
+            theme::apply(&cc.egui_ctx);
             let ctx = cc.egui_ctx.clone();
             app.blocking_write().repaint = Some(Arc::new(move || ctx.request_repaint()));
             Ok(Box::new(GuiApp::new(app, cmd_tx, connection)))
@@ -146,9 +148,13 @@ impl eframe::App for GuiApp {
 
         handle_shortcuts(ctx, &mut app, &mut self.show_help);
 
-        egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
-            top_bar(ui, &mut app, &mut self.show_help, &mut self.connection)
-        });
+        egui::TopBottomPanel::top("top_bar")
+            .frame(bar_frame())
+            .show(ctx, |ui| top_bar(ui, &mut app, &mut self.show_help));
+        // Added before the palette so it stays at the very bottom, below it.
+        egui::TopBottomPanel::bottom("status_bar")
+            .frame(bar_frame())
+            .show(ctx, |ui| status_bar(ui, &mut app, &mut self.connection));
         command::show(ctx, &mut app.command_line, &self.cmd_tx);
 
         egui::CentralPanel::default().show(ctx, |ui| match app.active_tab {
@@ -248,26 +254,22 @@ fn toggle_palette(app: &mut App) {
     }
 }
 
-fn top_bar(
-    ui: &mut egui::Ui,
-    app: &mut App,
-    show_help: &mut bool,
-    connection: &mut ConnectionWindow,
-) {
-    ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        ui.label(
-            RichText::new("tui4kas")
-                .strong()
-                .color(theme::ACCENT)
-                .size(16.0),
-        );
-        ui.separator();
+fn bar_frame() -> egui::Frame {
+    egui::Frame::new()
+        .fill(theme::SURFACE)
+        .stroke(Stroke::new(1.0_f32, theme::BORDER))
+        .inner_margin(egui::Margin::symmetric(10, 4))
+}
 
+/// Brand prompt, tmux-style tab strip, and the palette/help buttons.
+fn top_bar(ui: &mut egui::Ui, app: &mut App, show_help: &mut bool) {
+    ui.horizontal(|ui| {
+        brand(ui);
+        ui.add_space(12.0);
+
+        ui.spacing_mut().item_spacing.x = 2.0;
         for (i, tab) in Tab::all().iter().enumerate() {
-            let selected = app.active_tab == *tab;
-            if ui
-                .selectable_label(selected, tab.label())
+            if tab_button(ui, i + 1, tab.label(), app.active_tab == *tab)
                 .on_hover_text(format!("Shortcut: {}", i + 1))
                 .clicked()
             {
@@ -276,7 +278,8 @@ fn top_bar(
         }
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.button("?").on_hover_text("Help (?)").clicked() {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            if ui.button("?").on_hover_text("Help (? / F1)").clicked() {
                 *show_help = !*show_help;
             }
             if ui
@@ -286,47 +289,93 @@ fn top_bar(
             {
                 toggle_palette(app);
             }
+        });
+    });
+}
+
+/// `$ tui4kas█` with a cursor that blinks on the 1s repaint tick.
+fn brand(ui: &mut egui::Ui) {
+    let cursor_on = (ui.input(|i| i.time) as u64).is_multiple_of(2);
+    let cursor = if cursor_on {
+        theme::ACCENT_BRIGHT
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    ui.spacing_mut().item_spacing.x = 0.0;
+    ui.label(RichText::new("$ ").color(theme::TEXT_DIM).size(15.0));
+    ui.label(RichText::new("tui").color(theme::TEXT_BRIGHT).size(15.0));
+    ui.label(RichText::new("4").color(theme::ACCENT_BRIGHT).size(15.0));
+    ui.label(RichText::new("kas").color(theme::TEXT_BRIGHT).size(15.0));
+    ui.label(RichText::new("█").color(cursor).size(15.0));
+}
+
+/// A tab in the strip: the shortcut number, then the name. The active tab is inverted.
+fn tab_button(ui: &mut egui::Ui, number: usize, label: &str, selected: bool) -> egui::Response {
+    let (num_color, text_color, fill) = if selected {
+        (theme::BG_DEEP, theme::BG_DEEP, theme::ACCENT)
+    } else {
+        (theme::ACCENT, theme::TEXT, egui::Color32::TRANSPARENT)
+    };
+    ui.add(
+        Button::new((
+            RichText::new(number.to_string()).color(num_color),
+            RichText::new(label).color(text_color),
+        ))
+        .fill(fill)
+        .stroke(Stroke::NONE)
+        .frame_when_inactive(selected),
+    )
+}
+
+/// Connection (click to change), embedded node, network, DAA score, poll latency and pause.
+fn status_bar(ui: &mut egui::Ui, app: &mut App, connection: &mut ConnectionWindow) {
+    ui.horizontal(|ui| {
+        let (text, color) = theme::connection_status(&app.node.connection_status);
+        if ui
+            .selectable_label(
+                connection.open,
+                RichText::new(format!("● {text} · {}", app.connection.label())).color(color),
+            )
+            .on_hover_text("Change connection")
+            .clicked()
+        {
+            connection.toggle();
+        }
+
+        if app.integrated_node.status != DaemonStatus::Stopped {
+            widgets::divider(ui);
+            let (text, color) = theme::daemon_status(&app.integrated_node.status);
+            ui.label(RichText::new("node").weak());
+            ui.label(RichText::new(text).color(color));
+        }
+
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let pause_label = if app.paused {
                 "▶ Resume"
             } else {
                 "⏸ Pause"
             };
             if ui
-                .button(pause_label)
-                .on_hover_text("Shortcut: P")
+                .selectable_label(app.paused, pause_label)
+                .on_hover_text("Pause / resume polling (P)")
                 .clicked()
             {
                 app.paused = !app.paused;
             }
 
             if app.paused {
-                ui.label(RichText::new("Paused").color(theme::WARN));
+                ui.label(RichText::new("PAUSED").color(theme::WARN));
             } else if let Some(ms) = app.node.last_poll_duration_ms {
-                ui.label(RichText::new(format!("{ms:.0} ms")).weak());
+                ui.label(format!("{ms:.0} ms"));
+                ui.label(RichText::new("poll").weak());
             }
-
             if let Some(ref info) = app.node.server_info {
-                ui.label(RichText::new(&info.network_id).weak());
-            }
-
-            if app.integrated_node.status != DaemonStatus::Stopped {
-                let (text, color) = theme::daemon_status(&app.integrated_node.status);
-                ui.label(RichText::new(format!("Node: {text}")).color(color));
-                ui.separator();
-            }
-
-            let (text, color) = theme::connection_status(&app.node.connection_status);
-            if ui
-                .selectable_label(
-                    connection.open,
-                    RichText::new(format!("● {text} · {}", app.connection.label())).color(color),
-                )
-                .on_hover_text("Change connection")
-                .clicked()
-            {
-                connection.toggle();
+                widgets::divider(ui);
+                ui.label(format_number(info.virtual_daa_score));
+                ui.label(RichText::new("daa").weak());
+                widgets::divider(ui);
+                ui.label(RichText::new(&info.network_id).color(theme::ACCENT));
             }
         });
     });
-    ui.add_space(4.0);
 }

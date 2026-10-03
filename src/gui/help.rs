@@ -3,13 +3,14 @@
 use eframe::egui::{self, RichText};
 
 use super::theme;
+use super::widgets::section_title;
 
 const SHORTCUTS: &[(&str, &str)] = &[
     ("1 – 6", "Switch tab"),
     ("Ctrl+Tab / Ctrl+Shift+Tab", "Next / previous tab"),
     ("P", "Pause / resume polling"),
     (": or ⌘K / Ctrl+K", "Open command palette"),
-    ("?", "Toggle this help"),
+    ("? / F1", "Toggle this help"),
     ("Esc", "Close popup, palette or help"),
 ];
 
@@ -35,7 +36,7 @@ pub fn show(ctx: &egui::Context, open: &mut bool) {
             ui.add_space(8.0);
             ui.label(
                 RichText::new(
-                    "Click the connection status in the top bar to switch nodes. \
+                    "Click the connection status in the status bar to switch nodes. \
                      Shortcuts are ignored while a text field has focus.",
                 )
                 .weak(),
@@ -47,13 +48,13 @@ pub fn show(ctx: &egui::Context, open: &mut bool) {
 }
 
 fn section(ui: &mut egui::Ui, title: &str, rows: &[(&str, &str)]) {
-    ui.label(RichText::new(title).strong().color(theme::ACCENT));
+    section_title(ui, title);
     egui::Grid::new(title)
         .num_columns(2)
         .spacing([24.0, 4.0])
         .show(ui, |ui| {
             for (keys, action) in rows {
-                ui.label(RichText::new(*keys).monospace());
+                ui.label(RichText::new(*keys).color(theme::ACCENT_BRIGHT));
                 ui.label(*action);
                 ui.end_row();
             }

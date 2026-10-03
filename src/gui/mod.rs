@@ -18,13 +18,15 @@ use anyhow::Result;
 use eframe::egui::{self, Button, Event, Key, Modifiers, RichText, Stroke, ViewportCommand};
 use tokio::sync::{RwLock, oneshot};
 
-use crate::app::{ActiveConnection, App, ConnectionStatus, Tab};
+use crate::app::{ActiveConnection, AnalyticsPhase, App, ConnectionStatus, StartPoint, Tab};
 use crate::cli::CliArgs;
 use crate::config::{ConnectionKind, ConnectionSettings};
 use crate::controller::{self, CommandSender, ControllerArgs, RemoteTarget, UiCommand};
+use crate::format::format_duration;
 use crate::rpc::market;
 use crate::rpc::types::format_number;
 use connection::ConnectionWindow;
+use widgets::kv;
 
 /// Start background tasks on `rt` and run the GUI on the current (main) thread.
 pub fn run(rt: &tokio::runtime::Runtime, args: CliArgs) -> Result<()> {
@@ -354,6 +356,162 @@ fn format_seconds(secs: f64) -> String {
     }
 }
 
+/// Node sync indicator; details (version, block counts, last poll) on hover.
+fn node_chip(ui: &mut egui::Ui, app: &App) {
+    if !matches!(app.node.connection_status, ConnectionStatus::Connected) {
+        return;
+    }
+    let node = &app.node;
+    let (text, color) = match node.server_info {
+        None => ("◌ Node", theme::TEXT_DIM),
+        Some(ref info) if info.is_synced => ("● Node synced", theme::OK),
+        Some(_) => ("◐ Node syncing", theme::WARN),
+    };
+    widgets::divider(ui);
+    widgets::status_chip(ui, "node_status", text, color, |ui| {
+        if let Some(ref info) = node.server_info {
+            kv(ui, "Version", &info.server_version);
+            kv(ui, "Synced", widgets::yes_no(info.is_synced));
+            kv(ui, "UTXO index", widgets::yes_no(info.has_utxo_index));
+            kv(ui, "DAA score", format_number(info.virtual_daa_score));
+        }
+        if let Some(ref dag) = node.dag_info {
+            kv(
+                ui,
+                "Blocks / headers",
+                format!(
+                    "{} / {}",
+                    format_number(dag.block_count),
+                    format_number(dag.header_count)
+                ),
+            );
+        }
+        if let Some(secs) = app.seconds_behind_tip(now_ms()) {
+            kv(ui, "Behind tip", format!("{}s", format_seconds(secs)));
+        }
+        if let Some(at) = node.last_refresh {
+            let took = node
+                .last_poll_duration_ms
+                .map(|ms| format!(", took {ms:.0} ms"))
+                .unwrap_or_default();
+            kv(
+                ui,
+                "Last poll",
+                format!("{} ago{took}", format_duration(at.elapsed())),
+            );
+        }
+        if let Some(ref err) = node.last_error {
+            kv(ui, "Error", RichText::new(err).color(theme::ERROR));
+        }
+    });
+}
+
+/// Analytics task indicator; details (start point, progress, speed) on hover.
+fn analytics_chip(ui: &mut egui::Ui, app: &App) {
+    match app.connection {
+        ActiveConnection::None => return,
+        ActiveConnection::Resolver => {
+            widgets::divider(ui);
+            widgets::status_chip(
+                ui,
+                "analytics_status",
+                "○ Analytics n/a",
+                theme::TEXT_DIM,
+                |ui| kv(ui, "Status", "Needs a direct node (URL), not the resolver"),
+            );
+            return;
+        }
+        ActiveConnection::Url(_) => {}
+    }
+
+    let status = &app.analytics.status;
+    let tip = app.node.server_info.as_ref().map(|s| s.virtual_daa_score);
+    let fraction = tip.and_then(|tip| status.fraction(tip));
+    let (text, color, summary) = match status.phase {
+        AnalyticsPhase::Idle => return,
+        _ if app.paused => ("⏸ Analytics paused".into(), theme::TEXT_DIM, "Paused"),
+        AnalyticsPhase::LoadingCache => (
+            "◌ Analytics loading".into(),
+            theme::TEXT_DIM,
+            "Loading the saved cache",
+        ),
+        AnalyticsPhase::WaitingForNode => (
+            "◌ Analytics waiting".into(),
+            theme::TEXT_DIM,
+            "Waiting for the node to connect and sync",
+        ),
+        AnalyticsPhase::CatchingUp => (
+            match fraction {
+                Some(f) => format!("◐ Analytics {:.0}%", f * 100.0),
+                None => "◐ Analytics".into(),
+            },
+            theme::WARN,
+            "Catching up to the DAG tip",
+        ),
+        AnalyticsPhase::Live => (
+            "● Analytics live".into(),
+            theme::OK,
+            "Up to date, checking every 2s",
+        ),
+        AnalyticsPhase::Error(_) => (
+            "× Analytics error".into(),
+            theme::ERROR,
+            "Request failed, retrying every 5s",
+        ),
+    };
+
+    widgets::divider(ui);
+    widgets::status_chip(ui, "analytics_status", &text, color, |ui| {
+        kv(ui, "Status", summary);
+        if let AnalyticsPhase::Error(ref err) = status.phase {
+            kv(ui, "Error", RichText::new(err).color(theme::ERROR));
+        }
+        match status.started_from {
+            Some(StartPoint::Cache(Some(saved))) => {
+                let age = saved.elapsed().unwrap_or_default();
+                kv(
+                    ui,
+                    "Started from",
+                    format!("cache (saved {} ago)", format_duration(age)),
+                );
+            }
+            Some(StartPoint::Cache(None)) => kv(ui, "Started from", "cache"),
+            Some(StartPoint::PruningPoint) => kv(ui, "Started from", "pruning point"),
+            None => {}
+        }
+        if let (Some(current), Some(tip)) = (status.current_daa, tip) {
+            let pct = fraction
+                .map(|f| format!(" ({:.1}%)", f * 100.0))
+                .unwrap_or_default();
+            kv(
+                ui,
+                "Progress",
+                format!(
+                    "DAA {} / {}{pct}",
+                    format_number(current),
+                    format_number(tip)
+                ),
+            );
+        }
+        if status.phase == AnalyticsPhase::CatchingUp {
+            if let Some(rate) = status.daa_per_sec {
+                kv(ui, "Speed", format!("{} DAA/s", format_number(rate as u64)));
+            }
+            if let Some(eta) = tip.and_then(|tip| status.eta(tip)) {
+                kv(ui, "Time left", format!("~{}", format_duration(eta)));
+            }
+        }
+        kv(ui, "Chain blocks", format_number(status.blocks_processed));
+        if let Some(at) = status.last_batch_at {
+            kv(
+                ui,
+                "Last batch",
+                format!("{} ago", format_duration(at.elapsed())),
+            );
+        }
+    });
+}
+
 /// Status bar text, e.g. "Connected to ws://127.0.0.1:17110".
 fn connection_summary(app: &App) -> String {
     let target = match app.connection {
@@ -383,6 +541,8 @@ fn status_bar(ui: &mut egui::Ui, app: &mut App, connection: &mut ConnectionWindo
         {
             connection.toggle();
         }
+        node_chip(ui, app);
+        analytics_chip(ui, app);
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let pause_label = if app.paused {

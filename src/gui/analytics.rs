@@ -9,8 +9,8 @@ use super::widgets::{
     section_title,
 };
 use crate::analytics::AggregatedView;
-use crate::app::{AnalyticsPanel, App, PanelState, TimeWindow, ViewMode};
-use crate::format::{format_hashrate, format_kas};
+use crate::app::{AnalyticsPanel, AnalyticsPhase, App, PanelState, TimeWindow, ViewMode};
+use crate::format::{format_duration, format_hashrate, format_kas};
 use crate::rpc::types::format_number;
 use crate::tx_inspect::TransactionProtocol;
 
@@ -55,12 +55,12 @@ pub fn show(ui: &mut Ui, app: &mut App) {
 }
 
 fn banners(ui: &mut Ui, app: &mut App) {
-    if let Some((current, tip)) = app.analytics.sync_progress {
-        let fraction = if tip > 0 {
-            (current as f32 / tip as f32).min(1.0)
-        } else {
-            0.0
-        };
+    let status = &app.analytics.status;
+    let tip = app.node.server_info.as_ref().map(|s| s.virtual_daa_score);
+    if status.phase == AnalyticsPhase::CatchingUp
+        && let Some(tip) = tip
+    {
+        let fraction = status.fraction(tip).unwrap_or(0.0);
         ui.horizontal(|ui| {
             ui.label(RichText::new("Syncing analytics…").color(theme::WARN));
             ui.add(
@@ -68,11 +68,14 @@ fn banners(ui: &mut Ui, app: &mut App) {
                     .desired_width(300.0)
                     .text(format!(
                         "DAA {}/{} ({:.1}%)",
-                        format_number(current),
+                        format_number(status.current_daa.unwrap_or(0)),
                         format_number(tip),
                         fraction * 100.0
                     )),
             );
+            if let Some(eta) = status.eta(tip) {
+                ui.label(RichText::new(format!("~{} left", format_duration(eta))).weak());
+            }
         });
         ui.add_space(2.0);
     }

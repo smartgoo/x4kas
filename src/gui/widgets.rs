@@ -97,6 +97,19 @@ pub fn divider(ui: &mut Ui) {
     ui.label(RichText::new("│").color(theme::BORDER_HI));
 }
 
+/// A colored status-bar indicator, e.g. `● Node synced`, with a details grid on hover.
+/// Fill the grid with [`kv`] rows.
+pub fn status_chip(
+    ui: &mut Ui,
+    id: &str,
+    text: &str,
+    color: egui::Color32,
+    details: impl FnOnce(&mut Ui),
+) {
+    ui.label(RichText::new(text).color(color))
+        .on_hover_ui(|ui| kv_grid(ui, id, details));
+}
+
 /// Placeholder text for data that needs a direct node (a URL), not the resolver.
 pub fn direct_node_placeholder<'a>(app: &App, waiting: &'a str) -> &'a str {
     match app.connection {

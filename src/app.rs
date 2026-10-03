@@ -529,11 +529,91 @@ pub struct PanelState {
     pub mode: ViewMode,
 }
 
+/// What the analytics streaming task is doing.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum AnalyticsPhase {
+    /// No task running (not connected, or connected through the resolver).
+    #[default]
+    Idle,
+    LoadingCache,
+    /// Waiting for the node to connect and finish syncing.
+    WaitingForNode,
+    /// Fetching chain blocks quickly to reach the tip.
+    CatchingUp,
+    /// At the tip, fetching new chain blocks every few seconds.
+    Live,
+    /// The last request failed; the task retries.
+    Error(String),
+}
+
+/// Where analytics started reading the chain.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StartPoint {
+    /// The last chain block in the saved cache, saved at the given time if known.
+    Cache(Option<std::time::SystemTime>),
+    PruningPoint,
+}
+
+/// Progress of the analytics task, shown in the status bar and on the Analytics tab.
+#[derive(Debug, Clone, Default)]
+pub struct AnalyticsStatus {
+    pub phase: AnalyticsPhase,
+    pub started_from: Option<StartPoint>,
+    /// DAA score of the first processed chain block.
+    pub start_daa: Option<u64>,
+    /// DAA score of the newest processed chain block.
+    pub current_daa: Option<u64>,
+    /// Chain blocks processed since the task started.
+    pub blocks_processed: u64,
+    /// Smoothed catch-up speed in DAA score per second.
+    pub daa_per_sec: Option<f64>,
+    pub last_batch_at: Option<Instant>,
+}
+
+impl AnalyticsStatus {
+    /// Catch-up progress between the start point and `tip_daa`, in `0.0..=1.0`.
+    pub fn fraction(&self, tip_daa: u64) -> Option<f32> {
+        let (start, current) = (self.start_daa?, self.current_daa?);
+        if tip_daa <= start {
+            return Some(1.0);
+        }
+        Some((current.saturating_sub(start) as f32 / (tip_daa - start) as f32).min(1.0))
+    }
+
+    /// Estimated time left to reach `tip_daa` at the current speed.
+    pub fn eta(&self, tip_daa: u64) -> Option<Duration> {
+        let rate = self.daa_per_sec.filter(|r| *r > 0.0)?;
+        let remaining = tip_daa.saturating_sub(self.current_daa?);
+        Some(Duration::from_secs_f64(remaining as f64 / rate))
+    }
+
+    /// Record a processed batch: `newest_daa` is its highest DAA score (0 if empty).
+    pub fn record_batch(&mut self, blocks: usize, newest_daa: u64, now: Instant) {
+        self.blocks_processed += blocks as u64;
+        if newest_daa > 0 {
+            self.start_daa.get_or_insert(newest_daa);
+            if let (Some(prev_daa), Some(prev_at)) = (self.current_daa, self.last_batch_at) {
+                let secs = now.duration_since(prev_at).as_secs_f64();
+                if secs > 0.0 && newest_daa > prev_daa {
+                    let rate = (newest_daa - prev_daa) as f64 / secs;
+                    // Exponential moving average, so the estimate doesn't jump around.
+                    self.daa_per_sec = Some(match self.daa_per_sec {
+                        Some(r) => r * 0.8 + rate * 0.2,
+                        None => rate,
+                    });
+                }
+            }
+            self.current_daa = Some(newest_daa);
+        }
+        self.last_batch_at = Some(now);
+    }
+}
+
 pub struct AnalyticsState {
     pub engine: Option<Arc<tokio::sync::RwLock<AnalyticsEngine>>>,
     /// Indexed by [`AnalyticsPanel`].
     pub panels: [PanelState; 5],
-    pub sync_progress: Option<(u64, u64)>,
+    pub status: AnalyticsStatus,
     pub reorg_notification: Option<String>,
     /// One view per window, indexed by [`TimeWindow::index`].
     pub cached_views: Option<[AggregatedView; 3]>,
@@ -555,7 +635,7 @@ impl Default for AnalyticsState {
                 panel(TimeWindow::OneHour),
                 panel(TimeWindow::OneHour),
             ],
-            sync_progress: None,
+            status: AnalyticsStatus::default(),
             reorg_notification: None,
             cached_views: None,
         }
@@ -644,7 +724,7 @@ impl App {
     pub fn clear_node_data(&mut self) {
         self.node = NodeState::default();
         self.analytics.engine = None;
-        self.analytics.sync_progress = None;
+        self.analytics.status = AnalyticsStatus::default();
         self.analytics.cached_views = None;
         self.analytics.reorg_notification = None;
         self.mempool_selected = 0;
@@ -738,6 +818,59 @@ mod tests {
         assert!(!app.dag_selection.block_loading);
         assert_eq!(app.rpc_explorer.last_response, None);
         assert!(app.paused, "user settings survive a reconnect");
+    }
+
+    #[test]
+    fn clear_node_data_resets_analytics_status() {
+        let mut app = App::default();
+        app.analytics.status.phase = AnalyticsPhase::Live;
+        app.analytics.status.blocks_processed = 10;
+        app.clear_node_data();
+        assert_eq!(app.analytics.status.phase, AnalyticsPhase::Idle);
+        assert_eq!(app.analytics.status.blocks_processed, 0);
+    }
+
+    // --- Analytics status ---
+
+    #[test]
+    fn analytics_status_fraction_is_relative_to_start() {
+        let mut s = AnalyticsStatus::default();
+        assert_eq!(s.fraction(2_000), None);
+        let t0 = Instant::now();
+        s.record_batch(5, 1_000, t0);
+        assert_eq!(s.fraction(2_000), Some(0.0));
+        s.record_batch(5, 1_500, t0 + Duration::from_secs(1));
+        assert_eq!(s.fraction(2_000), Some(0.5));
+        // The tip can't be behind the processed blocks.
+        assert_eq!(s.fraction(1_200), Some(1.0));
+        assert_eq!(s.fraction(900), Some(1.0));
+    }
+
+    #[test]
+    fn analytics_status_rate_and_eta() {
+        let mut s = AnalyticsStatus::default();
+        let t0 = Instant::now();
+        s.record_batch(3, 1_000, t0);
+        assert_eq!(s.daa_per_sec, None);
+        assert_eq!(s.eta(2_000), None);
+        s.record_batch(3, 1_100, t0 + Duration::from_secs(1));
+        assert_eq!(s.daa_per_sec, Some(100.0));
+        assert_eq!(s.eta(2_100), Some(Duration::from_secs(10)));
+        // Smoothed: 100 * 0.8 + 300 * 0.2.
+        s.record_batch(3, 1_400, t0 + Duration::from_secs(2));
+        assert!((s.daa_per_sec.unwrap() - 140.0).abs() < 1e-9);
+        assert_eq!(s.blocks_processed, 9);
+    }
+
+    #[test]
+    fn analytics_status_empty_batch_keeps_progress() {
+        let mut s = AnalyticsStatus::default();
+        let t0 = Instant::now();
+        s.record_batch(2, 1_000, t0);
+        s.record_batch(0, 0, t0 + Duration::from_secs(1));
+        assert_eq!(s.current_daa, Some(1_000));
+        assert_eq!(s.blocks_processed, 2);
+        assert_eq!(s.last_batch_at, Some(t0 + Duration::from_secs(1)));
     }
 
     #[test]

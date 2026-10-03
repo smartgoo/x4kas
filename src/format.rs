@@ -43,10 +43,35 @@ pub fn format_kas(sompi: f64, decimals: usize) -> String {
     }
 }
 
+/// A short duration in its two largest units, e.g. `45s`, `3m 05s`, `2h 10m`, `1d 4h`.
+pub fn format_duration(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    let (days, hours, mins, secs) = (secs / 86_400, secs / 3_600 % 24, secs / 60 % 60, secs % 60);
+    if days > 0 {
+        format!("{days}d {hours}h")
+    } else if hours > 0 {
+        format!("{hours}h {mins:02}m")
+    } else if mins > 0 {
+        format!("{mins}m {secs:02}s")
+    } else {
+        format!("{secs}s")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::rpc::types::format_number;
+
+    #[test]
+    fn format_duration_uses_two_largest_units() {
+        use std::time::Duration;
+        assert_eq!(format_duration(Duration::from_millis(400)), "0s");
+        assert_eq!(format_duration(Duration::from_secs(45)), "45s");
+        assert_eq!(format_duration(Duration::from_secs(185)), "3m 05s");
+        assert_eq!(format_duration(Duration::from_secs(7_800)), "2h 10m");
+        assert_eq!(format_duration(Duration::from_secs(100_800)), "1d 4h");
+    }
 
     #[test]
     fn format_kas_decimals_and_separators() {

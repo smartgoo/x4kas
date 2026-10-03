@@ -32,7 +32,7 @@ egui/eframe desktop GUI for monitoring a Kaspa L1 node via wRPC, connecting by U
 - `src/controller.rs`: the `UiCommand` enum, `RemoteTarget`, and the controller task. Owns the RPC manager and polling handles. Handles startup (`--url`, or idle with the connection window open), connect/disconnect, command-line execution, and shutdown.
 - `src/polling.rs`: `PollingHandles`, RPC creation (`create_and_start_rpc`) and mining polling.
 - `src/config.rs`: `data_dir()` (`~/.x4kas`), `valid_networks()`, and `ConnectionSettings`/`ConnectionKind`, the last connection choice (`~/.x4kas/connection.toml`).
-- `src/analytics.rs` / `src/analytics_streaming.rs`: chain analytics (per-chain-block `Metrics` rolled into 1m/10m buckets, `AggregatedView` per window) and its VSPC v2 streaming task (cache at `~/.x4kas/analytics_cache.bin`, versioned by `CACHE_MAGIC`; bump it when the format changes). All data comes from the connected node.
+- `src/analytics.rs` / `src/analytics_streaming.rs`: chain analytics (per-chain-block `Metrics` rolled into 1m/10m buckets, `AggregatedView` per window) and its VSPC v2 streaming task (cache at `~/.x4kas/analytics_cache.bin`, versioned by `CACHE_MAGIC`; bump it when the format changes). The task reports its progress in `app.analytics.status` (`AnalyticsStatus`/`AnalyticsPhase`), waits for a connected, synced node, and retries failed requests instead of exiting. All data comes from the connected node.
 - `src/tx_inspect.rs`: per-transaction classification, mirroring Kaspalytics: protocol detection, output script classes, covenant/introspection/ZK opcode scanning, coinbase node-version parsing.
 - `src/format.rs`: pure formatting helpers (`format_hashrate`, `format_usd`, `format_kas`, …).
 - `src/rpc/client.rs`: `RpcManager`. Connect, background polling, RPC execution, mining/analytics fetches, block lookup.
@@ -40,7 +40,7 @@ egui/eframe desktop GUI for monitoring a Kaspa L1 node via wRPC, connecting by U
 - `src/rpc/methods.rs`: `RPC_METHODS` catalog (name, description, typed params with defaults), `resolve_args`, and argument parsers.
 - `src/rpc/hash_links.rs`: finds block hashes (by field name) in JSON responses so the result viewer can link them to `get_block`.
 - `src/rpc/types.rs`: UI-friendly structs with `From` impls for kaspa RPC types.
-- `src/gui/mod.rs`: `GuiApp` (`eframe::App`). Frame loop, top bar (brand, tab strip, palette/help buttons), bottom status bar (connection, node, network, DAA, seconds behind the DAG tip, pause), keyboard shortcuts, quit handling.
+- `src/gui/mod.rs`: `GuiApp` (`eframe::App`). Frame loop, top bar (brand, tab strip, palette/help buttons), bottom status bar (connection, node sync and analytics indicators with details on hover, network, DAA, seconds behind the DAG tip, pause), keyboard shortcuts, quit handling.
 - `src/gui/dashboard.rs`: Dashboard tab (node info + block counts, markets, network stats + hashrate + supply, mempool & fees cards).
 - `src/gui/mempool.rs`: Mempool tab (`egui_extras` table, click a row for the detail window).
 - `src/gui/blockdag.rs`: BlockDAG tab (custom painter DAG visualizer, metrics, GHOSTDAG stats, tip/parent lists, Block Info window).
@@ -50,7 +50,7 @@ egui/eframe desktop GUI for monitoring a Kaspa L1 node via wRPC, connecting by U
 - `src/gui/command.rs`: command palette (bottom panel: input, suggestions, output).
 - `src/gui/help.rs`: help window (shortcuts).
 - `src/gui/theme.rs`: palette constants, `apply` (monospace fonts + dark visuals, installed at startup), and status → label/color mapping.
-- `src/gui/widgets.rs`: shared building blocks (`card` with the title set into its border, `kv_grid`/`kv`, `section_title`, `column_header`, `primary_button`, `placeholder`, `direct_node_placeholder`, `CARD_GAP`).
+- `src/gui/widgets.rs`: shared building blocks (`card` with the title set into its border, `kv_grid`/`kv`, `section_title`, `column_header`, `primary_button`, `status_chip`, `placeholder`, `direct_node_placeholder`, `CARD_GAP`).
 
 ### Dependencies
 

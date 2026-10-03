@@ -420,12 +420,6 @@ impl RpcManager {
         Ok(dag.pruning_point_hash)
     }
 
-    /// Get the current DAA score from DAG info.
-    pub async fn get_daa_score(&self) -> Result<u64> {
-        let dag = self.client.get_block_dag_info().await?;
-        Ok(dag.virtual_daa_score)
-    }
-
     /// Extract BlockSummary entries and removed hashes from a VSPC V2 response.
     pub fn extract_block_summaries(
         response: &GetVirtualChainFromBlockV2Response,

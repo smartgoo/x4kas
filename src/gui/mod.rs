@@ -23,9 +23,8 @@ use crate::app::{ActiveConnection, AnalyticsPhase, App, ConnectionStatus, StartP
 use crate::cli::CliArgs;
 use crate::config::{ConnectionKind, ConnectionSettings};
 use crate::controller::{self, CommandSender, ControllerArgs, RemoteTarget, UiCommand};
-use crate::format::format_duration;
+use crate::format::{format_duration, format_number, now_ms};
 use crate::rpc::market;
-use crate::rpc::types::format_number;
 use connection::ConnectionWindow;
 use widgets::kv;
 
@@ -178,9 +177,7 @@ impl eframe::App for GuiApp {
         // A click on any block hash (or a BlockDAG block) opens Block Info here, whatever
         // the tab.
         if let Some(hash) = widgets::take_block_request(ctx) {
-            app.dag_selection.block_hash = Some(hash.clone());
-            app.dag_selection.block_detail = None;
-            app.dag_selection.block_loading = true;
+            app.dag_selection.request(hash.clone());
             let _ = self.cmd_tx.send(UiCommand::LookupBlock(hash));
         }
         blockdag::block_window(ctx, &mut app);
@@ -197,7 +194,7 @@ impl eframe::App for GuiApp {
             });
         }
 
-        // Keep time-based values (uptime, seconds behind sink) ticking. Wake on the
+        // Keep time-based values (seconds behind the tip, "ago" times) ticking. Wake on the
         // next whole second rather than 1s from now, so they tick evenly even when
         // data updates trigger frames at arbitrary times.
         let to_next_second = 1.0 - ctx.input(|i| i.time).fract();
@@ -355,13 +352,6 @@ fn tab_button(ui: &mut egui::Ui, number: usize, label: &str, selected: bool) -> 
         .stroke(Stroke::NONE)
         .frame_when_inactive(selected),
     )
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or_default()
 }
 
 /// One decimal under 10s (a healthy node is usually under a second behind), whole seconds above.

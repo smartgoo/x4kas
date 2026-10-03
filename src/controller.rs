@@ -1,15 +1,16 @@
 //! Owns the node connection lifecycle (RPC manager, polling tasks) and executes
 //! commands sent from the frontend.
 
+use std::future::Future;
 use std::sync::Arc;
 
+use anyhow::{Result, anyhow};
 use tokio::sync::{RwLock, mpsc, oneshot};
 
 use crate::analytics_streaming;
 use crate::app::{ActiveConnection, App, CommandLine, ConnectionStatus};
-use crate::polling::{PollingHandles, create_and_start_rpc, start_mining_polling};
+use crate::polling::{PollingHandles, create_and_start_rpc, start_hashrate_polling};
 use crate::rpc::client::RpcManager;
-use crate::rpc::methods;
 
 /// Commands sent from the frontend to the controller task.
 pub enum UiCommand {
@@ -64,7 +65,7 @@ pub fn spawn(
         refresh_interval_ms: args.refresh_interval_ms,
         remote: args.remote,
         rpc: None,
-        polling: PollingHandles::new(),
+        polling: PollingHandles::default(),
     };
     rt.spawn(controller.run(rx));
     tx
@@ -81,7 +82,7 @@ impl Controller {
                 UiCommand::Disconnect => self.disconnect().await,
                 UiCommand::ExecuteRpc { method, args } => self.execute_rpc(method, args),
                 UiCommand::LookupBlock(hash) => self.lookup_block(hash),
-                UiCommand::RunCommandLine(cmd) => self.run_command_line(cmd),
+                UiCommand::RunCommandLine(cmd) => self.run_command_line(cmd).await,
                 UiCommand::Shutdown(done) => {
                     self.stop_all().await;
                     let _ = done.send(());
@@ -104,16 +105,14 @@ impl Controller {
         self.remote = None;
     }
 
-    /// Connect to `self.remote`. Mining and analytics need a direct node, so they are
-    /// only started for a URL, not for the resolver.
+    /// Connect to `self.remote`. Analytics needs a direct node, so it is only started
+    /// for a URL, not for the resolver.
     async fn connect_remote(&mut self) {
         let Some(target) = self.remote.clone() else {
             return;
         };
-        let direct = target.url.is_some();
         {
             let mut app = self.app.write().await;
-            app.has_direct_node = direct;
             app.connection = match target.url {
                 Some(ref url) => ActiveConnection::Url(url.clone()),
                 None => ActiveConnection::Resolver,
@@ -123,17 +122,15 @@ impl Controller {
         }
 
         match create_and_start_rpc(
-            target.url,
+            target.url.as_deref(),
             &target.network,
             &self.app,
             self.refresh_interval_ms,
             &mut self.polling,
-        )
-        .await
-        {
+        ) {
             Ok(rpc) => {
-                if direct {
-                    start_mining_polling(&rpc, &self.app, &mut self.polling);
+                start_hashrate_polling(&rpc, &self.app, &mut self.polling);
+                if target.url.is_some() {
                     analytics_streaming::start_analytics_streaming(
                         &rpc,
                         &self.app,
@@ -162,90 +159,92 @@ impl Controller {
         save_analytics_cache(&app);
         app.clear_node_data();
         app.connection = ActiveConnection::None;
-        app.has_direct_node = false;
         app.mark_dirty();
     }
 
-    fn execute_rpc(&self, method: String, args: Vec<String>) {
+    /// Run `request` against the current RPC manager in a tracked task (aborted by a
+    /// connection switch, so a late reply can't land in the next node's data), then
+    /// hand its result to `apply` under the app write lock.
+    fn spawn_rpc<T, F>(
+        &mut self,
+        request: impl FnOnce(Arc<RpcManager>) -> F + Send + 'static,
+        apply: impl FnOnce(&mut App, Result<T>) + Send + 'static,
+    ) where
+        T: Send + 'static,
+        F: Future<Output = Result<T>> + Send + 'static,
+    {
         let rpc = self.rpc.clone();
         let app = self.app.clone();
-        tokio::spawn(async move {
+        self.polling.spawn_request(async move {
             let result = match rpc {
-                Some(rpc) => rpc.execute_rpc_call(&method, &args).await,
-                None => Err(anyhow::anyhow!("not connected")),
+                Some(rpc) => request(rpc).await,
+                None => Err(anyhow!("not connected")),
             };
-            // The result viewer shows JSON, errors included.
-            let result = result.unwrap_or_else(|e| {
-                serde_json::to_string_pretty(&serde_json::json!({ "error": e.to_string() }))
-                    .unwrap_or_default()
-            });
             let mut app = app.write().await;
-            app.rpc_explorer.set_response(Some(result));
-            app.rpc_explorer.is_loading = false;
+            apply(&mut app, result);
             app.mark_dirty();
         });
     }
 
-    fn lookup_block(&self, hash: String) {
-        let rpc = self.rpc.clone();
-        let app = self.app.clone();
-        tokio::spawn(async move {
-            let result = match rpc {
-                Some(rpc) => match rpc.get_block_by_hash(&hash).await {
-                    Ok(info) => info,
-                    Err(e) => format!("Error: {}", e),
-                },
-                None => "Error: not connected".to_string(),
-            };
-            let mut app = app.write().await;
-            app.dag_selection.block_detail = Some(result);
-            app.dag_selection.block_loading = false;
-            app.mark_dirty();
-        });
+    fn execute_rpc(&mut self, method: String, args: Vec<String>) {
+        self.spawn_rpc(
+            move |rpc| async move { rpc.execute_rpc_call(&method, &args).await },
+            |app, result| {
+                // The result viewer shows JSON, errors included.
+                let response = result.unwrap_or_else(|e| error_json(&e));
+                app.rpc_explorer.set_response(Some(response));
+                app.rpc_explorer.is_loading = false;
+            },
+        );
     }
 
-    fn run_command_line(&self, cmd: String) {
-        let rpc = self.rpc.clone();
-        let app = self.app.clone();
-        tokio::spawn(async move {
-            let mut words = cmd.split_whitespace().map(str::to_string);
-            let command = words.next().unwrap_or_default();
-            let args: Vec<String> = words.collect();
-            let (output, is_error) = match command.as_str() {
-                "help" => {
-                    let mut help_text = String::from("Available commands:\n\n");
-                    for (name, desc) in CommandLine::available_commands() {
-                        help_text.push_str(&format!("  {:<34} {}\n", name, desc));
-                        if let Some(m) = methods::find(name)
-                            && !m.params.is_empty()
-                        {
-                            help_text.push_str(&format!("      usage: {}\n", m.usage()));
-                        }
-                    }
-                    help_text.push_str(
-                        "\nOpen with ':' or Ctrl+K · Tab completes · Up/Down for history · Esc closes",
-                    );
-                    (help_text, false)
-                }
-                "clear" => {
-                    let mut app = app.write().await;
-                    app.command_line.output.clear();
-                    app.mark_dirty();
-                    return;
-                }
-                _ => match rpc {
-                    Some(rpc) => match rpc.execute_rpc_call(&command, &args).await {
+    fn lookup_block(&mut self, hash: String) {
+        self.spawn_rpc(
+            move |rpc| async move {
+                rpc.execute_rpc_call("get_block", &[hash, "true".to_string()])
+                    .await
+            },
+            |app, result| {
+                let detail = result.unwrap_or_else(|e| error_json(&e));
+                app.dag_selection.set_detail(Some(detail));
+                app.dag_selection.block_loading = false;
+            },
+        );
+    }
+
+    async fn run_command_line(&mut self, cmd: String) {
+        let mut words = cmd.split_whitespace().map(str::to_string);
+        let command = words.next().unwrap_or_default();
+        let args: Vec<String> = words.collect();
+        match command.as_str() {
+            "help" => {
+                let mut app = self.app.write().await;
+                app.command_line
+                    .push_output(cmd, CommandLine::help_text(), false);
+                app.mark_dirty();
+            }
+            "clear" => {
+                let mut app = self.app.write().await;
+                app.command_line.output.clear();
+                app.mark_dirty();
+            }
+            _ => self.spawn_rpc(
+                move |rpc| async move { rpc.execute_rpc_call(&command, &args).await },
+                move |app, result| {
+                    let (output, is_error) = match result {
                         Ok(response) => (response, false),
                         Err(e) => (e.to_string(), true),
-                    },
-                    None => ("not connected".to_string(), true),
+                    };
+                    app.command_line.push_output(cmd, output, is_error);
                 },
-            };
-            let mut app = app.write().await;
-            app.command_line.push_output(cmd, output, is_error);
-            app.mark_dirty();
-        });
+            ),
+        }
     }
+}
+
+/// An error as a JSON object, for views that show JSON responses.
+fn error_json(e: &anyhow::Error) -> String {
+    serde_json::to_string_pretty(&serde_json::json!({ "error": e.to_string() })).unwrap_or_default()
 }
 
 /// Persist the analytics cache (best-effort; the streaming task is aborted, not stopped).

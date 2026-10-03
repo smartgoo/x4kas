@@ -2,11 +2,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use futures::stream::{self, StreamExt};
 use kaspa_rpc_core::api::rpc::RpcApi;
 use kaspa_rpc_core::{
     GetVirtualChainFromBlockV2Response, RpcDataVerbosityLevel, RpcHash, RpcHeader,
-    RpcOptionalTransaction,
 };
 use kaspa_wrpc_client::prelude::*;
 use serde::Serialize;
@@ -14,64 +12,34 @@ use serde_json::json;
 use std::str::FromStr;
 use tokio::sync::RwLock;
 
-use crate::analytics::{BlockSummary, Metrics};
 use crate::app::{App, ConnectionStatus, DagBlock, Tab};
+use crate::format::sompi_to_kas;
 use crate::rpc::methods::{
     self, parse_address, parse_addresses, parse_bool, parse_hash, parse_opt_u64,
     parse_subnetwork_id, parse_u64, parse_u64_list, parse_verbosity,
 };
-use crate::rpc::types::sompi_to_kas;
-use crate::tx_inspect::{
-    OpcodeUsage, ScriptClass, coinbase_node_version, detect_protocol, output_script_opcodes,
-    redeem_script_opcodes, script_class,
-};
 
 pub struct RpcManager {
-    client: Arc<KaspaRpcClient>,
+    client: KaspaRpcClient,
     app_state: Arc<RwLock<App>>,
-    poll_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl RpcManager {
-    pub async fn new(
-        url: Option<String>,
-        network: &str,
-        app_state: Arc<RwLock<App>>,
-    ) -> Result<Self> {
-        let network_id = NetworkId::from_str(network)?;
-
-        let client = if let Some(ref url) = url {
-            KaspaRpcClient::new(
-                WrpcEncoding::Borsh,
-                Some(url.as_str()),
-                None,
-                Some(network_id),
-                None,
-            )?
-        } else {
-            let resolver = Resolver::default();
-            KaspaRpcClient::new(
-                WrpcEncoding::Borsh,
-                None,
-                Some(resolver),
-                Some(network_id),
-                None,
-            )?
-        };
-
-        Ok(Self {
-            client: Arc::new(client),
-            app_state,
-            poll_handle: None,
-        })
+    /// `url: None` connects through the public node resolver.
+    pub fn new(url: Option<&str>, network: &str, app_state: Arc<RwLock<App>>) -> Result<Self> {
+        let client = KaspaRpcClient::new(
+            WrpcEncoding::Borsh,
+            url,
+            url.is_none().then(Resolver::default),
+            Some(NetworkId::from_str(network)?),
+            None,
+        )?;
+        Ok(Self { client, app_state })
     }
 
+    /// Connect, recording the outcome in `connection_status` (the controller has already
+    /// set it to `Connecting`).
     pub async fn connect(&self) -> Result<()> {
-        {
-            let mut app = self.app_state.write().await;
-            app.node.connection_status = ConnectionStatus::Connecting;
-        }
-
         match self.client.connect(None).await {
             Ok(_) => {
                 let mut app = self.app_state.write().await;
@@ -94,17 +62,18 @@ impl RpcManager {
     }
 
     /// Poll the node every `interval` until the surrounding task is aborted.
-    pub async fn poll_forever(&self, interval: Duration, app_state: Arc<RwLock<App>>) {
+    pub async fn poll_forever(&self, interval: Duration) {
         let mut ticker = tokio::time::interval(interval);
         loop {
             ticker.tick().await;
-            if !app_state.read().await.paused {
-                Self::poll_once(&self.client, &app_state).await;
+            if !self.app_state.read().await.paused {
+                self.poll_once().await;
             }
         }
     }
 
-    async fn poll_once(client: &KaspaRpcClient, state: &Arc<RwLock<App>>) {
+    async fn poll_once(&self) {
+        let client = &self.client;
         let start = std::time::Instant::now();
 
         let (server_info, dag_info, mempool, supply, fee_estimate, sink_blue_score) = tokio::join!(
@@ -121,7 +90,7 @@ impl RpcManager {
             Err(_) => None,
         };
 
-        let mut app = state.write().await;
+        let mut app = self.app_state.write().await;
         let mut errors: Vec<String> = Vec::new();
 
         match server_info {
@@ -276,11 +245,7 @@ impl RpcManager {
             }
             "get_coin_supply" => to_json(&c.get_coin_supply().await?)?,
             "estimate_network_hashes_per_second" => {
-                let dag = c.get_block_dag_info().await?;
-                let r = c
-                    .estimate_network_hashes_per_second(1000, Some(dag.sink))
-                    .await?;
-                to_json(&json!({ "networkHashesPerSecond": r }))?
+                to_json(&json!({ "networkHashesPerSecond": self.estimate_hashrate().await? }))?
             }
             "get_virtual_chain" => {
                 let dag = c.get_block_dag_info().await?;
@@ -389,70 +354,13 @@ impl RpcManager {
         Ok(truncate_response(out))
     }
 
-    pub async fn fetch_mining_info(&self) -> Result<crate::rpc::types::MiningInfo> {
-        use std::collections::HashMap;
-
+    /// Network hashrate (hashes per second) estimated over the last 1000 blocks.
+    pub async fn estimate_hashrate(&self) -> Result<u64> {
         let dag = self.client.get_block_dag_info().await?;
-
-        // Estimate hashrate
-        let hashrate = self
+        Ok(self
             .client
             .estimate_network_hashes_per_second(1000, Some(dag.sink))
-            .await
-            .unwrap_or(0) as f64;
-
-        // Get virtual chain to find recent blocks
-        let vspc = self
-            .client
-            .get_virtual_chain_from_block(dag.pruning_point_hash, false, None)
-            .await?;
-
-        // Sample the last N blocks from the chain
-        let sample_size = 100.min(vspc.added_chain_block_hashes.len());
-        let start = vspc
-            .added_chain_block_hashes
-            .len()
-            .saturating_sub(sample_size);
-        let sample_hashes = &vspc.added_chain_block_hashes[start..];
-
-        let mut miner_counts: HashMap<String, usize> = HashMap::new();
-
-        // Fetch blocks in parallel (10 concurrent)
-        let hashes: Vec<_> = sample_hashes.to_vec();
-        let client = self.client.clone();
-        let results: Vec<_> = stream::iter(hashes)
-            .map(|hash| {
-                let client = client.clone();
-                async move { client.get_block(hash, true).await }
-            })
-            .buffer_unordered(10)
-            .collect()
-            .await;
-
-        for block in results.into_iter().flatten() {
-            // The first transaction in a block is the coinbase
-            if let Some(coinbase) = block.transactions.first() {
-                // Miner address is typically in the first output
-                if let Some(output) = coinbase.outputs.first()
-                    && let Some(ref verbose) = output.verbose_data
-                {
-                    let addr = verbose.script_public_key_address.to_string();
-                    *miner_counts.entry(addr).or_insert(0) += 1;
-                }
-            }
-        }
-
-        let unique_miners = miner_counts.len();
-        let mut top_miners: Vec<(String, usize)> = miner_counts.into_iter().collect();
-        top_miners.sort_by_key(|a| std::cmp::Reverse(a.1));
-        top_miners.truncate(5);
-
-        Ok(crate::rpc::types::MiningInfo {
-            hashrate,
-            unique_miners,
-            top_miners,
-            blocks_analyzed: sample_size,
-        })
+            .await?)
     }
 
     /// Fetch the virtual selected parent chain v2 from a given start hash.
@@ -476,136 +384,6 @@ impl RpcManager {
     pub async fn get_pruning_point_hash(&self) -> Result<RpcHash> {
         let dag = self.client.get_block_dag_info().await?;
         Ok(dag.pruning_point_hash)
-    }
-
-    /// Extract BlockSummary entries and removed hashes from a VSPC V2 response.
-    pub fn extract_block_summaries(
-        response: &GetVirtualChainFromBlockV2Response,
-    ) -> (Vec<BlockSummary>, Vec<String>) {
-        let removed: Vec<String> = response
-            .removed_chain_block_hashes
-            .iter()
-            .map(|h| h.to_string())
-            .collect();
-
-        let summaries = response
-            .chain_block_accepted_transactions
-            .iter()
-            .map(|chain_block| {
-                let header = &chain_block.chain_block_header;
-                let mut metrics = Metrics {
-                    chain_blocks: 1,
-                    ..Default::default()
-                };
-                for tx in chain_block.accepted_transactions.iter() {
-                    record_transaction(&mut metrics, tx);
-                }
-                BlockSummary {
-                    hash: header.hash.map(|h| h.to_string()).unwrap_or_default(),
-                    timestamp_ms: header.timestamp.unwrap_or(0),
-                    metrics,
-                }
-            })
-            .collect();
-
-        (summaries, removed)
-    }
-
-    pub async fn get_block_by_hash(&self, hash_str: &str) -> Result<String> {
-        let hash = kaspa_rpc_core::RpcHash::from_str(hash_str)
-            .map_err(|e| anyhow::anyhow!("Invalid hash: {}", e))?;
-        let block = self.client.get_block(hash, true).await?;
-        Ok(format!("{:#?}", block))
-    }
-}
-
-/// Count one accepted transaction into a chain block's metrics.
-fn record_transaction(metrics: &mut Metrics, tx: &RpcOptionalTransaction) {
-    let payload = tx.payload.as_deref().unwrap_or(&[]);
-
-    // Coinbase: no inputs. Its payload carries the miner's node version.
-    if tx.inputs.is_empty() {
-        if let Some(version) = coinbase_node_version(payload) {
-            *metrics.node_versions.entry(version).or_insert(0) += 1;
-        }
-        return;
-    }
-    metrics.tx_count += 1;
-
-    let mut usage = OpcodeUsage::default();
-    let mut covenant_created = 0;
-    let mut covenant_spent = 0;
-    // Fee = inputs - outputs, known only if every spent UTXO's amount is.
-    let mut input_sum = Some(0u64);
-
-    for input in &tx.inputs {
-        let utxo = input
-            .verbose_data
-            .as_ref()
-            .and_then(|vd| vd.utxo_entry.as_ref());
-        input_sum = input_sum
-            .zip(utxo.and_then(|u| u.amount))
-            .map(|(a, b)| a + b);
-        let Some(utxo) = utxo else { continue };
-
-        if let Some(addr) = utxo
-            .verbose_data
-            .as_ref()
-            .and_then(|uvd| uvd.script_public_key_address.as_ref())
-        {
-            *metrics.senders.entry(addr.to_string()).or_insert(0) += 1;
-        }
-        if utxo.covenant_id.is_some() {
-            covenant_spent += 1;
-        }
-        // Covenant opcodes live in the redeem script a P2SH spend reveals.
-        if let Some(spk) = &utxo.script_public_key
-            && script_class(spk.script()) == ScriptClass::ScriptHash
-            && let Some(sig) = &input.signature_script
-        {
-            usage |= redeem_script_opcodes(sig);
-        }
-    }
-
-    let mut output_sum = 0u64;
-    for output in &tx.outputs {
-        output_sum += output.value.unwrap_or(0);
-        if let Some(spk) = &output.script_public_key {
-            metrics.script_classes.record(script_class(spk.script()));
-            usage |= output_script_opcodes(spk.script());
-        }
-        if output.covenant.as_ref().is_some_and(|c| c.0.is_some()) {
-            covenant_created += 1;
-        }
-        if let Some(addr) = output
-            .verbose_data
-            .as_ref()
-            .and_then(|vd| vd.script_public_key_address.as_ref())
-        {
-            *metrics.receivers.entry(addr.to_string()).or_insert(0) += 1;
-        }
-    }
-
-    metrics.record_fee(input_sum.map(|i| i.saturating_sub(output_sum)));
-    metrics
-        .inspection
-        .record_tx(usage, covenant_created, covenant_spent);
-
-    let input_scripts: Vec<&[u8]> = tx
-        .inputs
-        .iter()
-        .filter_map(|inp| inp.signature_script.as_deref())
-        .collect();
-    if let Some(proto) = detect_protocol(payload, &input_scripts) {
-        *metrics.protocols.entry(proto).or_insert(0) += 1;
-    }
-}
-
-impl Drop for RpcManager {
-    fn drop(&mut self) {
-        if let Some(handle) = self.poll_handle.take() {
-            handle.abort();
-        }
     }
 }
 
@@ -643,8 +421,9 @@ mod tests {
     #[test]
     fn all_rpc_methods_have_handler() {
         let src = include_str!("client.rs");
-        let body = &src[src.find("pub async fn execute_rpc_call").unwrap()
-            ..src.find("pub async fn fetch_mining_info").unwrap()];
+        let start = src.find("pub async fn execute_rpc_call").unwrap();
+        let end = start + src[start..].find("No handler for RPC method").unwrap();
+        let body = &src[start..end];
         for m in RPC_METHODS {
             assert!(
                 body.contains(&format!("\"{}\" =>", m.name)),

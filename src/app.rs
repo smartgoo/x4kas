@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use crate::analytics::{AggregatedView, AnalyticsEngine};
 use crate::rpc::hash_links::{HashLink, block_hash_links};
+use crate::rpc::methods::{self, RPC_METHODS, RpcMethod};
 use crate::rpc::types::*;
 
 /// A block from the node's `BlockAdded` stream, as the DAG visualizer needs it.
@@ -88,12 +89,10 @@ pub struct DagSample {
 #[derive(Debug, Clone, Default)]
 pub struct DagStats {
     pub samples: VecDeque<DagSample>,
-    pub sink_blue_score: Option<u64>,
 }
 
 impl DagStats {
     pub fn update(&mut self, dag_info: &DagInfo, blue_score: Option<u64>) {
-        self.sink_blue_score = blue_score;
         self.samples.push_back(DagSample {
             timestamp: Instant::now(),
             blue_score: blue_score.unwrap_or(0),
@@ -155,8 +154,9 @@ impl DagStats {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Tab {
+    #[default]
     Dashboard,
     Mempool,
     BlockDag,
@@ -175,36 +175,14 @@ impl Tab {
         ]
     }
 
-    pub fn title(&self) -> &'static str {
-        match self {
-            Tab::Dashboard => "1:Dashboard",
-            Tab::Mempool => "2:Mempool",
-            Tab::BlockDag => "3:BlockDAG",
-            Tab::Analytics => "4:Analytics",
-            Tab::RpcExplorer => "5:RPC Cmds",
-        }
-    }
-
-    /// Title without the numeric shortcut prefix.
-    pub fn label(&self) -> &'static str {
-        self.title()
-            .split_once(':')
-            .map_or(self.title(), |(_, name)| name)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ViewMode {
-    #[default]
-    Table,
-    Chart,
-}
-
-impl ViewMode {
+    /// Name in the tab strip, after its number shortcut (its position in [`Self::all`] + 1).
     pub fn label(&self) -> &'static str {
         match self {
-            Self::Table => "Table",
-            Self::Chart => "Chart",
+            Tab::Dashboard => "Dashboard",
+            Tab::Mempool => "Mempool",
+            Tab::BlockDag => "BlockDAG",
+            Tab::Analytics => "Analytics",
+            Tab::RpcExplorer => "RPC Cmds",
         }
     }
 }
@@ -240,19 +218,11 @@ impl TimeWindow {
             Self::TwentyFourHour => 86_400_000,
         }
     }
-
-    /// Width of one bar in the transaction chart.
-    pub fn series_bin_ms(&self) -> u64 {
-        match self {
-            Self::OneMin => 5_000,
-            Self::OneHour => 60_000,
-            Self::TwentyFourHour => 3_600_000,
-        }
-    }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum ConnectionStatus {
+    #[default]
     Disconnected,
     Connecting,
     Connected,
@@ -276,11 +246,18 @@ impl ActiveConnection {
             ActiveConnection::Resolver => "Public resolver",
         }
     }
+
+    /// Connected (or connecting) straight to a node by URL, which mining and analytics
+    /// need; the resolver's public nodes are not used for them.
+    pub fn is_direct(&self) -> bool {
+        matches!(self, ActiveConnection::Url(_))
+    }
 }
 
 pub struct RpcExplorerState {
     pub selected_method: usize,
-    pub available_methods: Vec<&'static str>,
+    /// Every method in [`RPC_METHODS`], sorted by name.
+    pub available_methods: Vec<&'static RpcMethod>,
     /// Argument inputs for the selected method, one per parameter.
     pub args: Vec<String>,
     /// Set through `set_response` so `hash_links` stays in sync.
@@ -296,11 +273,8 @@ pub struct RpcExplorerState {
 
 impl Default for RpcExplorerState {
     fn default() -> Self {
-        let mut available_methods: Vec<_> = crate::rpc::methods::RPC_METHODS
-            .iter()
-            .map(|m| m.name)
-            .collect();
-        available_methods.sort_unstable();
+        let mut available_methods: Vec<_> = RPC_METHODS.iter().collect();
+        available_methods.sort_unstable_by_key(|m| m.name);
         let mut state = Self {
             selected_method: 0,
             available_methods,
@@ -318,10 +292,8 @@ impl Default for RpcExplorerState {
 }
 
 impl RpcExplorerState {
-    pub fn method(&self) -> Option<&'static crate::rpc::methods::RpcMethod> {
-        self.available_methods
-            .get(self.selected_method)
-            .and_then(|name| crate::rpc::methods::find(name))
+    pub fn method(&self) -> Option<&'static RpcMethod> {
+        self.available_methods.get(self.selected_method).copied()
     }
 
     /// Time left until the next loop run (`Duration::ZERO` if due), or `None` when
@@ -350,20 +322,21 @@ impl RpcExplorerState {
         if let Some(i) = self
             .available_methods
             .iter()
-            .position(|m| *m == "get_block")
+            .position(|m| m.name == "get_block")
         {
             self.select(i);
             if let Some(arg) = self.args.first_mut() {
                 *arg = hash.to_string();
             }
-            self.set_response(None);
         }
     }
 
-    /// Select a method and reset the argument inputs to its defaults. Stops any loop.
+    /// Select a method, reset the argument inputs to its defaults and clear the last
+    /// response. Stops any loop.
     pub fn select(&mut self, index: usize) {
         self.selected_method = index;
         self.loop_enabled = false;
+        self.set_response(None);
         self.args = self
             .method()
             .map(|m| {
@@ -476,22 +449,38 @@ impl CommandLine {
             ("help", "Show this help message"),
             ("clear", "Clear command output"),
         ];
-        cmds.extend(
-            crate::rpc::methods::RPC_METHODS
-                .iter()
-                .map(|m| (m.name, m.description)),
-        );
+        cmds.extend(RPC_METHODS.iter().map(|m| (m.name, m.description)));
         cmds
+    }
+
+    /// Output of the `help` command: every command with its description, plus usage for
+    /// methods that take arguments.
+    pub fn help_text() -> String {
+        let mut text = String::from("Available commands:\n\n");
+        for (name, desc) in Self::available_commands() {
+            text.push_str(&format!("  {name:<34} {desc}\n"));
+            if let Some(m) = methods::find(name)
+                && !m.params.is_empty()
+            {
+                text.push_str(&format!("      usage: {}\n", m.usage()));
+            }
+        }
+        text.push_str(
+            "\nOpen with ':' or Ctrl+K · Tab completes · Up/Down for history · Esc closes",
+        );
+        text
     }
 }
 
+#[derive(Default)]
 pub struct NodeState {
     pub server_info: Option<ServerInfo>,
     pub dag_info: Option<DagInfo>,
     pub mempool_state: Option<MempoolState>,
     pub coin_supply: Option<CoinSupplyInfo>,
     pub fee_estimate: Option<FeeEstimateInfo>,
-    pub mining_info: Option<MiningInfo>,
+    /// Estimated network hashrate in hashes per second.
+    pub hashrate: Option<f64>,
     pub dag_visualizer: DagVisualizer,
     pub dag_stats: DagStats,
     pub sink_blue_score: Option<u64>,
@@ -505,43 +494,15 @@ pub struct NodeState {
     pub last_error: Option<String>,
 }
 
-impl Default for NodeState {
-    fn default() -> Self {
-        Self {
-            server_info: None,
-            dag_info: None,
-            mempool_state: None,
-            coin_supply: None,
-            fee_estimate: None,
-            mining_info: None,
-            dag_visualizer: DagVisualizer::default(),
-            dag_stats: DagStats::default(),
-            sink_blue_score: None,
-            sink_timestamp_ms: None,
-            node_url: None,
-            node_uid: None,
-            connection_status: ConnectionStatus::Disconnected,
-            last_refresh: None,
-            last_poll_duration_ms: None,
-            last_error: None,
-        }
-    }
-}
-
-/// Analytics cards with their own time window and table/chart toggle.
+/// Analytics cards with their own time window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnalyticsPanel {
     TxSummary,
     Inspection,
     NodeVersions,
+    Miners,
     TopSenders,
     TopReceivers,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PanelState {
-    pub window: TimeWindow,
-    pub mode: ViewMode,
 }
 
 /// DAA score growth per second: 10 blocks per second since Crescendo, on mainnet and
@@ -637,8 +598,8 @@ impl AnalyticsStatus {
 
 pub struct AnalyticsState {
     pub engine: Option<Arc<tokio::sync::RwLock<AnalyticsEngine>>>,
-    /// Indexed by [`AnalyticsPanel`].
-    pub panels: [PanelState; 5],
+    /// Each panel's time window, indexed by [`AnalyticsPanel`].
+    pub windows: [TimeWindow; 6],
     pub status: AnalyticsStatus,
     pub reorg_notification: Option<String>,
     /// One view per window, indexed by [`TimeWindow::index`].
@@ -647,19 +608,17 @@ pub struct AnalyticsState {
 
 impl Default for AnalyticsState {
     fn default() -> Self {
-        let panel = |window| PanelState {
-            window,
-            mode: ViewMode::Table,
-        };
+        use TimeWindow::*;
         Self {
             engine: None,
             // Same windows as the Kaspalytics home page
-            panels: [
-                panel(TimeWindow::TwentyFourHour),
-                panel(TimeWindow::TwentyFourHour),
-                panel(TimeWindow::OneHour),
-                panel(TimeWindow::OneHour),
-                panel(TimeWindow::OneHour),
+            windows: [
+                TwentyFourHour,
+                TwentyFourHour,
+                OneHour,
+                OneHour,
+                OneHour,
+                OneHour,
             ],
             status: AnalyticsStatus::default(),
             reorg_notification: None,
@@ -669,8 +628,12 @@ impl Default for AnalyticsState {
 }
 
 impl AnalyticsState {
-    pub fn panel(&mut self, panel: AnalyticsPanel) -> &mut PanelState {
-        &mut self.panels[panel as usize]
+    pub fn window(&self, panel: AnalyticsPanel) -> TimeWindow {
+        self.windows[panel as usize]
+    }
+
+    pub fn window_mut(&mut self, panel: AnalyticsPanel) -> &mut TimeWindow {
+        &mut self.windows[panel as usize]
     }
 
     pub fn view(&self, window: TimeWindow) -> Option<&AggregatedView> {
@@ -682,12 +645,36 @@ impl AnalyticsState {
 pub struct DagSelection {
     /// The block shown (or loading) in the Block Info window.
     pub block_hash: Option<String>,
+    /// `get_block` JSON, set through `set_detail` so `hash_links` stays in sync.
     pub block_detail: Option<String>,
+    /// Block hashes in `block_detail`, linked to their own Block Info.
+    pub hash_links: Vec<HashLink>,
     pub block_loading: bool,
+}
+
+impl DagSelection {
+    /// Start loading `hash` (the controller then fills in the detail).
+    pub fn request(&mut self, hash: String) {
+        self.block_hash = Some(hash);
+        self.set_detail(None);
+        self.block_loading = true;
+    }
+
+    pub fn set_detail(&mut self, detail: Option<String>) {
+        self.hash_links = detail.as_deref().map(block_hash_links).unwrap_or_default();
+        self.block_detail = detail;
+    }
+
+    pub fn close(&mut self) {
+        self.block_hash = None;
+        self.set_detail(None);
+        self.block_loading = false;
+    }
 }
 
 pub type RepaintFn = Arc<dyn Fn() + Send + Sync>;
 
+#[derive(Default)]
 pub struct App {
     pub active_tab: Tab,
 
@@ -699,35 +686,14 @@ pub struct App {
     pub rpc_explorer: RpcExplorerState,
     pub command_line: CommandLine,
 
-    /// Transaction ID shown in the Transaction Detail window, highlighted in the table.
-    pub mempool_open_tx: Option<String>,
-    pub mempool_detail: Option<String>,
+    /// Mempool entry shown in the Transaction Detail window, highlighted in the table.
+    /// A copy, so the window stays open once the transaction leaves the mempool.
+    pub mempool_open: Option<MempoolEntryInfo>,
 
     pub paused: bool,
     /// Called by `mark_dirty()` so a frontend can wake up and redraw.
     pub repaint: Option<RepaintFn>,
-    pub has_direct_node: bool,
     pub connection: ActiveConnection,
-}
-
-impl Default for App {
-    fn default() -> Self {
-        Self {
-            active_tab: Tab::Dashboard,
-            node: NodeState::default(),
-            analytics: AnalyticsState::default(),
-            dag_selection: DagSelection::default(),
-            market_data: None,
-            rpc_explorer: RpcExplorerState::default(),
-            command_line: CommandLine::default(),
-            mempool_open_tx: None,
-            mempool_detail: None,
-            paused: false,
-            repaint: None,
-            has_direct_node: false,
-            connection: ActiveConnection::None,
-        }
-    }
 }
 
 impl App {
@@ -753,32 +719,23 @@ impl App {
         self.analytics.status = AnalyticsStatus::default();
         self.analytics.cached_views = None;
         self.analytics.reorg_notification = None;
-        self.mempool_open_tx = None;
-        self.mempool_detail = None;
-        self.dag_selection.block_detail = None;
+        self.mempool_open = None;
+        self.dag_selection.set_detail(None);
         self.dag_selection.block_loading = false;
         self.rpc_explorer.set_response(None);
         self.rpc_explorer.is_loading = false;
     }
 
-    /// Open the detail popup for the mempool entry at `index`, if it exists.
-    pub fn open_mempool_detail(&mut self, index: usize) {
-        let Some(entry) = self
+    /// Open the detail window for the mempool entry at `index`, if it exists.
+    pub fn open_mempool_entry(&mut self, index: usize) {
+        if let Some(entry) = self
             .node
             .mempool_state
             .as_ref()
             .and_then(|m| m.entries.get(index))
-        else {
-            return;
-        };
-        self.mempool_open_tx = Some(entry.transaction_id.clone());
-        self.mempool_detail = Some(format!(
-            "Transaction ID: {}\nFee: {:.8} KAS ({} sompi)\nOrphan: {}",
-            entry.transaction_id,
-            sompi_to_kas(entry.fee),
-            entry.fee,
-            if entry.is_orphan { "Yes" } else { "No" },
-        ));
+        {
+            self.mempool_open = Some(entry.clone());
+        }
     }
 
     pub fn tab_index(&self) -> usize {
@@ -826,8 +783,11 @@ mod tests {
         app.node.node_url = Some("ws://node:17110".to_string());
         app.node.last_error = Some("boom".to_string());
         app.node.connection_status = ConnectionStatus::Connected;
-        app.mempool_open_tx = Some("tx".to_string());
-        app.mempool_detail = Some("tx".to_string());
+        app.mempool_open = Some(MempoolEntryInfo {
+            transaction_id: "tx".to_string(),
+            fee: 1,
+            is_orphan: false,
+        });
         app.dag_selection.block_loading = true;
         app.rpc_explorer.last_response = Some("resp".to_string());
         app.paused = true;
@@ -840,8 +800,7 @@ mod tests {
             app.node.connection_status,
             ConnectionStatus::Disconnected
         ));
-        assert_eq!(app.mempool_open_tx, None);
-        assert_eq!(app.mempool_detail, None);
+        assert!(app.mempool_open.is_none());
         assert!(!app.dag_selection.block_loading);
         assert_eq!(app.rpc_explorer.last_response, None);
         assert!(app.paused, "user settings survive a reconnect");
@@ -916,21 +875,22 @@ mod tests {
         assert_eq!(ActiveConnection::Resolver.label(), "Public resolver");
     }
 
+    #[test]
+    fn only_url_connections_are_direct() {
+        assert!(ActiveConnection::Url("ws://x:1".into()).is_direct());
+        assert!(!ActiveConnection::Resolver.is_direct());
+        assert!(!ActiveConnection::None.is_direct());
+    }
+
     // --- Tab ---
 
     #[test]
-    fn tab_titles() {
-        assert_eq!(Tab::Dashboard.title(), "1:Dashboard");
-        assert_eq!(Tab::Mempool.title(), "2:Mempool");
-        assert_eq!(Tab::BlockDag.title(), "3:BlockDAG");
-        assert_eq!(Tab::Analytics.title(), "4:Analytics");
-        assert_eq!(Tab::RpcExplorer.title(), "5:RPC Cmds");
-    }
-
-    #[test]
-    fn tab_labels_strip_shortcut_prefix() {
-        assert_eq!(Tab::Dashboard.label(), "Dashboard");
-        assert_eq!(Tab::RpcExplorer.label(), "RPC Cmds");
+    fn tab_labels() {
+        let labels: Vec<_> = Tab::all().iter().map(Tab::label).collect();
+        assert_eq!(
+            labels,
+            ["Dashboard", "Mempool", "BlockDAG", "Analytics", "RPC Cmds"]
+        );
     }
 
     #[test]
@@ -1108,29 +1068,20 @@ mod tests {
         assert!(cl.suggestions().is_empty());
     }
 
+    #[test]
+    fn help_text_lists_commands_with_usage() {
+        let help = CommandLine::help_text();
+        assert!(help.contains("clear"));
+        assert!(help.contains("get_block_dag_info"));
+        assert!(help.contains("usage: get_block <hash> [include_transactions=true]"));
+    }
+
     // --- RpcExplorerState ---
 
     #[test]
     fn rpc_explorer_default_has_all_methods() {
         let state = RpcExplorerState::default();
-        assert!(state.available_methods.len() >= 18);
-        assert!(state.available_methods.contains(&"ping"));
-        assert!(state.available_methods.contains(&"get_server_info"));
-        assert!(state.available_methods.contains(&"get_sink"));
-        assert!(state.available_methods.contains(&"get_sink_blue_score"));
-        assert!(state.available_methods.contains(&"get_info"));
-        assert!(state.available_methods.contains(&"get_peer_addresses"));
-        assert!(state.available_methods.contains(&"get_current_network"));
-        assert!(
-            state
-                .available_methods
-                .contains(&"get_fee_estimate_experimental")
-        );
-        assert!(
-            state
-                .available_methods
-                .contains(&"estimate_network_hashes_per_second")
-        );
+        assert_eq!(state.available_methods.len(), RPC_METHODS.len());
     }
 
     // --- DagVisualizer ---
@@ -1214,7 +1165,6 @@ mod tests {
     fn dag_stats_default_empty() {
         let stats = DagStats::default();
         assert!(stats.samples.is_empty());
-        assert!(stats.sink_blue_score.is_none());
         assert!(stats.blue_block_rate().is_none());
         assert!(stats.avg_dag_width().is_none());
         assert!(stats.block_interval_ms().is_none());
@@ -1228,7 +1178,7 @@ mod tests {
         let dag = make_dag_info(4, 3, 1000, 1010);
         stats.update(&dag, Some(500));
         assert_eq!(stats.samples.len(), 1);
-        assert_eq!(stats.sink_blue_score, Some(500));
+        assert_eq!(stats.samples[0].blue_score, 500);
     }
 
     #[test]
@@ -1325,7 +1275,7 @@ mod tests {
     #[test]
     fn rpc_explorer_methods_are_sorted() {
         let state = RpcExplorerState::default();
-        assert!(state.available_methods.is_sorted());
+        assert!(state.available_methods.is_sorted_by_key(|m| m.name));
     }
 
     #[test]
@@ -1334,7 +1284,7 @@ mod tests {
         let i = state
             .available_methods
             .iter()
-            .position(|m| *m == "get_block")
+            .position(|m| m.name == "get_block")
             .unwrap();
         state.select(i);
         assert_eq!(state.args, vec![String::new(), "true".to_string()]);
@@ -1342,7 +1292,7 @@ mod tests {
         let ping = state
             .available_methods
             .iter()
-            .position(|m| *m == "ping")
+            .position(|m| m.name == "ping")
             .unwrap();
         state.select(ping);
         assert!(state.args.is_empty());
@@ -1351,24 +1301,17 @@ mod tests {
     }
 
     #[test]
-    fn rpc_explorer_methods_match_available_commands() {
-        let state = RpcExplorerState::default();
-        let commands = CommandLine::available_commands();
-        // Every explorer method should have a corresponding command entry
-        for method in &state.available_methods {
-            assert!(
-                commands.iter().any(|(name, _)| name == method),
-                "Explorer method '{}' missing from available_commands",
-                method
-            );
-        }
+    fn rpc_explorer_select_clears_response() {
+        let mut state = RpcExplorerState::default();
+        state.set_response(Some("resp".into()));
+        state.select(0);
+        assert_eq!(state.last_response, None);
     }
 
     #[test]
-    fn open_mempool_detail_formats_entry_and_ignores_out_of_range() {
+    fn open_mempool_entry_copies_entry_and_ignores_out_of_range() {
         let mut app = App::default();
         app.node.mempool_state = Some(MempoolState {
-            entry_count: 1,
             entries: vec![MempoolEntryInfo {
                 transaction_id: "abc123".to_string(),
                 fee: 150_000_000,
@@ -1377,37 +1320,46 @@ mod tests {
             total_fees: 150_000_000,
         });
 
-        app.open_mempool_detail(5);
-        assert!(app.mempool_detail.is_none());
-        assert!(app.mempool_open_tx.is_none());
+        app.open_mempool_entry(5);
+        assert!(app.mempool_open.is_none());
 
-        app.open_mempool_detail(0);
-        assert_eq!(app.mempool_open_tx.as_deref(), Some("abc123"));
-        let detail = app.mempool_detail.as_deref().unwrap();
-        assert!(detail.contains("Transaction ID: abc123"));
-        assert!(detail.contains("1.50000000 KAS (150000000 sompi)"));
-        assert!(detail.contains("Orphan: Yes"));
+        app.open_mempool_entry(0);
+        assert_eq!(
+            app.mempool_open.as_ref().map(|e| e.transaction_id.as_str()),
+            Some("abc123")
+        );
+    }
+
+    #[test]
+    fn dag_selection_tracks_hash_links() {
+        let mut sel = DagSelection::default();
+        let hash = "cd".repeat(32);
+        sel.request(hash.clone());
+        assert!(sel.block_loading);
+        assert_eq!(sel.block_hash.as_deref(), Some(hash.as_str()));
+        sel.set_detail(Some(format!(
+            "{{\n  \"selectedParentHash\": \"{hash}\"\n}}"
+        )));
+        assert_eq!(sel.hash_links.len(), 1);
+        sel.close();
+        assert!(sel.block_hash.is_none() && sel.hash_links.is_empty());
     }
 
     #[test]
     fn time_window_index_matches_all() {
         for (i, w) in TimeWindow::ALL.iter().enumerate() {
             assert_eq!(w.index(), i);
-            assert_eq!(w.duration_ms() % w.series_bin_ms(), 0);
         }
     }
 
     #[test]
     fn analytics_panels_default_to_kaspalytics_windows() {
-        let mut state = AnalyticsState::default();
+        let state = AnalyticsState::default();
         assert_eq!(
-            state.panel(AnalyticsPanel::TxSummary).window,
+            state.window(AnalyticsPanel::TxSummary),
             TimeWindow::TwentyFourHour
         );
-        assert_eq!(
-            state.panel(AnalyticsPanel::NodeVersions).window,
-            TimeWindow::OneHour
-        );
+        assert_eq!(state.window(AnalyticsPanel::Miners), TimeWindow::OneHour);
         assert!(state.view(TimeWindow::OneMin).is_none());
     }
 }

@@ -1,10 +1,9 @@
 use eframe::egui::{self, RichText, Ui};
 
 use super::theme;
-use super::widgets::{CARD_GAP, card, kv, kv_grid, kv_with, placeholder, yes_no};
+use super::widgets::{CARD_GAP, card, kv, kv_grid, kv_with, or_dash, placeholder, yes_no};
 use crate::app::App;
-use crate::format::{format_hashrate, format_usd};
-use crate::rpc::types::{format_number, sompi_to_kas};
+use crate::format::{format_hashrate, format_kas, format_number, format_usd};
 
 pub fn show(ui: &mut Ui, app: &App) {
     egui::ScrollArea::vertical().show(ui, |ui| {
@@ -61,34 +60,15 @@ fn network_stats(ui: &mut Ui, app: &App) {
     };
     kv_grid(ui, "network_stats", |ui| {
         kv(ui, "Difficulty", format_number(dag.difficulty as u64));
-        let hashrate = app
-            .node
-            .mining_info
-            .as_ref()
-            .map(|m| format_hashrate(m.hashrate))
-            .unwrap_or_else(|| "—".to_string());
-        kv(ui, "Hashrate", hashrate);
+        kv(ui, "Hashrate", or_dash(app.node.hashrate, format_hashrate));
         kv(ui, "DAA Score", format_number(dag.virtual_daa_score));
         kv(ui, "Tips", dag.tip_hashes.len().to_string());
 
         if let Some(ref supply) = app.node.coin_supply {
-            let max_kas = sompi_to_kas(supply.max_sompi);
-            let circ_kas = sompi_to_kas(supply.circulating_sompi);
-            let pct = if max_kas > 0.0 {
-                (circ_kas / max_kas) * 100.0
-            } else {
-                0.0
-            };
-            kv(
-                ui,
-                "Max Supply",
-                format!("{} KAS", format_number(max_kas as u64)),
-            );
-            kv(
-                ui,
-                "Circulating",
-                format!("{} KAS", format_number(circ_kas as u64)),
-            );
+            let (max, circ) = (supply.max_sompi as f64, supply.circulating_sompi as f64);
+            let pct = if max > 0.0 { circ / max * 100.0 } else { 0.0 };
+            kv(ui, "Max Supply", format!("{} KAS", format_kas(max, 0)));
+            kv(ui, "Circulating", format!("{} KAS", format_kas(circ, 0)));
             kv(ui, "% Circulating", format!("{pct:.2}%"));
         }
     });
@@ -129,20 +109,21 @@ fn mempool_summary(ui: &mut Ui, app: &App) {
         kv(
             ui,
             "Transactions",
-            format_number(mempool.entry_count as u64),
+            format_number(mempool.entries.len() as u64),
         );
         kv(
             ui,
             "Total Fees",
-            format!("{:.8} KAS", sompi_to_kas(mempool.total_fees)),
+            format!("{} KAS", format_kas(mempool.total_fees as f64, 8)),
         );
         if let Some(ref fee) = app.node.fee_estimate {
-            kv(ui, "Priority Fee", &fee.priority_bucket);
-            if let Some(normal) = fee.normal_buckets.first() {
-                kv(ui, "Normal Fee", normal);
+            let rate = |r: f64| format!("{r:.2} sompi/gram");
+            kv(ui, "Priority Fee", rate(fee.priority_feerate));
+            if let Some(normal) = fee.normal_feerate {
+                kv(ui, "Normal Fee", rate(normal));
             }
-            if let Some(low) = fee.low_buckets.first() {
-                kv(ui, "Low Fee", low);
+            if let Some(low) = fee.low_feerate {
+                kv(ui, "Low Fee", rate(low));
             }
         }
     });

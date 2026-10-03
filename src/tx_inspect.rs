@@ -1,7 +1,7 @@
 //! Per-transaction classification for analytics: protocol tags, output script
 //! classes, covenant / introspection opcode usage, and the node version in a
 //! coinbase payload. Pure functions over raw bytes; the RPC adapter lives in
-//! `RpcManager::extract_block_summaries`.
+//! `analytics::summarize_chain_blocks`.
 //!
 //! The rules mirror Kaspalytics so the numbers are comparable.
 

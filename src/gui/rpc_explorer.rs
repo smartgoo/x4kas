@@ -1,12 +1,11 @@
 use std::time::Instant;
 
-use eframe::egui::{self, Button, ComboBox, RichText, TextEdit, Ui, text::CCursor};
+use eframe::egui::{self, Button, ComboBox, RichText, TextEdit, Ui};
 
 use super::theme;
-use super::widgets::{field_label, kv_grid, placeholder, primary_button, section_title};
+use super::widgets::{field_label, json_view, kv_grid, placeholder, primary_button, section_title};
 use crate::app::{App, RpcExplorerState};
 use crate::controller::{CommandSender, UiCommand};
-use crate::rpc::hash_links::HashLink;
 use crate::rpc::methods::{self, ParamKind, RpcMethod};
 
 pub fn show(ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
@@ -83,7 +82,7 @@ pub fn show(ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
                 let state = &app.rpc_explorer;
                 let clicked = egui::ScrollArea::both()
                     .auto_shrink(false)
-                    .show(ui, |ui| response_view(ui, response, &state.hash_links))
+                    .show(ui, |ui| json_view(ui, response, &state.hash_links))
                     .inner;
                 if let Some(hash) = clicked {
                     app.rpc_explorer.open_block(&hash);
@@ -99,43 +98,6 @@ pub fn show(ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
             None => placeholder(ui, "Fill in the arguments and press Run."),
         }
     });
-}
-
-/// Read-only (but selectable/copyable) response text with a link icon after each block
-/// hash. Returns the hash whose icon was clicked.
-fn response_view(ui: &mut Ui, response: &str, links: &[HashLink]) -> Option<String> {
-    let output = TextEdit::multiline(&mut &*response)
-        .code_editor()
-        .desired_width(f32::INFINITY)
-        .show(ui);
-
-    let clip = ui.clip_rect();
-    let size = ui.text_style_height(&egui::TextStyle::Monospace);
-    let mut clicked = None;
-    for link in links {
-        let line = output
-            .galley
-            .pos_from_cursor(CCursor::new(link.line_end_char))
-            .translate(output.galley_pos.to_vec2());
-        let rect = egui::Rect::from_min_size(
-            egui::pos2(line.right() + 6.0, line.center().y - size / 2.0),
-            egui::vec2(size, size),
-        );
-        if !clip.intersects(rect) {
-            continue;
-        }
-        let icon = ui
-            .put(
-                rect,
-                Button::new(RichText::new("🔍").size(size * 0.8).color(theme::ACCENT)).frame(false),
-            )
-            .on_hover_text("Open in get_block")
-            .on_hover_cursor(egui::CursorIcon::PointingHand);
-        if icon.clicked() {
-            clicked = Some(link.hash.clone());
-        }
-    }
-    clicked
 }
 
 /// List entry: methods that take arguments get a trailing ellipsis.
@@ -166,15 +128,12 @@ fn method_list_width(ui: &Ui) -> f32 {
 
 fn method_list(ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
     for i in 0..app.rpc_explorer.available_methods.len() {
-        let Some(method) = methods::find(app.rpc_explorer.available_methods[i]) else {
-            continue;
-        };
+        let method = app.rpc_explorer.available_methods[i];
         let selected = i == app.rpc_explorer.selected_method;
         let response = ui.selectable_label(selected, method_label(method));
         if response.clicked() {
             if !selected {
                 app.rpc_explorer.select(i);
-                app.rpc_explorer.set_response(None);
             }
             // Argument-free methods run on click; others wait for the form.
             if method.params.is_empty() && !app.rpc_explorer.is_loading {
@@ -253,7 +212,7 @@ fn loop_control(ui: &mut Ui, state: &mut RpcExplorerState) {
         let id = ui.id().with("loop_interval_text");
         let mut text = ui
             .data_mut(|d| d.get_temp::<String>(id))
-            .unwrap_or_else(|| format_interval(state.loop_interval_secs));
+            .unwrap_or_else(|| state.loop_interval_secs.to_string());
         let response = ui
             .add(
                 TextEdit::singleline(&mut text)
@@ -269,15 +228,11 @@ fn loop_control(ui: &mut Ui, state: &mut RpcExplorerState) {
         }
         if response.lost_focus() {
             // Show the value actually in use (clamped, or reverted if invalid).
-            text = format_interval(state.loop_interval_secs);
+            text = state.loop_interval_secs.to_string();
         }
         ui.data_mut(|d| d.insert_temp(id, text));
         ui.label("s");
     });
-}
-
-fn format_interval(secs: f64) -> String {
-    format!("{secs}")
 }
 
 fn required_filled(app: &App, method: &RpcMethod) -> bool {

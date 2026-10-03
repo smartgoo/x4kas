@@ -7,12 +7,11 @@ use eframe::egui::{
 
 use super::theme;
 use super::widgets::{
-    CARD_GAP, block_hash, card, copy_value, is_testnet, kv, kv_grid, kv_with, placeholder,
-    request_block,
+    CARD_GAP, block_hash, card, copy_value, is_testnet, json_view, kv, kv_grid, kv_with,
+    modal_window, or_dash, placeholder, request_block,
 };
-use crate::app::{App, DagBlock, DagVisualizer};
-use crate::format::{explorer_block_url, kaspa_stream_block_url, shorten_middle};
-use crate::rpc::types::format_number;
+use crate::app::{App, DAG_MAX_DAA_SCORES, DagBlock, DagVisualizer};
+use crate::format::{explorer_block_url, format_number, kaspa_stream_block_url, shorten_middle};
 
 // The visualizer mirrors the one on the Kaspalytics home page: a band of the newest DAA
 // scores, one column each, blocks spread evenly down their column and joined to their
@@ -81,7 +80,6 @@ fn visualizer(ui: &mut Ui, live: &DagVisualizer, waiting: &str) -> Option<String
     let (response, painter) =
         ui.allocate_painter(vec2(ui.available_width(), CANVAS_HEIGHT), Sense::click());
     let rect = response.rect;
-    let (now, dt) = ui.input(|i| (i.time, i.stable_dt.min(0.1)));
 
     // Hovering anywhere on the canvas freezes it, so a block can be picked out.
     let paused = ui.rect_contains_pointer(rect) && !live.is_empty();
@@ -93,7 +91,7 @@ fn visualizer(ui: &mut Ui, live: &DagVisualizer, waiting: &str) -> Option<String
     };
     let vis = frozen.as_ref().unwrap_or(live);
 
-    if vis.is_empty() {
+    let clicked = if vis.is_empty() {
         view.nodes.clear();
         painter.text(
             rect.center(),
@@ -103,18 +101,34 @@ fn visualizer(ui: &mut Ui, live: &DagVisualizer, waiting: &str) -> Option<String
             theme::TEXT_DIM,
         );
         title_chip(ui, rect, NARROW_DAA_SCORES);
-        view.frozen = frozen;
-        ui.data_mut(|d| d.insert_temp(id, view));
-        return None;
-    }
+        None
+    } else {
+        draw_blocks(ui, &response, &painter, &mut view, vis, paused)
+    };
+    view.frozen = frozen;
+    ui.data_mut(|d| d.insert_temp(id, view));
+    clicked
+}
 
+/// Lay out, animate and paint the blocks of `vis`, with the hover pill and title.
+/// Returns the hash of a clicked block.
+fn draw_blocks(
+    ui: &Ui,
+    response: &egui::Response,
+    painter: &Painter,
+    view: &mut DagView,
+    vis: &DagVisualizer,
+    paused: bool,
+) -> Option<String> {
+    let rect = response.rect;
+    let (now, dt) = ui.input(|i| (i.time, i.stable_dt.min(0.1)));
     let max_scores = if rect.width() >= WIDE_CANVAS {
-        crate::app::DAG_MAX_DAA_SCORES
+        DAG_MAX_DAA_SCORES
     } else {
         NARROW_DAA_SCORES
     };
     let targets = layout(vis, rect.size(), max_scores);
-    let animating = animate(&mut view, &targets, now, dt);
+    let animating = animate(view, &targets, now, dt);
 
     // Blocks only respond while paused: picking one out of a sliding DAG is futile.
     let hovered = paused
@@ -134,11 +148,11 @@ fn visualizer(ui: &mut Ui, live: &DagVisualizer, waiting: &str) -> Option<String
         .and_then(|h| vis.blocks().find(|b| b.hash == h));
 
     let tips = vis.tips();
-    paint(&painter, rect, &view, vis, &tips, hovered_block, now);
+    paint(painter, rect, view, vis, &tips, hovered_block, now);
 
     if paused {
         pill(
-            &painter,
+            painter,
             rect.center_top() + vec2(0.0, 10.0),
             Align2::CENTER_TOP,
             "Updates paused during hover",
@@ -157,7 +171,7 @@ fn visualizer(ui: &mut Ui, live: &DagVisualizer, waiting: &str) -> Option<String
             block.parents.len(),
         );
         pill(
-            &painter,
+            painter,
             rect.left_bottom() + vec2(10.0, -10.0),
             Align2::LEFT_BOTTOM,
             &text,
@@ -169,10 +183,7 @@ fn visualizer(ui: &mut Ui, live: &DagVisualizer, waiting: &str) -> Option<String
     if animating {
         ui.ctx().request_repaint();
     }
-    let clicked = response.clicked().then_some(hovered).flatten();
-    view.frozen = frozen;
-    ui.data_mut(|d| d.insert_temp(id, view));
-    clicked
+    response.clicked().then_some(hovered).flatten()
 }
 
 /// Target position of every block in the newest `max_scores` DAA scores, relative to the
@@ -292,7 +303,7 @@ fn paint(
 }
 
 /// Text on a dark rounded backing, anchored at `pos`.
-fn pill(painter: &Painter, pos: Pos2, align: Align2, text: &str) -> Rect {
+fn pill(painter: &Painter, pos: Pos2, align: Align2, text: &str) {
     let galley = painter.layout_no_wrap(
         text.to_string(),
         FontId::monospace(theme::FONT_SIZE),
@@ -308,7 +319,6 @@ fn pill(painter: &Painter, pos: Pos2, align: Align2, text: &str) -> Rect {
         egui::StrokeKind::Inside,
     );
     painter.galley(rect.min + padding, galley, Color32::PLACEHOLDER);
-    rect
 }
 
 /// The band's title in its top-left corner, with an explanation on hover.
@@ -365,60 +375,47 @@ fn ghostdag(ui: &mut Ui, app: &App) {
         return;
     }
     let stats = &app.node.dag_stats;
-    let dash = || "—".to_string();
     kv_grid(ui, "ghostdag", |ui| {
         kv(
             ui,
             "Blue Score",
-            stats
-                .sink_blue_score
-                .map(format_number)
-                .unwrap_or_else(dash),
+            or_dash(app.node.sink_blue_score, format_number),
         );
         kv(
             ui,
             "Blue/Red Tips",
-            stats
-                .blue_red_ratio()
-                .map(|(blue, red)| format!("{blue} blue / {red} red"))
-                .unwrap_or_else(dash),
+            or_dash(stats.blue_red_ratio(), |(blue, red)| {
+                format!("{blue} blue / {red} red")
+            }),
         );
         kv(
             ui,
             "DAG Width",
-            match (stats.samples.back(), stats.avg_dag_width()) {
-                (Some(s), Some(avg)) => format!("{} tips (avg: {avg:.1})", s.tip_count),
-                _ => dash(),
-            },
+            or_dash(
+                stats.samples.back().zip(stats.avg_dag_width()),
+                |(s, avg)| format!("{} tips (avg: {avg:.1})", s.tip_count),
+            ),
         );
         kv(
             ui,
             "Block Interval",
-            stats
-                .block_interval_ms()
-                .map(|ms| format!("{ms:.0} ms"))
-                .unwrap_or_else(dash),
+            or_dash(stats.block_interval_ms(), |ms| format!("{ms:.0} ms")),
         );
         kv(
             ui,
             "Blue Block Rate",
-            stats
-                .blue_block_rate()
-                .map(|r| format!("{r:.2} blocks/s"))
-                .unwrap_or_else(dash),
+            or_dash(stats.blue_block_rate(), |r| format!("{r:.2} blocks/s")),
         );
         kv(
             ui,
             "Unvalidated",
-            stats
-                .headers_blocks_delta()
-                .map(|d| format!("{} headers ahead", format_number(d)))
-                .unwrap_or_else(dash),
+            or_dash(stats.headers_blocks_delta(), |d| {
+                format!("{} headers ahead", format_number(d))
+            }),
         );
     });
 }
 
-/// Tip and virtual-parent hash lists. Returns the hash of a clicked entry.
 /// Tip and virtual parent hashes. Only the block open in Block Info is highlighted.
 fn hash_lists(ui: &mut Ui, app: &mut App) {
     let Some(dag) = app.node.dag_info.as_ref() else {
@@ -442,43 +439,33 @@ fn hash_lists(ui: &mut Ui, app: &mut App) {
 }
 
 /// The Block Info window for the requested block (see [`request_block`]), on any tab.
+/// The block's `get_block` JSON links other block hashes to their own Block Info.
 pub fn block_window(ctx: &egui::Context, app: &mut App) {
     let sel = &mut app.dag_selection;
     if !sel.block_loading && sel.block_detail.is_none() {
         return;
     }
-    let mut open = true;
-    egui::Window::new("Block Info")
-        .open(&mut open)
-        .collapsible(false)
-        .resizable(true)
-        .default_width(640.0)
-        .default_height(480.0)
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .show(ctx, |ui| {
-            if let Some(ref hash) = sel.block_hash {
-                block_links(ui, hash);
-                ui.separator();
-            }
-            if sel.block_loading {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label("Loading block info…");
-                });
-            } else if let Some(ref detail) = sel.block_detail {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.add(
-                        egui::TextEdit::multiline(&mut detail.as_str())
-                            .code_editor()
-                            .desired_width(f32::INFINITY),
-                    );
-                });
-            }
-        });
-    if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-        sel.block_hash = None;
-        sel.block_detail = None;
-        sel.block_loading = false;
+    let window = egui::Window::new("Block Info").default_size([640.0, 480.0]);
+    let open = modal_window(ctx, window, |ui| {
+        if let Some(ref hash) = sel.block_hash {
+            block_links(ui, hash);
+            ui.separator();
+        }
+        if sel.block_loading {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Loading block info…");
+            });
+        } else if let Some(ref detail) = sel.block_detail
+            && let Some(hash) = egui::ScrollArea::vertical()
+                .show(ui, |ui| json_view(ui, detail, &sel.hash_links))
+                .inner
+        {
+            request_block(ui.ctx(), &hash);
+        }
+    });
+    if !open {
+        sel.close();
     }
 }
 

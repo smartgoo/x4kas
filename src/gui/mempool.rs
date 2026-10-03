@@ -2,9 +2,13 @@ use eframe::egui::{self, RichText, Sense, Ui};
 use egui_extras::{Column, TableBuilder};
 
 use super::theme;
-use super::widgets::{CARD_GAP, card, column_header, kv, kv_grid, placeholder, yes_no};
+use super::widgets::{
+    CARD_GAP, card, copy_value, kv, kv_grid, kv_with, modal_window, placeholder, section_title,
+    yes_no,
+};
 use crate::app::App;
-use crate::rpc::types::{format_number, sompi_to_kas};
+use crate::format::{format_kas, format_number};
+use crate::rpc::types::MempoolEntryInfo;
 
 pub fn show(ui: &mut Ui, app: &mut App) {
     card(ui, "Mempool Summary", |ui| summary(ui, app));
@@ -28,34 +32,30 @@ pub fn show(ui: &mut Ui, app: &mut App) {
         .column(Column::auto().at_least(70.0))
         .header(18.0, |mut header| {
             header.col(|ui| {
-                column_header(ui, "Transaction ID");
+                section_title(ui, "Transaction ID");
             });
             header.col(|ui| {
-                column_header(ui, "Fee (KAS)");
+                section_title(ui, "Fee (KAS)");
             });
             header.col(|ui| {
-                column_header(ui, "Orphan");
+                section_title(ui, "Orphan");
             });
         })
         .body(|body| {
+            let open_tx = app.mempool_open.as_ref().map(|e| &e.transaction_id);
             body.rows(16.0, mempool.entries.len(), |mut row| {
                 let i = row.index();
                 let entry = &mempool.entries[i];
                 // Only the transaction open in the detail window is highlighted.
-                row.set_selected(app.mempool_open_tx.as_ref() == Some(&entry.transaction_id));
+                row.set_selected(open_tx == Some(&entry.transaction_id));
                 row.col(|ui| {
                     ui.label(&entry.transaction_id);
                 });
                 row.col(|ui| {
-                    ui.label(format!("{:.8}", sompi_to_kas(entry.fee)));
+                    ui.label(format_kas(entry.fee as f64, 8));
                 });
                 row.col(|ui| {
-                    let color = if entry.is_orphan {
-                        theme::WARN
-                    } else {
-                        theme::TEXT_DIM
-                    };
-                    ui.label(RichText::new(yes_no(entry.is_orphan)).color(color));
+                    orphan_label(ui, entry.is_orphan);
                 });
                 if row.response().clicked() {
                     clicked = Some(i);
@@ -64,7 +64,7 @@ pub fn show(ui: &mut Ui, app: &mut App) {
         });
 
     if let Some(i) = clicked {
-        app.open_mempool_detail(i);
+        app.open_mempool_entry(i);
     }
 
     detail_window(ui.ctx(), app);
@@ -80,37 +80,51 @@ fn summary(ui: &mut Ui, app: &App) {
         kv(
             ui,
             "Total Entries",
-            RichText::new(format_number(mempool.entry_count as u64)).color(theme::ACCENT_BRIGHT),
+            RichText::new(format_number(mempool.entries.len() as u64)).color(theme::ACCENT_BRIGHT),
         );
         kv(ui, "Orphans", orphan_count.to_string());
         kv(
             ui,
             "Total Fees",
-            format!("{:.8} KAS", sompi_to_kas(mempool.total_fees)),
+            format!("{} KAS", format_kas(mempool.total_fees as f64, 8)),
         );
     });
 }
 
+fn orphan_label(ui: &mut Ui, is_orphan: bool) {
+    let color = if is_orphan {
+        theme::WARN
+    } else {
+        theme::TEXT_DIM
+    };
+    ui.label(RichText::new(yes_no(is_orphan)).color(color));
+}
+
 fn detail_window(ctx: &egui::Context, app: &mut App) {
-    let Some(ref detail) = app.mempool_detail else {
+    let Some(ref entry) = app.mempool_open else {
         return;
     };
-    let mut open = true;
-    egui::Window::new("Transaction Detail")
-        .open(&mut open)
-        .collapsible(false)
-        .resizable(true)
-        .default_width(560.0)
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .show(ctx, |ui| {
-            ui.add(
-                egui::TextEdit::multiline(&mut detail.as_str())
-                    .code_editor()
-                    .desired_width(f32::INFINITY),
-            );
-        });
-    if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-        app.mempool_open_tx = None;
-        app.mempool_detail = None;
+    let window = egui::Window::new("Transaction Detail").default_width(560.0);
+    let open = modal_window(ctx, window, |ui| detail(ui, entry));
+    if !open {
+        app.mempool_open = None;
     }
+}
+
+fn detail(ui: &mut Ui, entry: &MempoolEntryInfo) {
+    kv_grid(ui, "mempool_detail", |ui| {
+        kv_with(ui, "Transaction ID", |ui| {
+            copy_value(ui, &entry.transaction_id, "Copy transaction ID");
+        });
+        kv(
+            ui,
+            "Fee",
+            format!(
+                "{} KAS ({} sompi)",
+                format_kas(entry.fee as f64, 8),
+                format_number(entry.fee)
+            ),
+        );
+        kv_with(ui, "Orphan", |ui| orphan_label(ui, entry.is_orphan));
+    });
 }

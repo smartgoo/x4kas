@@ -38,8 +38,6 @@ pub const ACCENT_DIM: Color32 = Color32::from_rgb(0x1d, 0x4a, 0x43);
 pub const OK: Color32 = Color32::from_rgb(0x5f, 0xd3, 0x8d);
 pub const WARN: Color32 = Color32::from_rgb(0xf0, 0xb5, 0x4a);
 pub const ERROR: Color32 = Color32::from_rgb(0xff, 0x6b, 0x6b);
-pub const INFO: Color32 = Color32::from_rgb(0x6c, 0xb6, 0xff);
-pub const PURPLE: Color32 = Color32::from_rgb(0xc4, 0x9b, 0xff);
 
 // ── DAG visualizer ──
 pub const DAG_BLOCK: Color32 = TEXT_BRIGHT;
@@ -49,9 +47,6 @@ pub const DAG_HOVER: Color32 = OK;
 /// Parents of the hovered block, and the edges to them.
 pub const DAG_PARENT: Color32 = WARN;
 pub const DAG_EDGE: Color32 = TEXT_DIM;
-
-/// Categorical colors for chart series.
-pub const SERIES: [Color32; 6] = [ACCENT, INFO, WARN, PURPLE, OK, ERROR];
 
 pub const FONT_SIZE: f32 = 12.0;
 pub const SMALL_FONT_SIZE: f32 = 10.0;

@@ -1,32 +1,27 @@
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use eframe::egui::{self, RichText, Ui};
 use egui_extras::{Column, TableBuilder};
-use egui_plot::{Bar, BarChart, GridMark, Plot};
 
 use super::theme;
 use super::widgets::{
-    CARD_GAP, address, card, card_with_header, column_header, direct_node_placeholder, fit_label,
-    kv, kv_grid, placeholder, section_title,
+    CARD_GAP, address, card, card_with_header, direct_node_placeholder, fit_label, kv, kv_grid,
+    or_dash, placeholder, section_title,
 };
 use crate::analytics::AggregatedView;
-use crate::app::{AnalyticsPanel, AnalyticsPhase, App, PanelState, TimeWindow, ViewMode};
-use crate::format::{format_duration, format_hashrate, format_kas};
-use crate::rpc::types::format_number;
+use crate::app::{AnalyticsPanel, AnalyticsPhase, App, TimeWindow};
+use crate::format::{format_duration, format_hashrate, format_kas, format_number};
 use crate::tx_inspect::TransactionProtocol;
 
-const CHART_HEIGHT: f32 = 200.0;
-/// Charts are temporarily hidden: no Table/Chart toggle, every panel shows its table.
-/// Set to true to bring them back.
-const CHARTS_ENABLED: bool = false;
+/// Tables taller than this scroll.
+const TABLE_MAX_HEIGHT: f32 = 200.0;
 
 pub fn show(ui: &mut Ui, app: &mut App) {
-    if !app.has_direct_node {
+    if !app.connection.is_direct() {
         placeholder(ui, direct_node_placeholder(app, ""));
         return;
     }
 
     banners(ui, app);
+    let hashrate = app.node.hashrate;
 
     egui::ScrollArea::vertical().show(ui, |ui| {
         ui.columns(2, |cols| {
@@ -56,9 +51,13 @@ pub fn show(ui: &mut Ui, app: &mut App) {
                 AnalyticsPanel::NodeVersions,
                 node_versions,
             );
-            card(&mut cols[1], "Mining Analysis", |ui| {
-                mining_analysis(ui, app)
-            });
+            panel_card(
+                &mut cols[1],
+                app,
+                "Mining Analysis",
+                AnalyticsPanel::Miners,
+                |ui, view| mining_analysis(ui, hashrate, view),
+            );
         });
         ui.add_space(CARD_GAP);
         ui.columns(2, |cols| {
@@ -67,33 +66,34 @@ pub fn show(ui: &mut Ui, app: &mut App) {
                 app,
                 "Top Senders",
                 AnalyticsPanel::TopSenders,
-                |ui, app| addresses(ui, app, AnalyticsPanel::TopSenders),
+                |ui, view| addresses(ui, &view.top_senders, "sender"),
             );
             panel_card(
                 &mut cols[1],
                 app,
                 "Top Receivers",
                 AnalyticsPanel::TopReceivers,
-                |ui, app| addresses(ui, app, AnalyticsPanel::TopReceivers),
+                |ui, view| addresses(ui, &view.top_receivers, "receiver"),
             );
         });
     });
 }
 
-/// A card for an analytics panel, with its time window dropdown after the title.
+/// A card for an analytics panel, with its time window dropdown after the title. The
+/// contents get the view for that window, or a placeholder shows until there is one.
 fn panel_card(
     ui: &mut Ui,
     app: &mut App,
     title: &str,
     panel: AnalyticsPanel,
-    add_contents: impl FnOnce(&mut Ui, &mut App),
+    add_contents: impl FnOnce(&mut Ui, &AggregatedView),
 ) {
     card_with_header(
         ui,
         title,
         app,
         |ui, app| {
-            let window = &mut app.analytics.panel(panel).window;
+            let window = app.analytics.window_mut(panel);
             egui::ComboBox::from_id_salt(("time_window", format!("{panel:?}")))
                 .selected_text(window.label())
                 .width(0.0)
@@ -103,7 +103,10 @@ fn panel_card(
                     }
                 });
         },
-        add_contents,
+        |ui, app| match app.analytics.view(app.analytics.window(panel)) {
+            Some(view) => add_contents(ui, view),
+            None => placeholder(ui, "Collecting data…"),
+        },
     );
 }
 
@@ -150,140 +153,25 @@ fn banners(ui: &mut Ui, app: &mut App) {
     }
 }
 
-/// The panel's state, after the Table/Chart toggle if `chart` (the time window is in the
-/// card header, see [`panel_card`]).
-fn controls(ui: &mut Ui, app: &mut App, panel: AnalyticsPanel, chart: bool) -> PanelState {
-    let state = app.analytics.panel(panel);
-    if chart && CHARTS_ENABLED {
-        ui.horizontal(|ui| {
-            for m in [ViewMode::Table, ViewMode::Chart] {
-                ui.selectable_value(&mut state.mode, m, m.label());
-            }
-        });
-        ui.add_space(2.0);
-    }
-    if !CHARTS_ENABLED {
-        state.mode = ViewMode::Table;
-    }
-    *state
-}
-
-/// The view for `window`, or a placeholder if analytics hasn't produced one yet.
-fn view_or_placeholder<'a>(
-    ui: &mut Ui,
-    app: &'a App,
-    window: TimeWindow,
-) -> Option<&'a AggregatedView> {
-    let view = app.analytics.view(window);
-    if view.is_none() {
-        placeholder(ui, "Collecting data…");
-    }
-    view
-}
-
-fn count(n: u64) -> String {
-    format_number(n)
-}
-
 // ── Transaction Summary ──
 
-fn tx_summary(ui: &mut Ui, app: &mut App) {
-    let state = controls(ui, app, AnalyticsPanel::TxSummary, true);
-    let Some(view) = view_or_placeholder(ui, app, state.window) else {
-        return;
-    };
-    if state.mode == ViewMode::Chart {
-        tx_chart(ui, view);
-        return;
-    }
-
+fn tx_summary(ui: &mut Ui, view: &AggregatedView) {
     let t = &view.totals;
     section_title(ui, "Unique Transactions");
     kv_grid(ui, "tx_summary", |ui| {
-        kv(ui, "Tx Count", count(t.tx_count));
-        kv(
-            ui,
-            "TPS",
-            view.tps().map_or("—".into(), |tps| format!("{tps:.2}")),
-        );
-        kv(ui, "Chain Blocks", count(t.chain_blocks));
+        kv(ui, "Tx Count", format_number(t.tx_count));
+        kv(ui, "TPS", or_dash(view.tps(), |tps| format!("{tps:.2}")));
+        kv(ui, "Chain Blocks", format_number(t.chain_blocks));
     });
     ui.add_space(4.0);
     section_title(ui, "Output Script Classes");
     let c = &t.script_classes;
     kv_grid(ui, "script_classes", |ui| {
-        kv(ui, "P2PK", count(c.pubkey));
-        kv(ui, "P2PK ECDSA", count(c.pubkey_ecdsa));
-        kv(ui, "P2SH", count(c.script_hash));
-        kv(ui, "Non-standard", count(c.nonstandard));
+        kv(ui, "P2PK", format_number(c.pubkey));
+        kv(ui, "P2PK ECDSA", format_number(c.pubkey_ecdsa));
+        kv(ui, "P2SH", format_number(c.script_hash));
+        kv(ui, "Non-standard", format_number(c.nonstandard));
     });
-}
-
-/// Bars of transactions per bin, x in minutes relative to now.
-fn tx_chart(ui: &mut Ui, view: &AggregatedView) {
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as f64)
-        .unwrap_or_default();
-    let bin_min = view.series_bin_ms as f64 / 60_000.0;
-    let last = view.tx_series.len().saturating_sub(1);
-    let bars = view
-        .tx_series
-        .iter()
-        .enumerate()
-        .map(|(i, &(start, n))| {
-            let center = (start as f64 - now_ms) / 60_000.0 + bin_min / 2.0;
-            // The current bin is still filling
-            let fill = if i == last {
-                theme::ACCENT_DIM
-            } else {
-                theme::ACCENT
-            };
-            Bar::new(center, n as f64).width(bin_min * 0.8).fill(fill)
-        })
-        .collect();
-
-    Plot::new("tx_series")
-        .height(CHART_HEIGHT)
-        .allow_zoom(false)
-        .allow_drag(false)
-        .allow_scroll(false)
-        .show_grid([false, true])
-        .x_axis_formatter(|mark: GridMark, _| relative_time_label(mark.value))
-        .show(ui, |plot_ui| {
-            plot_ui.bar_chart(
-                BarChart::new("Transactions", bars).element_formatter(Box::new(|bar, _| {
-                    format!(
-                        "{} ago\n{} txs",
-                        relative_time_label(bar.argument),
-                        format_number(bar.value as u64)
-                    )
-                })),
-            );
-        });
-    let per = match view.window {
-        TimeWindow::OneMin => "5 seconds",
-        TimeWindow::OneHour => "minute",
-        TimeWindow::TwentyFourHour => "hour",
-    };
-    ui.label(
-        RichText::new(format!(
-            "Transactions per {per}. The last bar is still filling."
-        ))
-        .weak()
-        .small(),
-    );
-}
-
-fn relative_time_label(minutes: f64) -> String {
-    let m = minutes.abs();
-    if m >= 120.0 {
-        format!("{:.0}h", m / 60.0)
-    } else if m >= 1.0 {
-        format!("{m:.0}m")
-    } else {
-        format!("{:.0}s", m * 60.0)
-    }
 }
 
 // ── Fees ──
@@ -292,7 +180,7 @@ fn fees(ui: &mut Ui, app: &App) {
     section_title(ui, "Fee Rates (sompi/gram)");
     match app.node.fee_estimate {
         Some(ref fee) => {
-            let rate = |r: Option<f64>| r.map_or("—".into(), |r| format!("{r:.2}"));
+            let rate = |r: Option<f64>| or_dash(r, |r| format!("{r:.2}"));
             kv_grid(ui, "fee_rates", |ui| {
                 kv(ui, "Low", rate(fee.low_feerate));
                 kv(ui, "Normal", rate(fee.normal_feerate));
@@ -314,13 +202,11 @@ fn fees(ui: &mut Ui, app: &App) {
             let t = &view.totals;
             Some([
                 format!("Prior {}", w.label()),
-                view.avg_fee().map_or("—".into(), |f| format_kas(f, 6)),
-                if t.fee_tx_count > 0 {
-                    format_kas(t.total_fees as f64, 3)
-                } else {
-                    "—".into()
-                },
-                count(t.fee_tx_count),
+                or_dash(view.avg_fee(), |f| format_kas(f, 6)),
+                or_dash((t.fee_tx_count > 0).then_some(t.total_fees), |f| {
+                    format_kas(f as f64, 3)
+                }),
+                format_number(t.fee_tx_count),
             ])
         })
         .collect();
@@ -337,37 +223,41 @@ fn fees(ui: &mut Ui, app: &App) {
 
 // ── Transaction Inspection ──
 
-fn inspection(ui: &mut Ui, app: &mut App) {
-    let state = controls(ui, app, AnalyticsPanel::Inspection, false);
-    let Some(view) = view_or_placeholder(ui, app, state.window) else {
-        return;
-    };
+fn inspection(ui: &mut Ui, view: &AggregatedView) {
     let i = &view.totals.inspection;
     ui.columns(3, |cols| {
         section_title(&mut cols[0], "Opcodes");
         kv_grid(&mut cols[0], "inspect_opcodes", |ui| {
-            kv(ui, "Introspection Txs", count(i.introspection_txs));
-            kv(ui, "OpZkPrecompile Txs", count(i.zk_precompile_txs));
-            kv(ui, "└ Groth16", count(i.zk_groth16_txs));
-            kv(ui, "└ R0Succinct", count(i.zk_r0succinct_txs));
+            kv(ui, "Introspection Txs", format_number(i.introspection_txs));
+            kv(ui, "OpZkPrecompile Txs", format_number(i.zk_precompile_txs));
+            kv(ui, "└ Groth16", format_number(i.zk_groth16_txs));
+            kv(ui, "└ R0Succinct", format_number(i.zk_r0succinct_txs));
             kv(
                 ui,
                 "OpChainblockSeqCommit Txs",
-                count(i.chainblock_seqcommit_txs),
+                format_number(i.chainblock_seqcommit_txs),
             );
         });
 
         section_title(&mut cols[1], "Covenants");
         kv_grid(&mut cols[1], "inspect_covenants", |ui| {
-            kv(ui, "Covenant-Creating Txs", count(i.covenant_creating_txs));
-            kv(ui, "Outputs Created", count(i.covenant_outputs_created));
-            kv(ui, "Outputs Spent", count(i.covenant_outputs_spent));
+            kv(
+                ui,
+                "Covenant-Creating Txs",
+                format_number(i.covenant_creating_txs),
+            );
+            kv(
+                ui,
+                "Outputs Created",
+                format_number(i.covenant_outputs_created),
+            );
+            kv(ui, "Outputs Spent", format_number(i.covenant_outputs_spent));
         });
 
         section_title(&mut cols[2], "Protocols");
         kv_grid(&mut cols[2], "inspect_protocols", |ui| {
             for p in TransactionProtocol::ALL {
-                kv(ui, p.label(), count(view.protocol_count(p)));
+                kv(ui, p.label(), format_number(view.protocol_count(p)));
             }
         });
     });
@@ -375,11 +265,7 @@ fn inspection(ui: &mut Ui, app: &mut App) {
 
 // ── Mining Share by Node Version ──
 
-fn node_versions(ui: &mut Ui, app: &mut App) {
-    let state = controls(ui, app, AnalyticsPanel::NodeVersions, true);
-    let Some(view) = view_or_placeholder(ui, app, state.window) else {
-        return;
-    };
+fn node_versions(ui: &mut Ui, view: &AggregatedView) {
     let total = view.node_version_total();
     if total == 0 {
         placeholder(ui, "No coinbase data yet");
@@ -388,40 +274,25 @@ fn node_versions(ui: &mut Ui, app: &mut App) {
     let share = |n: u64| n as f64 / total as f64 * 100.0;
     let name = |v: &str| if v.is_empty() { "Unknown" } else { v }.to_string();
 
-    if state.mode == ViewMode::Chart {
-        let labels = view.node_versions.iter().map(|(v, _)| name(v)).collect();
-        let bars = view
-            .node_versions
-            .iter()
-            .enumerate()
-            .map(|(i, (v, n))| {
-                Bar::new(i as f64, share(*n))
-                    .name(name(v))
-                    .fill(theme::SERIES[i % theme::SERIES.len()])
-            })
-            .collect();
-        bar_chart(ui, "node_versions_chart", bars, labels, "%");
-    } else {
-        let rows = view
-            .node_versions
-            .iter()
-            .map(|(v, n)| [name(v), count(*n), format!("{:.2}%", share(*n))])
-            .collect();
-        wide_table(
-            ui,
-            "node_versions",
-            ["Version", "Blocks", "Share"],
-            rows,
-            |ui, v| {
-                fit_label(ui, v);
-            },
-        );
-    }
+    let rows = view
+        .node_versions
+        .iter()
+        .map(|(v, n)| [name(v), format_number(*n), format!("{:.2}%", share(*n))])
+        .collect();
+    wide_table(
+        ui,
+        "node_versions",
+        ["Version", "Blocks", "Share"],
+        rows,
+        |ui, v| {
+            fit_label(ui, v);
+        },
+    );
     ui.add_space(2.0);
     ui.label(
         RichText::new(format!(
             "From {} accepted coinbase transactions.",
-            count(total)
+            format_number(total)
         ))
         .weak()
         .small(),
@@ -430,32 +301,16 @@ fn node_versions(ui: &mut Ui, app: &mut App) {
 
 // ── Top Senders / Receivers ──
 
-fn addresses(ui: &mut Ui, app: &mut App, panel: AnalyticsPanel) {
-    let state = controls(ui, app, panel, true);
-    let Some(view) = view_or_placeholder(ui, app, state.window) else {
-        return;
-    };
-    let (entries, kind) = match panel {
-        AnalyticsPanel::TopSenders => (&view.top_senders, "sender"),
-        _ => (&view.top_receivers, "receiver"),
-    };
+fn addresses(ui: &mut Ui, entries: &[(String, u64)], kind: &str) {
     if entries.is_empty() {
         placeholder(ui, &format!("No {kind} data yet"));
         return;
     }
-    let id = format!("{kind}s");
-    match state.mode {
-        ViewMode::Table => address_table(ui, &id, entries),
-        ViewMode::Chart => address_chart(ui, &id, entries),
-    }
-}
-
-fn address_table(ui: &mut Ui, id: &str, entries: &[(String, u64)]) {
     let rows = entries
         .iter()
-        .map(|(addr, n)| [addr.clone(), count(*n)])
+        .map(|(addr, n)| [addr.clone(), format_number(*n)])
         .collect();
-    wide_table(ui, id, ["Address", "Txs"], rows, address);
+    wide_table(ui, &format!("{kind}s"), ["Address", "Txs"], rows, address);
 }
 
 /// Full-width table: the first column takes the remaining width and is drawn by
@@ -494,7 +349,7 @@ fn wide_table<const N: usize>(
         let first = (ui.available_width() - rest).max(0.0);
         let mut table = TableBuilder::new(ui)
             .striped(true)
-            .max_scroll_height(CHART_HEIGHT)
+            .max_scroll_height(TABLE_MAX_HEIGHT)
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .column(Column::exact(first));
         for w in widths {
@@ -504,7 +359,7 @@ fn wide_table<const N: usize>(
             .header(theme::ROW_HEIGHT, |mut header| {
                 for (i, h) in headers.into_iter().enumerate() {
                     header.col(|ui| {
-                        right_after_first(ui, i, |ui| column_header(ui, h));
+                        right_after_first(ui, i, |ui| section_title(ui, h));
                     });
                 }
             })
@@ -536,85 +391,44 @@ fn right_after_first(ui: &mut Ui, column: usize, add: impl FnOnce(&mut Ui)) {
     }
 }
 
-fn address_chart(ui: &mut Ui, id: &str, entries: &[(String, u64)]) {
-    let top: Vec<_> = entries.iter().take(10).collect();
-    // Full addresses don't fit under the bars: label by rank and list them below.
-    let labels = (1..=top.len()).map(|rank| format!("#{rank}")).collect();
-    let bars = top
-        .iter()
-        .enumerate()
-        .map(|(i, (addr, n))| Bar::new(i as f64, *n as f64).name(addr).fill(theme::ACCENT))
-        .collect();
-    bar_chart(ui, id, bars, labels, "");
-
-    ui.add_space(2.0);
-    // Rows rather than a grid so each address is fitted to the card width.
-    for (rank, (addr, _)) in top.iter().enumerate() {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 12.0;
-            ui.label(RichText::new(format!("#{:<2}", rank + 1)).weak());
-            address(ui, addr);
-        });
-    }
-}
-
-/// Bars at x = 0, 1, … labelled with `labels`; hover shows name and value + `unit`.
-fn bar_chart(ui: &mut Ui, id: &str, bars: Vec<Bar>, labels: Vec<String>, unit: &'static str) {
-    Plot::new(id)
-        .height(CHART_HEIGHT)
-        .allow_zoom(false)
-        .allow_drag(false)
-        .allow_scroll(false)
-        .show_grid([false, true])
-        .x_axis_formatter(move |mark: GridMark, _| {
-            let i = mark.value.round();
-            if (mark.value - i).abs() > f64::EPSILON || i < 0.0 {
-                return String::new();
-            }
-            labels.get(i as usize).cloned().unwrap_or_default()
-        })
-        .show(ui, |plot_ui| {
-            plot_ui.bar_chart(BarChart::new("counts", bars).width(0.7).element_formatter(
-                Box::new(move |bar, _| {
-                    if unit == "%" {
-                        format!("{}\n{:.2}%", bar.name, bar.value)
-                    } else {
-                        format!("{}\n{}", bar.name, format_number(bar.value as u64))
-                    }
-                }),
-            ));
-        });
-}
-
 // ── Mining ──
 
-fn mining_analysis(ui: &mut Ui, app: &App) {
-    let Some(ref mining) = app.node.mining_info else {
-        placeholder(ui, direct_node_placeholder(app, "Collecting mining data…"));
-        return;
-    };
+fn mining_analysis(ui: &mut Ui, hashrate: Option<f64>, view: &AggregatedView) {
+    let blocks = view.totals.mined_blocks;
     kv_grid(ui, "mining_info", |ui| {
         kv(
             ui,
             "Hashrate",
-            RichText::new(format_hashrate(mining.hashrate)).color(theme::ACCENT_BRIGHT),
+            RichText::new(or_dash(hashrate, format_hashrate)).color(theme::ACCENT_BRIGHT),
         );
         kv(
             ui,
             "Unique Miners",
-            format!(
-                "{} (last {} blocks)",
-                mining.unique_miners, mining.blocks_analyzed
-            ),
+            format_number(view.unique_miners as u64),
         );
+        kv(ui, "Blocks Mined", format_number(blocks));
     });
-    if !mining.top_miners.is_empty() {
-        ui.add_space(4.0);
-        let rows = mining
-            .top_miners
-            .iter()
-            .map(|(addr, n)| [addr.clone(), count(*n as u64)])
-            .collect();
-        wide_table(ui, "top_miners", ["Top Miners", "Blocks"], rows, address);
+    if view.top_miners.is_empty() {
+        return;
     }
+    ui.add_space(4.0);
+    let share = |n: u64| n as f64 / blocks.max(1) as f64 * 100.0;
+    let rows = view
+        .top_miners
+        .iter()
+        .map(|(addr, n)| {
+            [
+                addr.clone(),
+                format_number(*n),
+                format!("{:.2}%", share(*n)),
+            ]
+        })
+        .collect();
+    wide_table(
+        ui,
+        "top_miners",
+        ["Top Miners", "Blocks", "Share"],
+        rows,
+        address,
+    );
 }

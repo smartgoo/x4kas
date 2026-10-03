@@ -6,9 +6,10 @@ use std::time::{Duration, Instant};
 use kaspa_rpc_core::RpcHash;
 use tokio::sync::RwLock;
 
-use crate::analytics::AnalyticsEngine;
+use crate::analytics::{AnalyticsEngine, summarize_chain_blocks};
 use crate::app::{AnalyticsPhase, App, ConnectionStatus, StartPoint};
 use crate::config;
+use crate::format::now_ms;
 use crate::polling::PollingHandles;
 use crate::rpc::client::RpcManager;
 
@@ -54,7 +55,7 @@ async fn run(rpc: Arc<RpcManager>, app: Arc<RwLock<App>>) {
             let saved_at = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
             (engine, saved_at)
         }
-        Err(_) => (AnalyticsEngine::new(), None),
+        Err(_) => (AnalyticsEngine::default(), None),
     };
     let cached_start = engine
         .last_known_chain_block
@@ -103,7 +104,7 @@ async fn run(rpc: Arc<RpcManager>, app: Arc<RwLock<App>>) {
             }
         };
 
-        let (summaries, removed) = RpcManager::extract_block_summaries(&response);
+        let (summaries, removed) = summarize_chain_blocks(&response);
         let block_count = summaries.len();
         let newest_daa = response
             .chain_block_accepted_transactions
@@ -134,10 +135,7 @@ async fn run(rpc: Arc<RpcManager>, app: Arc<RwLock<App>>) {
                 current_hash = *last_added;
             }
 
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
+            let now_ms = now_ms();
             eng.finalize_old_blocks(now_ms);
             eng.prune_buckets(now_ms);
 

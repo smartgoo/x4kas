@@ -21,5 +21,4 @@ async-channel = "2"
 indexmap = { version = "2", features = ["serde"] }
 eframe = "0.33"
 egui_extras = "0.33"
-egui_plot = "0.34"
 

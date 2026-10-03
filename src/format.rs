@@ -1,33 +1,58 @@
-//! Pure display-formatting helpers shared by the UI.
+//! Pure display-formatting helpers, shared by the GUI and the CLI.
+
+/// Milliseconds since the Unix epoch, by the local clock.
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+pub fn sompi_to_kas(sompi: u64) -> f64 {
+    sompi as f64 / 1e8
+}
+
+/// An integer with thousands separators, e.g. `12,345`.
+pub fn format_number(n: u64) -> String {
+    let s = n.to_string();
+    let mut result = String::new();
+    for (i, c) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            result.push(',');
+        }
+        result.push(c);
+    }
+    result.chars().rev().collect()
+}
+
+/// `value` divided by the largest `(threshold, suffix)` it reaches (thresholds in
+/// descending order), with its suffix: `scaled(1.5e15, …)` → `(1.5, "P")`.
+fn scaled(value: f64, units: &[(f64, &'static str)]) -> (f64, &'static str) {
+    units
+        .iter()
+        .find(|(threshold, _)| value >= *threshold)
+        .map_or((value, ""), |&(threshold, suffix)| {
+            (value / threshold, suffix)
+        })
+}
 
 pub fn format_hashrate(hps: f64) -> String {
-    if hps >= 1e18 {
-        format!("{:.2} EH/s", hps / 1e18)
-    } else if hps >= 1e15 {
-        format!("{:.2} PH/s", hps / 1e15)
-    } else if hps >= 1e12 {
-        format!("{:.2} TH/s", hps / 1e12)
-    } else if hps >= 1e9 {
-        format!("{:.2} GH/s", hps / 1e9)
-    } else if hps >= 1e6 {
-        format!("{:.2} MH/s", hps / 1e6)
-    } else if hps >= 1e3 {
-        format!("{:.2} KH/s", hps / 1e3)
-    } else {
-        format!("{:.2} H/s", hps)
-    }
+    const UNITS: [(f64, &str); 6] = [
+        (1e18, "E"),
+        (1e15, "P"),
+        (1e12, "T"),
+        (1e9, "G"),
+        (1e6, "M"),
+        (1e3, "K"),
+    ];
+    let (value, prefix) = scaled(hps, &UNITS);
+    format!("{value:.2} {prefix}H/s")
 }
 
 pub fn format_usd(value: f64) -> String {
-    if value >= 1_000_000_000.0 {
-        format!("${:.2}B", value / 1_000_000_000.0)
-    } else if value >= 1_000_000.0 {
-        format!("${:.2}M", value / 1_000_000.0)
-    } else if value >= 1_000.0 {
-        format!("${:.2}K", value / 1_000.0)
-    } else {
-        format!("${:.2}", value)
-    }
+    const UNITS: [(f64, &str); 3] = [(1e9, "B"), (1e6, "M"), (1e3, "K")];
+    let (value, suffix) = scaled(value, &UNITS);
+    format!("${value:.2}{suffix}")
 }
 
 /// Sompi as KAS with a fixed number of decimals and thousands separators,
@@ -35,7 +60,7 @@ pub fn format_usd(value: f64) -> String {
 pub fn format_kas(sompi: f64, decimals: usize) -> String {
     let s = format!("{:.*}", decimals, sompi / 1e8);
     let (int, frac) = s.split_once('.').unwrap_or((&s, ""));
-    let int = crate::rpc::types::format_number(int.parse().unwrap_or(0));
+    let int = format_number(int.parse().unwrap_or(0));
     if frac.is_empty() {
         int
     } else {
@@ -72,13 +97,18 @@ pub fn shorten_middle(s: &str, max_chars: usize) -> String {
     format!("{start}...{end}")
 }
 
-/// The address page on Kaspa Explorer: the testnet-10 explorer for `kaspatest:` addresses.
-pub fn explorer_address_url(addr: &str) -> String {
-    let host = if addr.starts_with("kaspatest:") {
+/// Kaspa Explorer's host: the testnet-10 explorer if `testnet`.
+fn explorer_host(testnet: bool) -> &'static str {
+    if testnet {
         "explorer-tn10.kaspa.org"
     } else {
         "explorer.kaspa.org"
-    };
+    }
+}
+
+/// The address page on Kaspa Explorer: the testnet-10 explorer for `kaspatest:` addresses.
+pub fn explorer_address_url(addr: &str) -> String {
+    let host = explorer_host(addr.starts_with("kaspatest:"));
     format!("https://{host}/addresses/{addr}")
 }
 
@@ -89,12 +119,7 @@ pub fn kaspa_stream_address_url(addr: &str) -> String {
 
 /// The block page on Kaspa Explorer, on the testnet-10 explorer if `testnet`.
 pub fn explorer_block_url(hash: &str, testnet: bool) -> String {
-    let host = if testnet {
-        "explorer-tn10.kaspa.org"
-    } else {
-        "explorer.kaspa.org"
-    };
-    format!("https://{host}/blocks/{hash}")
+    format!("https://{}/blocks/{hash}", explorer_host(testnet))
 }
 
 /// The block page on Kaspa Stream (mainnet).
@@ -105,7 +130,6 @@ pub fn kaspa_stream_block_url(hash: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rpc::types::format_number;
 
     #[test]
     fn explorer_urls_by_network() {
@@ -193,6 +217,14 @@ mod tests {
     #[test]
     fn format_number_large() {
         assert_eq!(format_number(1_000_000_000_000), "1,000,000,000,000");
+    }
+
+    #[test]
+    fn sompi_to_kas_converts() {
+        assert_eq!(sompi_to_kas(0), 0.0);
+        assert_eq!(sompi_to_kas(100_000_000), 1.0);
+        assert!((sompi_to_kas(50_000_000) - 0.5).abs() < f64::EPSILON);
+        assert!((sompi_to_kas(2_900_000_000_000_000_000) - 29_000_000_000.0).abs() < 1.0);
     }
 
     // --- format_usd ---

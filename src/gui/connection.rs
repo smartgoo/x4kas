@@ -3,7 +3,7 @@
 use eframe::egui::{self, Button, ComboBox, RichText, TextEdit, Ui};
 
 use super::theme;
-use super::widgets::{field_label, kv_grid, primary_button};
+use super::widgets::{field_label, kv_grid, modal_window, placeholder, primary_button};
 use crate::app::{ActiveConnection, App, ConnectionStatus};
 use crate::config::{self, ConnectionKind, ConnectionSettings};
 use crate::controller::{CommandSender, RemoteTarget, UiCommand};
@@ -37,17 +37,12 @@ impl ConnectionWindow {
         if !self.open {
             return;
         }
-        let mut open = true;
-        egui::Window::new("Connection")
-            .open(&mut open)
-            .collapsible(false)
+        let window = egui::Window::new("Connection")
             .resizable(false)
-            .default_width(440.0)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| self.contents(ui, app, cmd_tx));
-        if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.open = false;
-        }
+            .default_width(440.0);
+        // `contents` closes the window itself after a successful Connect.
+        let still_open = modal_window(ctx, window, |ui| self.contents(ui, app, cmd_tx));
+        self.open &= still_open;
     }
 
     fn contents(&mut self, ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
@@ -83,7 +78,7 @@ impl ConnectionWindow {
                     network_combo(ui, &mut self.form.network);
                     ui.end_row();
                 });
-                note(
+                placeholder(
                     ui,
                     "Connects to a public node chosen by the Kaspa resolver. \
                      Mining and analytics need a direct node and are disabled.",
@@ -161,8 +156,4 @@ fn network_combo(ui: &mut Ui, network: &mut String) {
                 ui.selectable_value(network, n.to_string(), *n);
             }
         });
-}
-
-fn note(ui: &mut Ui, text: &str) {
-    ui.label(RichText::new(text).weak());
 }

@@ -1,11 +1,16 @@
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
+use std::hash::Hash;
 use std::path::Path;
 
 use indexmap::IndexMap;
+use kaspa_rpc_core::{GetVirtualChainFromBlockV2Response, RpcOptionalTransaction};
 use serde::{Deserialize, Serialize};
 
 use crate::app::TimeWindow;
-use crate::tx_inspect::{OpcodeUsage, ScriptClass, TransactionProtocol};
+use crate::tx_inspect::{
+    OpcodeUsage, ScriptClass, TransactionProtocol, coinbase_node_version, detect_protocol,
+    output_script_opcodes, redeem_script_opcodes, script_class,
+};
 
 // --- Metrics ---
 
@@ -83,6 +88,8 @@ pub struct Metrics {
     pub chain_blocks: u64,
     /// Accepted non-coinbase transactions.
     pub tx_count: u64,
+    /// Accepted coinbase transactions, one per mined block.
+    pub mined_blocks: u64,
     /// Transactions whose fee is known (every input's UTXO resolved).
     pub fee_tx_count: u64,
     /// Sum of known fees, in sompi.
@@ -90,8 +97,10 @@ pub struct Metrics {
     pub script_classes: ScriptClassCounts,
     pub inspection: InspectionCounts,
     pub protocols: HashMap<TransactionProtocol, u64>,
-    /// Chain-block coinbases by miner node version (`""` = not set).
+    /// Accepted coinbases (one per mined block) by miner node version (`""` = not set).
     pub node_versions: HashMap<String, u64>,
+    /// Accepted coinbases by miner address (the coinbase's first output).
+    pub miners: HashMap<String, u64>,
     pub senders: HashMap<String, u64>,
     pub receivers: HashMap<String, u64>,
 }
@@ -107,20 +116,153 @@ impl Metrics {
     fn merge(&mut self, other: &Self) {
         self.chain_blocks += other.chain_blocks;
         self.tx_count += other.tx_count;
+        self.mined_blocks += other.mined_blocks;
         self.fee_tx_count += other.fee_tx_count;
         self.total_fees += other.total_fees;
         self.script_classes.merge(&other.script_classes);
         self.inspection.merge(&other.inspection);
         add_counts(&mut self.protocols, &other.protocols);
         add_counts(&mut self.node_versions, &other.node_versions);
+        add_counts(&mut self.miners, &other.miners);
         add_counts(&mut self.senders, &other.senders);
         add_counts(&mut self.receivers, &other.receivers);
     }
 }
 
-fn add_counts<K: Clone + Eq + std::hash::Hash>(into: &mut HashMap<K, u64>, from: &HashMap<K, u64>) {
+fn add_counts<K: Clone + Eq + Hash>(into: &mut HashMap<K, u64>, from: &HashMap<K, u64>) {
     for (key, count) in from {
         *into.entry(key.clone()).or_insert(0) += count;
+    }
+}
+
+fn bump<K: Eq + Hash>(counts: &mut HashMap<K, u64>, key: K) {
+    *counts.entry(key).or_insert(0) += 1;
+}
+
+// --- Ingestion ---
+
+/// The chain blocks a VSPC v2 response adds, summarized, and the hashes it removes.
+pub fn summarize_chain_blocks(
+    response: &GetVirtualChainFromBlockV2Response,
+) -> (Vec<BlockSummary>, Vec<String>) {
+    let removed = response
+        .removed_chain_block_hashes
+        .iter()
+        .map(|h| h.to_string())
+        .collect();
+
+    let summaries = response
+        .chain_block_accepted_transactions
+        .iter()
+        .map(|chain_block| {
+            let header = &chain_block.chain_block_header;
+            let mut metrics = Metrics {
+                chain_blocks: 1,
+                ..Default::default()
+            };
+            for tx in &chain_block.accepted_transactions {
+                record_transaction(&mut metrics, tx);
+            }
+            BlockSummary {
+                hash: header.hash.map(|h| h.to_string()).unwrap_or_default(),
+                timestamp_ms: header.timestamp.unwrap_or(0),
+                metrics,
+            }
+        })
+        .collect();
+
+    (summaries, removed)
+}
+
+/// Count one accepted transaction into a chain block's metrics.
+fn record_transaction(metrics: &mut Metrics, tx: &RpcOptionalTransaction) {
+    let payload = tx.payload.as_deref().unwrap_or(&[]);
+    let output_address = |i: usize| {
+        tx.outputs
+            .get(i)?
+            .verbose_data
+            .as_ref()?
+            .script_public_key_address
+            .as_ref()
+            .map(|a| a.to_string())
+    };
+
+    // Coinbase: no inputs. Its payload carries the miner's node version, its first
+    // output pays the miner.
+    if tx.inputs.is_empty() {
+        metrics.mined_blocks += 1;
+        if let Some(version) = coinbase_node_version(payload) {
+            bump(&mut metrics.node_versions, version);
+        }
+        if let Some(miner) = output_address(0) {
+            bump(&mut metrics.miners, miner);
+        }
+        return;
+    }
+    metrics.tx_count += 1;
+
+    let mut usage = OpcodeUsage::default();
+    let mut covenant_created = 0;
+    let mut covenant_spent = 0;
+    // Fee = inputs - outputs, known only if every spent UTXO's amount is.
+    let mut input_sum = Some(0u64);
+
+    for input in &tx.inputs {
+        let utxo = input
+            .verbose_data
+            .as_ref()
+            .and_then(|vd| vd.utxo_entry.as_ref());
+        input_sum = input_sum
+            .zip(utxo.and_then(|u| u.amount))
+            .map(|(a, b)| a + b);
+        let Some(utxo) = utxo else { continue };
+
+        if let Some(addr) = utxo
+            .verbose_data
+            .as_ref()
+            .and_then(|uvd| uvd.script_public_key_address.as_ref())
+        {
+            bump(&mut metrics.senders, addr.to_string());
+        }
+        if utxo.covenant_id.is_some() {
+            covenant_spent += 1;
+        }
+        // Covenant opcodes live in the redeem script a P2SH spend reveals.
+        if let Some(spk) = &utxo.script_public_key
+            && script_class(spk.script()) == ScriptClass::ScriptHash
+            && let Some(sig) = &input.signature_script
+        {
+            usage |= redeem_script_opcodes(sig);
+        }
+    }
+
+    let mut output_sum = 0u64;
+    for (i, output) in tx.outputs.iter().enumerate() {
+        output_sum += output.value.unwrap_or(0);
+        if let Some(spk) = &output.script_public_key {
+            metrics.script_classes.record(script_class(spk.script()));
+            usage |= output_script_opcodes(spk.script());
+        }
+        if output.covenant.as_ref().is_some_and(|c| c.0.is_some()) {
+            covenant_created += 1;
+        }
+        if let Some(addr) = output_address(i) {
+            bump(&mut metrics.receivers, addr);
+        }
+    }
+
+    metrics.record_fee(input_sum.map(|i| i.saturating_sub(output_sum)));
+    metrics
+        .inspection
+        .record_tx(usage, covenant_created, covenant_spent);
+
+    let input_scripts: Vec<&[u8]> = tx
+        .inputs
+        .iter()
+        .filter_map(|inp| inp.signature_script.as_deref())
+        .collect();
+    if let Some(proto) = detect_protocol(payload, &input_scripts) {
+        bump(&mut metrics.protocols, proto);
     }
 }
 
@@ -150,7 +292,11 @@ impl TimeBucket {
     fn merge_block(&mut self, block: &BlockSummary) {
         self.metrics.merge(&block.metrics);
         // Amortized cap: only sort when 2x over limit
-        for map in [&mut self.metrics.senders, &mut self.metrics.receivers] {
+        for map in [
+            &mut self.metrics.senders,
+            &mut self.metrics.receivers,
+            &mut self.metrics.miners,
+        ] {
             if map.len() > MAX_ADDRESSES_PER_BUCKET * 2 {
                 cap_hashmap(map, MAX_ADDRESSES_PER_BUCKET);
             }
@@ -170,10 +316,11 @@ fn cap_hashmap(map: &mut HashMap<String, u64>, max_entries: usize) {
 
 // --- Analytics Engine ---
 
+/// Blocks newer than this stay in `recent_blocks`; older ones go into buckets.
 const ONE_MINUTE_MS: u64 = 60_000;
-const ONE_HOUR_MS: u64 = 3_600_000;
 const TEN_MINUTES_MS: u64 = 600_000;
-const TWENTY_FOUR_HOURS_MS: u64 = 86_400_000;
+/// Bucket count caps, on top of pruning by age, so buckets dated in the future (a
+/// skewed clock) can't pile up.
 const MAX_MINUTE_BUCKETS: usize = 60;
 const MAX_TEN_MINUTE_BUCKETS: usize = 144;
 const MAX_ADDRESSES_PER_BUCKET: usize = 100;
@@ -181,52 +328,27 @@ const TOP_ADDRESSES: usize = 20;
 /// Written before the engine in the cache file; bump when the format or the meaning of
 /// its data changes (e.g. full instead of shortened addresses) so
 /// an old cache is discarded instead of misread.
-const CACHE_MAGIC: u64 = 0x7475_6934_6b61_7303;
+const CACHE_MAGIC: u64 = 0x7475_6934_6b61_7304;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AnalyticsEngine {
     pub recent_blocks: IndexMap<String, BlockSummary>,
     pub minute_buckets: VecDeque<TimeBucket>,
     pub ten_minute_buckets: VecDeque<TimeBucket>,
-    pub total_blocks_processed: u64,
-    pub total_transactions: u64,
     pub last_known_chain_block: Option<String>,
 }
 
 impl AnalyticsEngine {
-    pub fn new() -> Self {
-        Self {
-            recent_blocks: IndexMap::new(),
-            minute_buckets: VecDeque::new(),
-            ten_minute_buckets: VecDeque::new(),
-            total_blocks_processed: 0,
-            total_transactions: 0,
-            last_known_chain_block: None,
-        }
-    }
-
     pub fn add_block(&mut self, summary: BlockSummary) {
-        self.total_blocks_processed += 1;
-        self.total_transactions += summary.metrics.tx_count;
         self.last_known_chain_block = Some(summary.hash.clone());
         self.recent_blocks.insert(summary.hash.clone(), summary);
     }
 
-    /// Remove a block from the recent cache (reorg handling).
-    /// Returns `true` if the block was in the recent cache and removed.
-    /// Returns `false` if the block was already finalized into time buckets (not in cache).
-    /// When `false`, global counters are NOT decremented because the bucket data cannot
-    /// be unwound — the caller should notify the user via analytics_reorg_notification.
+    /// Remove a block from the recent cache (reorg handling). Returns `false` if the
+    /// block was already finalized into time buckets, which can't be unwound; the caller
+    /// should then tell the user (`AnalyticsState::reorg_notification`).
     pub fn remove_block(&mut self, hash: &str) -> bool {
-        if let Some(block) = self.recent_blocks.swap_remove(hash) {
-            self.total_blocks_processed = self.total_blocks_processed.saturating_sub(1);
-            self.total_transactions = self
-                .total_transactions
-                .saturating_sub(block.metrics.tx_count);
-            true
-        } else {
-            false
-        }
+        self.recent_blocks.swap_remove(hash).is_some()
     }
 
     /// Move blocks older than 1 minute from recent cache into time buckets.
@@ -250,11 +372,11 @@ impl AnalyticsEngine {
 
     /// Prune old buckets and cap address maps.
     pub fn prune_buckets(&mut self, now_ms: u64) {
-        let hour_cutoff = now_ms.saturating_sub(ONE_HOUR_MS);
+        let hour_cutoff = now_ms.saturating_sub(TimeWindow::OneHour.duration_ms());
         self.minute_buckets
             .retain(|b| b.bucket_start_ms >= hour_cutoff);
 
-        let day_cutoff = now_ms.saturating_sub(TWENTY_FOUR_HOURS_MS);
+        let day_cutoff = now_ms.saturating_sub(TimeWindow::TwentyFourHour.duration_ms());
         self.ten_minute_buckets
             .retain(|b| b.bucket_start_ms >= day_cutoff);
 
@@ -338,32 +460,21 @@ fn build_aggregated_view<'a>(
     now_ms: u64,
     items: impl Iterator<Item = (u64, &'a Metrics)>,
 ) -> AggregatedView {
-    let bin_ms = window.series_bin_ms();
-    let start_ms = now_ms.saturating_sub(window.duration_ms());
-    // Zero-filled bins so gaps show as empty bars.
-    let mut bins: BTreeMap<u64, u64> = (start_ms / bin_ms..=now_ms / bin_ms)
-        .map(|i| (i * bin_ms, 0))
-        .collect();
-
     let mut total = Metrics::default();
     let mut earliest_ms = None::<u64>;
     for (ts, metrics) in items {
         total.merge(metrics);
         earliest_ms = Some(earliest_ms.map_or(ts, |e| e.min(ts)));
-        if let Some(bin) = bins.get_mut(&(ts / bin_ms * bin_ms)) {
-            *bin += metrics.tx_count;
-        }
     }
 
     let covered_ms = earliest_ms.map_or(0, |e| now_ms.saturating_sub(e));
     AggregatedView {
-        window,
         covered_secs: covered_ms.min(window.duration_ms()) / 1000,
         top_senders: top_n_sorted(std::mem::take(&mut total.senders), TOP_ADDRESSES),
         top_receivers: top_n_sorted(std::mem::take(&mut total.receivers), TOP_ADDRESSES),
+        unique_miners: total.miners.len(),
+        top_miners: top_n_sorted(std::mem::take(&mut total.miners), TOP_ADDRESSES),
         node_versions: top_n_sorted(std::mem::take(&mut total.node_versions), usize::MAX),
-        tx_series: bins.into_iter().collect(),
-        series_bin_ms: bin_ms,
         totals: total,
     }
 }
@@ -379,7 +490,6 @@ fn top_n_sorted(map: HashMap<String, u64>, n: usize) -> Vec<(String, u64)> {
 
 #[derive(Debug, Clone, Default)]
 pub struct AggregatedView {
-    pub window: TimeWindow,
     /// Window totals. The address and node-version maps are moved into the
     /// sorted lists below and left empty.
     pub totals: Metrics,
@@ -388,11 +498,13 @@ pub struct AggregatedView {
     pub covered_secs: u64,
     pub top_senders: Vec<(String, u64)>,
     pub top_receivers: Vec<(String, u64)>,
-    /// Chain blocks by node version, most first.
+    /// Mined blocks by miner address, most first.
+    pub top_miners: Vec<(String, u64)>,
+    /// Distinct miner addresses. A lower bound over long windows, where each bucket only
+    /// keeps its top addresses.
+    pub unique_miners: usize,
+    /// Mined blocks by node version, most first.
     pub node_versions: Vec<(String, u64)>,
-    /// Transactions per bin: `(bin_start_ms, count)`, oldest first.
-    pub tx_series: Vec<(u64, u64)>,
-    pub series_bin_ms: u64,
 }
 
 impl AggregatedView {
@@ -411,7 +523,7 @@ impl AggregatedView {
         self.totals.protocols.get(&protocol).copied().unwrap_or(0)
     }
 
-    /// Blocks with a known node version entry, i.e. the share denominator.
+    /// Accepted coinbases with a parsed node version entry, i.e. the share denominator.
     pub fn node_version_total(&self) -> u64 {
         self.node_versions.iter().map(|(_, c)| c).sum()
     }
@@ -422,6 +534,9 @@ impl AggregatedView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const ONE_HOUR_MS: u64 = 3_600_000;
+    const TWENTY_FOUR_HOURS_MS: u64 = 86_400_000;
 
     /// A chain block with `tx_count` transactions, all paying `fee` sompi.
     fn make_block(hash: &str, timestamp_ms: u64, tx_count: u64, fee: u64) -> BlockSummary {
@@ -452,28 +567,23 @@ mod tests {
 
     #[test]
     fn add_and_remove_block() {
-        let mut engine = AnalyticsEngine::new();
+        let mut engine = AnalyticsEngine::default();
         engine.add_block(make_block("hash1", 1000, 5, 100));
-
-        assert_eq!(engine.total_blocks_processed, 1);
-        assert_eq!(engine.total_transactions, 5);
         assert_eq!(engine.recent_blocks.len(), 1);
 
         assert!(engine.remove_block("hash1"));
-        assert_eq!(engine.total_blocks_processed, 0);
-        assert_eq!(engine.total_transactions, 0);
         assert!(engine.recent_blocks.is_empty());
     }
 
     #[test]
     fn remove_nonexistent_block_returns_false() {
-        let mut engine = AnalyticsEngine::new();
+        let mut engine = AnalyticsEngine::default();
         assert!(!engine.remove_block("doesnt_exist"));
     }
 
     #[test]
     fn finalize_old_blocks_moves_to_buckets() {
-        let mut engine = AnalyticsEngine::new();
+        let mut engine = AnalyticsEngine::default();
         let now = 120_000u64; // 2 minutes
         engine.add_block(make_block("old", 10_000, 3, 50)); // very old
         engine.add_block(make_block("recent", now - 30_000, 2, 100)); // 30s ago
@@ -488,7 +598,7 @@ mod tests {
 
     #[test]
     fn late_block_merges_into_its_bucket_in_order() {
-        let mut engine = AnalyticsEngine::new();
+        let mut engine = AnalyticsEngine::default();
         engine.add_block(make_block("b2", 130_000, 1, 1));
         engine.add_block(make_block("b3", 190_000, 1, 1));
         engine.finalize_old_blocks(1_000_000);
@@ -508,7 +618,7 @@ mod tests {
 
     #[test]
     fn prune_buckets_removes_old() {
-        let mut engine = AnalyticsEngine::new();
+        let mut engine = AnalyticsEngine::default();
         let now = TWENTY_FOUR_HOURS_MS + ONE_HOUR_MS + 1000;
 
         engine
@@ -532,7 +642,7 @@ mod tests {
 
     #[test]
     fn one_min_view_uses_recent_blocks() {
-        let mut engine = AnalyticsEngine::new();
+        let mut engine = AnalyticsEngine::default();
         let now = 100_000;
         engine.add_block(make_block("b1", now - 1000, 5, 100));
         engine.add_block(make_block("b2", now - 2000, 3, 200));
@@ -549,7 +659,7 @@ mod tests {
 
     #[test]
     fn hour_view_combines_buckets_and_recent_blocks() {
-        let mut engine = AnalyticsEngine::new();
+        let mut engine = AnalyticsEngine::default();
         let now = 10 * ONE_MINUTE_MS;
         let mut bucket = TimeBucket::new(5 * ONE_MINUTE_MS);
         bucket.metrics.tx_count = 10;
@@ -564,28 +674,26 @@ mod tests {
     }
 
     #[test]
-    fn tx_series_is_zero_filled_per_bin() {
-        let mut engine = AnalyticsEngine::new();
-        let now = 2 * ONE_HOUR_MS + 30 * ONE_MINUTE_MS;
-        let mut bucket = TimeBucket::new(2 * ONE_HOUR_MS + 10 * ONE_MINUTE_MS);
-        bucket.metrics.tx_count = 7;
-        engine.ten_minute_buckets.push_back(bucket);
-        let mut bucket = TimeBucket::new(2 * ONE_HOUR_MS + 20 * ONE_MINUTE_MS);
-        bucket.metrics.tx_count = 3;
-        engine.ten_minute_buckets.push_back(bucket);
-
-        let view = engine.get_view(TimeWindow::TwentyFourHour, now);
-        assert_eq!(view.series_bin_ms, ONE_HOUR_MS);
-        // Hours 0, 1 and 2 (the partial current hour)
+    fn miners_ranked_in_view() {
+        let mut engine = AnalyticsEngine::default();
+        engine.add_block(make_block_with("b1", 1000, |m| {
+            m.miners.insert("kaspa:a".into(), 3);
+            m.miners.insert("kaspa:b".into(), 1);
+        }));
+        engine.add_block(make_block_with("b2", 2000, |m| {
+            m.miners.insert("kaspa:b".into(), 4);
+        }));
+        let view = engine.get_view(TimeWindow::OneMin, 3000);
+        assert_eq!(view.unique_miners, 2);
         assert_eq!(
-            view.tx_series,
-            vec![(0, 0), (ONE_HOUR_MS, 0), (2 * ONE_HOUR_MS, 10)]
+            view.top_miners,
+            vec![("kaspa:b".to_string(), 5), ("kaspa:a".to_string(), 3)]
         );
     }
 
     #[test]
     fn empty_view_has_no_rates() {
-        let view = AnalyticsEngine::new().get_view(TimeWindow::OneHour, ONE_HOUR_MS);
+        let view = AnalyticsEngine::default().get_view(TimeWindow::OneHour, ONE_HOUR_MS);
         assert_eq!(view.tps(), None);
         assert_eq!(view.avg_fee(), None);
     }
@@ -597,7 +705,7 @@ mod tests {
             m.fee_tx_count = 2;
             m.total_fees = 3000;
         });
-        let mut engine = AnalyticsEngine::new();
+        let mut engine = AnalyticsEngine::default();
         engine.add_block(block);
         let view = engine.get_view(TimeWindow::OneMin, 2000);
         assert_eq!(view.avg_fee(), Some(1500.0));
@@ -605,7 +713,7 @@ mod tests {
 
     #[test]
     fn protocol_and_node_version_counts_in_view() {
-        let mut engine = AnalyticsEngine::new();
+        let mut engine = AnalyticsEngine::default();
         engine.add_block(make_block_with("b1", 1000, |m| {
             m.protocols.insert(TransactionProtocol::Krc, 2);
             m.node_versions.insert("1.0.1".into(), 1);
@@ -653,7 +761,7 @@ mod tests {
 
     #[test]
     fn last_known_chain_block_tracks_last_added() {
-        let mut engine = AnalyticsEngine::new();
+        let mut engine = AnalyticsEngine::default();
         engine.add_block(make_block("first", 1000, 1, 10));
         assert_eq!(engine.last_known_chain_block, Some("first".to_string()));
         engine.add_block(make_block("second", 2000, 1, 10));
@@ -662,7 +770,7 @@ mod tests {
 
     #[test]
     fn persistence_round_trip() {
-        let mut engine = AnalyticsEngine::new();
+        let mut engine = AnalyticsEngine::default();
         engine.add_block(make_block("b1", 1000, 5, 100));
         engine.add_block(make_block_with("b2", 2000, |m| {
             m.protocols.insert(TransactionProtocol::Krc, 1);
@@ -673,8 +781,6 @@ mod tests {
         engine.save(&path).unwrap();
 
         let loaded = AnalyticsEngine::load(&path).unwrap();
-        assert_eq!(loaded.total_blocks_processed, 2);
-        assert_eq!(loaded.total_transactions, 6);
         assert_eq!(loaded.recent_blocks.len(), 2);
         assert_eq!(loaded.last_known_chain_block, Some("b2".to_string()));
 

@@ -84,7 +84,6 @@ impl From<RpcMempoolEntry> for MempoolEntryInfo {
 
 #[derive(Debug, Clone)]
 pub struct MempoolState {
-    pub entry_count: usize,
     pub entries: Vec<MempoolEntryInfo>,
     pub total_fees: u64,
 }
@@ -93,9 +92,7 @@ impl From<Vec<RpcMempoolEntry>> for MempoolState {
     fn from(r: Vec<RpcMempoolEntry>) -> Self {
         let entries: Vec<MempoolEntryInfo> = r.into_iter().map(|e| e.into()).collect();
         let total_fees = entries.iter().map(|e| e.fee).sum();
-        let entry_count = entries.len();
         Self {
-            entry_count,
             entries,
             total_fees,
         }
@@ -123,9 +120,6 @@ pub struct FeeEstimateInfo {
     pub priority_feerate: f64,
     pub normal_feerate: Option<f64>,
     pub low_feerate: Option<f64>,
-    pub priority_bucket: String,
-    pub normal_buckets: Vec<String>,
-    pub low_buckets: Vec<String>,
 }
 
 impl From<RpcFeeEstimate> for FeeEstimateInfo {
@@ -134,43 +128,8 @@ impl From<RpcFeeEstimate> for FeeEstimateInfo {
             priority_feerate: r.priority_bucket.feerate,
             normal_feerate: r.normal_buckets.first().map(|b| b.feerate),
             low_feerate: r.low_buckets.first().map(|b| b.feerate),
-            priority_bucket: format!("{:.2} sompi/gram", r.priority_bucket.feerate),
-            normal_buckets: r
-                .normal_buckets
-                .iter()
-                .map(|b| format!("{:.2} sompi/gram", b.feerate))
-                .collect(),
-            low_buckets: r
-                .low_buckets
-                .iter()
-                .map(|b| format!("{:.2} sompi/gram", b.feerate))
-                .collect(),
         }
     }
-}
-
-pub fn sompi_to_kas(sompi: u64) -> f64 {
-    sompi as f64 / 1e8
-}
-
-pub fn format_number(n: u64) -> String {
-    let s = n.to_string();
-    let mut result = String::new();
-    for (i, c) in s.chars().rev().enumerate() {
-        if i > 0 && i % 3 == 0 {
-            result.push(',');
-        }
-        result.push(c);
-    }
-    result.chars().rev().collect()
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct MiningInfo {
-    pub hashrate: f64,
-    pub unique_miners: usize,
-    pub top_miners: Vec<(String, usize)>,
-    pub blocks_analyzed: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -190,30 +149,6 @@ mod tests {
         RpcTransactionVerboseData,
     };
     use std::str::FromStr;
-
-    // --- sompi_to_kas ---
-
-    #[test]
-    fn sompi_to_kas_zero() {
-        assert_eq!(sompi_to_kas(0), 0.0);
-    }
-
-    #[test]
-    fn sompi_to_kas_one_kas() {
-        assert_eq!(sompi_to_kas(100_000_000), 1.0);
-    }
-
-    #[test]
-    fn sompi_to_kas_fractional() {
-        let result = sompi_to_kas(50_000_000);
-        assert!((result - 0.5).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn sompi_to_kas_large_value() {
-        let result = sompi_to_kas(2_900_000_000_000_000_000);
-        assert!((result - 29_000_000_000.0).abs() < 1.0);
-    }
 
     // --- From<GetServerInfoResponse> ---
 
@@ -325,7 +260,7 @@ mod tests {
     fn mempool_state_empty() {
         let entries: Vec<RpcMempoolEntry> = vec![];
         let state: MempoolState = entries.into();
-        assert_eq!(state.entry_count, 0);
+        assert!(state.entries.is_empty());
         assert_eq!(state.total_fees, 0);
         assert!(state.entries.is_empty());
     }
@@ -338,14 +273,14 @@ mod tests {
             RpcMempoolEntry::new(50, make_test_transaction(None), true),
         ];
         let state: MempoolState = entries.into();
-        assert_eq!(state.entry_count, 3);
+        assert_eq!(state.entries.len(), 3);
         assert_eq!(state.total_fees, 400);
     }
 
     // --- From<RpcFeeEstimate> ---
 
     #[test]
-    fn fee_estimate_formatting() {
+    fn fee_estimate_takes_first_bucket_rates() {
         let estimate = RpcFeeEstimate {
             priority_bucket: RpcFeerateBucket {
                 feerate: 100_000_000.0,
@@ -358,35 +293,8 @@ mod tests {
             low_buckets: vec![],
         };
         let info: FeeEstimateInfo = estimate.into();
-        assert_eq!(info.priority_bucket, "100000000.00 sompi/gram");
         assert_eq!(info.priority_feerate, 100_000_000.0);
         assert_eq!(info.normal_feerate, Some(50_000_000.0));
         assert_eq!(info.low_feerate, None);
-        assert_eq!(info.normal_buckets.len(), 1);
-        assert_eq!(info.normal_buckets[0], "50000000.00 sompi/gram");
-        assert!(info.low_buckets.is_empty());
-    }
-
-    // --- format_number ---
-
-    #[test]
-    fn format_number_zero() {
-        assert_eq!(format_number(0), "0");
-    }
-
-    #[test]
-    fn format_number_small() {
-        assert_eq!(format_number(999), "999");
-    }
-
-    #[test]
-    fn format_number_thousands() {
-        assert_eq!(format_number(1_000), "1,000");
-        assert_eq!(format_number(12_345), "12,345");
-    }
-
-    #[test]
-    fn format_number_millions() {
-        assert_eq!(format_number(1_000_000), "1,000,000");
     }
 }

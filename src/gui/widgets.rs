@@ -1,10 +1,13 @@
 //! Small building blocks shared by the tab views.
 
-use eframe::egui::{self, Button, FontId, Margin, RichText, Stroke, Ui, WidgetText, pos2};
+use eframe::egui::{
+    self, Button, FontId, Margin, RichText, Stroke, TextEdit, Ui, WidgetText, pos2, text::CCursor,
+};
 
 use super::theme;
 use crate::app::{ActiveConnection, App};
 use crate::format::{explorer_address_url, kaspa_stream_address_url, shorten_middle};
+use crate::rpc::hash_links::HashLink;
 
 /// Vertical space between stacked cards.
 pub const CARD_GAP: f32 = 4.0;
@@ -90,14 +93,68 @@ pub fn card_with_header<T: ?Sized>(
     }
 }
 
-/// Accent-colored heading for sections that aren't cards (side panels, help).
+/// Accent-colored heading: sections that aren't cards (side panels, help) and table
+/// column headers.
 pub fn section_title(ui: &mut Ui, title: &str) {
     ui.label(RichText::new(title).color(theme::ACCENT));
 }
 
-/// Header cell for tables and striped grids.
-pub fn column_header(ui: &mut Ui, text: &str) {
-    ui.label(RichText::new(text).color(theme::ACCENT));
+/// Show `window` centered and non-collapsible, closing with its X button or Esc.
+/// Returns false once closed. Size and resizability stay with the caller's `window`.
+pub fn modal_window(
+    ctx: &egui::Context,
+    window: egui::Window<'_>,
+    add_contents: impl FnOnce(&mut Ui),
+) -> bool {
+    let mut open = true;
+    window
+        .open(&mut open)
+        .collapsible(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, add_contents);
+    open && !ctx.input(|i| i.key_pressed(egui::Key::Escape))
+}
+
+/// `value` formatted with `f`, or an em dash when there is none.
+pub fn or_dash<T>(value: Option<T>, f: impl FnOnce(T) -> String) -> String {
+    value.map_or_else(|| "—".to_string(), f)
+}
+
+/// Read-only (but selectable/copyable) JSON with a link icon after each block hash in
+/// `links`. Returns the hash whose icon was clicked.
+pub fn json_view(ui: &mut Ui, text: &str, links: &[HashLink]) -> Option<String> {
+    let output = TextEdit::multiline(&mut &*text)
+        .code_editor()
+        .desired_width(f32::INFINITY)
+        .show(ui);
+
+    let clip = ui.clip_rect();
+    let size = ui.text_style_height(&egui::TextStyle::Monospace);
+    let mut clicked = None;
+    for link in links {
+        let line = output
+            .galley
+            .pos_from_cursor(CCursor::new(link.line_end_char))
+            .translate(output.galley_pos.to_vec2());
+        let rect = egui::Rect::from_min_size(
+            pos2(line.right() + 6.0, line.center().y - size / 2.0),
+            egui::vec2(size, size),
+        );
+        if !clip.intersects(rect) {
+            continue;
+        }
+        let icon = ui
+            .put(
+                rect,
+                Button::new(RichText::new("🔍").size(size * 0.8).color(theme::ACCENT)).frame(false),
+            )
+            .on_hover_text("Open block")
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        if icon.clicked() {
+            clicked = Some(link.hash.clone());
+        }
+    }
+    clicked
 }
 
 /// A two-column label/value grid. Fill it with [`kv`].
@@ -417,7 +474,7 @@ pub fn status_chip(
 /// Placeholder text for data that needs a direct node (a URL), not the resolver.
 pub fn direct_node_placeholder<'a>(app: &App, waiting: &'a str) -> &'a str {
     match app.connection {
-        _ if app.has_direct_node => waiting,
+        _ if app.connection.is_direct() => waiting,
         ActiveConnection::Resolver => "Disabled when using the public resolver",
         _ => "Not connected",
     }

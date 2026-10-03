@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use crate::analytics::{AggregatedView, AnalyticsEngine};
 use crate::config::DaemonConfig;
+use crate::rpc::hash_links::{HashLink, block_hash_links};
 use crate::rpc::types::*;
 
 #[derive(Debug, Clone)]
@@ -278,7 +279,10 @@ pub struct RpcExplorerState {
     pub available_methods: Vec<&'static str>,
     /// Argument inputs for the selected method, one per parameter.
     pub args: Vec<String>,
+    /// Set through `set_response` so `hash_links` stays in sync.
     pub last_response: Option<String>,
+    /// Block hashes in `last_response`, linked to `get_block` in the result viewer.
+    pub hash_links: Vec<HashLink>,
     pub is_loading: bool,
     /// Re-run the selected (parameterless) method every `loop_interval_secs`.
     pub loop_enabled: bool,
@@ -298,6 +302,7 @@ impl Default for RpcExplorerState {
             available_methods,
             args: Vec::new(),
             last_response: None,
+            hash_links: Vec::new(),
             is_loading: false,
             loop_enabled: false,
             loop_interval_secs: 1.0,
@@ -326,6 +331,29 @@ impl RpcExplorerState {
             Some(t) => interval.saturating_sub(now.saturating_duration_since(t)),
             None => Duration::ZERO,
         })
+    }
+
+    pub fn set_response(&mut self, response: Option<String>) {
+        self.hash_links = response
+            .as_deref()
+            .map(block_hash_links)
+            .unwrap_or_default();
+        self.last_response = response;
+    }
+
+    /// Select `get_block` with `hash` filled in (the GUI then runs it).
+    pub fn open_block(&mut self, hash: &str) {
+        if let Some(i) = self
+            .available_methods
+            .iter()
+            .position(|m| *m == "get_block")
+        {
+            self.select(i);
+            if let Some(arg) = self.args.first_mut() {
+                *arg = hash.to_string();
+            }
+            self.set_response(None);
+        }
     }
 
     /// Select a method and reset the argument inputs to its defaults. Stops any loop.
@@ -575,7 +603,7 @@ impl App {
         self.mempool_detail = None;
         self.dag_selection.block_detail = None;
         self.dag_selection.block_loading = false;
-        self.rpc_explorer.last_response = None;
+        self.rpc_explorer.set_response(None);
         self.rpc_explorer.is_loading = false;
     }
 
@@ -1064,6 +1092,21 @@ mod tests {
         state.is_loading = false;
         state.select(1);
         assert!(!state.loop_enabled);
+    }
+
+    #[test]
+    fn rpc_explorer_open_block_prefills_get_block() {
+        let mut state = RpcExplorerState::default();
+        let hash = "ab".repeat(32);
+        state.set_response(Some(format!("{{\n  \"sink\": \"{hash}\"\n}}")));
+        assert_eq!(state.hash_links.len(), 1);
+
+        state.open_block(&hash);
+        assert_eq!(state.method().unwrap().name, "get_block");
+        assert_eq!(state.args[0], hash);
+        assert_eq!(state.args[1], "true");
+        assert_eq!(state.last_response, None);
+        assert!(state.hash_links.is_empty());
     }
 
     #[test]

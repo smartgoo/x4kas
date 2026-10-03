@@ -7,6 +7,8 @@ use futures::stream::{self, StreamExt};
 use kaspa_rpc_core::api::rpc::RpcApi;
 use kaspa_rpc_core::{GetVirtualChainFromBlockV2Response, RpcDataVerbosityLevel, RpcHash};
 use kaspa_wrpc_client::prelude::*;
+use serde::Serialize;
+use serde_json::json;
 use std::str::FromStr;
 use tokio::sync::RwLock;
 
@@ -205,144 +207,133 @@ impl RpcManager {
             "ping" => {
                 let start = std::time::Instant::now();
                 c.ping().await?;
-                format!("Pong! ({:.2}ms)", start.elapsed().as_secs_f64() * 1000.0)
+                to_json(&json!({ "latencyMs": start.elapsed().as_secs_f64() * 1000.0 }))?
             }
-            "get_info" => format!("{:#?}", c.get_info().await?),
-            "get_server_info" => format!("{:#?}", c.get_server_info().await?),
-            "get_system_info" => format!("{:#?}", c.get_system_info().await?),
-            "get_metrics" => format!(
-                "{:#?}",
-                c.get_metrics(true, true, true, true, true, true).await?
-            ),
-            "get_connections" => format!("{:#?}", c.get_connections(true).await?),
-            "get_sync_status" => format!("Synced: {}", c.get_sync_status().await?),
-            "get_current_network" => format!("{:#?}", c.get_current_network().await?),
-            "get_connected_peer_info" => format!("{:#?}", c.get_connected_peer_info().await?),
-            "get_peer_addresses" => format!("{:#?}", c.get_peer_addresses().await?),
-            "get_block_dag_info" => format!("{:#?}", c.get_block_dag_info().await?),
-            "get_block_count" => format!("{:#?}", c.get_block_count().await?),
-            "get_sink" => format!("{:#?}", c.get_sink().await?),
-            "get_sink_blue_score" => format!("{:#?}", c.get_sink_blue_score().await?),
-            "get_coin_supply" => format!("{:#?}", c.get_coin_supply().await?),
+            "get_info" => to_json(&c.get_info().await?)?,
+            "get_server_info" => to_json(&c.get_server_info().await?)?,
+            "get_system_info" => to_json(&c.get_system_info().await?)?,
+            "get_metrics" => to_json(&c.get_metrics(true, true, true, true, true, true).await?)?,
+            "get_connections" => to_json(&c.get_connections(true).await?)?,
+            "get_sync_status" => to_json(&json!({ "isSynced": c.get_sync_status().await? }))?,
+            "get_current_network" => to_json(&c.get_current_network().await?)?,
+            "get_connected_peer_info" => to_json(&c.get_connected_peer_info().await?)?,
+            "get_peer_addresses" => to_json(&c.get_peer_addresses().await?)?,
+            "get_block_dag_info" => to_json(&c.get_block_dag_info().await?)?,
+            "get_block_count" => to_json(&c.get_block_count().await?)?,
+            "get_sink" => to_json(&c.get_sink().await?)?,
+            "get_sink_blue_score" => {
+                to_json(&json!({ "blueScore": c.get_sink_blue_score().await? }))?
+            }
+            "get_coin_supply" => to_json(&c.get_coin_supply().await?)?,
             "estimate_network_hashes_per_second" => {
                 let dag = c.get_block_dag_info().await?;
                 let r = c
                     .estimate_network_hashes_per_second(1000, Some(dag.sink))
                     .await?;
-                format!("Estimated network hash rate: {} hashes/second", r)
+                to_json(&json!({ "networkHashesPerSecond": r }))?
             }
             "get_virtual_chain" => {
                 let dag = c.get_block_dag_info().await?;
                 let r = c
                     .get_virtual_chain_from_block(dag.pruning_point_hash, false, None)
                     .await?;
-                format!(
-                    "Removed chain blocks: {}\nAdded chain blocks: {}\nAccepted transaction IDs: {}",
-                    r.removed_chain_block_hashes.len(),
-                    r.added_chain_block_hashes.len(),
-                    r.accepted_transaction_ids.len(),
-                )
+                to_json(&json!({
+                    "removedChainBlockCount": r.removed_chain_block_hashes.len(),
+                    "addedChainBlockCount": r.added_chain_block_hashes.len(),
+                    "acceptedTransactionIdCount": r.accepted_transaction_ids.len(),
+                }))?
             }
-            "get_block" => format!(
-                "{:#?}",
-                c.get_block(parse_hash(arg(0))?, parse_bool(arg(1))?)
-                    .await?
-            ),
-            "get_blocks" => format!(
-                "{:#?}",
-                c.get_blocks(
+            "get_block" => to_json(
+                &c.get_block(parse_hash(arg(0))?, parse_bool(arg(1))?)
+                    .await?,
+            )?,
+            "get_blocks" => to_json(
+                &c.get_blocks(
                     Some(parse_hash(arg(0))?),
                     parse_bool(arg(1))?,
-                    parse_bool(arg(2))?
+                    parse_bool(arg(2))?,
                 )
-                .await?
-            ),
-            "get_headers" => format!(
-                "{:#?}",
-                c.get_headers(parse_hash(arg(0))?, parse_u64(arg(1))?, parse_bool(arg(2))?)
-                    .await?
-            ),
-            "get_current_block_color" => format!(
-                "{:#?}",
-                c.get_current_block_color(parse_hash(arg(0))?).await?
-            ),
-            "get_block_reward_info" => {
-                format!("{:#?}", c.get_block_reward_info(parse_hash(arg(0))?).await?)
+                .await?,
+            )?,
+            "get_headers" => to_json(
+                &c.get_headers(parse_hash(arg(0))?, parse_u64(arg(1))?, parse_bool(arg(2))?)
+                    .await?,
+            )?,
+            "get_current_block_color" => {
+                to_json(&c.get_current_block_color(parse_hash(arg(0))?).await?)?
             }
-            "get_seq_commit_lane_proof" => format!(
-                "{:#?}",
-                c.get_seq_commit_lane_proof(parse_hash(arg(0))?, parse_hash(arg(1))?)
-                    .await?
-            ),
-            "get_virtual_chain_from_block_v2" => format!(
-                "{:#?}",
-                c.get_virtual_chain_from_block_v2(
+            "get_block_reward_info" => {
+                to_json(&c.get_block_reward_info(parse_hash(arg(0))?).await?)?
+            }
+            "get_seq_commit_lane_proof" => to_json(
+                &c.get_seq_commit_lane_proof(parse_hash(arg(0))?, parse_hash(arg(1))?)
+                    .await?,
+            )?,
+            "get_virtual_chain_from_block_v2" => to_json(
+                &c.get_virtual_chain_from_block_v2(
                     parse_hash(arg(0))?,
                     Some(parse_verbosity(arg(1))?),
-                    parse_opt_u64(arg(2))?
+                    parse_opt_u64(arg(2))?,
                 )
-                .await?
-            ),
+                .await?,
+            )?,
             "get_daa_score_timestamp_estimate" => {
                 let scores = parse_u64_list(arg(0))?;
                 let timestamps = c.get_daa_score_timestamp_estimate(scores.clone()).await?;
-                scores
+                let estimates: Vec<_> = scores
                     .iter()
                     .zip(timestamps)
-                    .map(|(score, ts)| format!("DAA score {score}: {ts} ms"))
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                    .map(|(score, ts)| json!({ "daaScore": score, "timestamp": ts }))
+                    .collect();
+                to_json(&estimates)?
             }
-            "get_subnetwork" => format!(
-                "{:#?}",
-                c.get_subnetwork(parse_subnetwork_id(arg(0))?).await?
-            ),
-            "get_block_template" => format!(
-                "{:#?}",
-                c.get_block_template(parse_address(arg(0))?, arg(1).as_bytes().to_vec())
-                    .await?
-            ),
-            "get_mempool_entries" => format!("{:#?}", c.get_mempool_entries(true, false).await?),
-            "get_mempool_entry" => format!(
-                "{:#?}",
-                c.get_mempool_entry(
+            "get_subnetwork" => to_json(&c.get_subnetwork(parse_subnetwork_id(arg(0))?).await?)?,
+            "get_block_template" => to_json(
+                &c.get_block_template(parse_address(arg(0))?, arg(1).as_bytes().to_vec())
+                    .await?,
+            )?,
+            "get_mempool_entries" => to_json(&c.get_mempool_entries(true, false).await?)?,
+            "get_mempool_entry" => to_json(
+                &c.get_mempool_entry(
                     parse_hash(arg(0))?,
                     parse_bool(arg(1))?,
-                    parse_bool(arg(2))?
+                    parse_bool(arg(2))?,
                 )
-                .await?
-            ),
-            "get_mempool_entries_by_addresses" => format!(
-                "{:#?}",
-                c.get_mempool_entries_by_addresses(
+                .await?,
+            )?,
+            "get_mempool_entries_by_addresses" => to_json(
+                &c.get_mempool_entries_by_addresses(
                     parse_addresses(arg(0))?,
                     parse_bool(arg(1))?,
-                    parse_bool(arg(2))?
+                    parse_bool(arg(2))?,
                 )
-                .await?
-            ),
-            "get_fee_estimate" => format!("{:#?}", c.get_fee_estimate().await?),
+                .await?,
+            )?,
+            "get_fee_estimate" => to_json(&c.get_fee_estimate().await?)?,
             "get_fee_estimate_experimental" => {
-                format!("{:#?}", c.get_fee_estimate_experimental(true).await?)
+                to_json(&c.get_fee_estimate_experimental(true).await?)?
             }
             "get_balance_by_address" => {
-                let sompi = c.get_balance_by_address(parse_address(arg(0))?).await?;
-                format!("Balance: {} KAS ({} sompi)", sompi_to_kas(sompi), sompi)
+                let address = parse_address(arg(0))?;
+                let sompi = c.get_balance_by_address(address.clone()).await?;
+                to_json(&json!({
+                    "address": address,
+                    "balance": sompi,
+                    "balanceKas": sompi_to_kas(sompi),
+                }))?
             }
-            "get_balances_by_addresses" => format!(
-                "{:#?}",
-                c.get_balances_by_addresses(parse_addresses(arg(0))?)
+            "get_balances_by_addresses" => to_json(
+                &c.get_balances_by_addresses(parse_addresses(arg(0))?)
+                    .await?,
+            )?,
+            "get_utxos_by_addresses" => {
+                to_json(&c.get_utxos_by_addresses(parse_addresses(arg(0))?).await?)?
+            }
+            "get_utxo_return_address" => to_json(&json!({
+                "returnAddress": c
+                    .get_utxo_return_address(parse_hash(arg(0))?, parse_u64(arg(1))?)
                     .await?
-            ),
-            "get_utxos_by_addresses" => format!(
-                "{:#?}",
-                c.get_utxos_by_addresses(parse_addresses(arg(0))?).await?
-            ),
-            "get_utxo_return_address" => format!(
-                "Return address: {}",
-                c.get_utxo_return_address(parse_hash(arg(0))?, parse_u64(arg(1))?)
-                    .await?
-            ),
+            }))?,
             _ => anyhow::bail!("No handler for RPC method '{}'", method),
         };
         Ok(truncate_response(out))
@@ -560,6 +551,11 @@ impl Drop for RpcManager {
             handle.abort();
         }
     }
+}
+
+/// Pretty-printed JSON for the result viewer.
+fn to_json<T: Serialize + ?Sized>(value: &T) -> Result<String> {
+    Ok(serde_json::to_string_pretty(value)?)
 }
 
 /// Responses beyond this many bytes are cut so the result viewer stays responsive.

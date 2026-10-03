@@ -266,14 +266,16 @@ impl Controller {
         let app = self.app.clone();
         tokio::spawn(async move {
             let result = match rpc {
-                Some(rpc) => match rpc.execute_rpc_call(&method, &args).await {
-                    Ok(response) => response,
-                    Err(e) => format!("Error: {}", e),
-                },
-                None => "Error: not connected".to_string(),
+                Some(rpc) => rpc.execute_rpc_call(&method, &args).await,
+                None => Err(anyhow::anyhow!("not connected")),
             };
+            // The result viewer shows JSON, errors included.
+            let result = result.unwrap_or_else(|e| {
+                serde_json::to_string_pretty(&serde_json::json!({ "error": e.to_string() }))
+                    .unwrap_or_default()
+            });
             let mut app = app.write().await;
-            app.rpc_explorer.last_response = Some(result);
+            app.rpc_explorer.set_response(Some(result));
             app.rpc_explorer.is_loading = false;
             app.mark_dirty();
         });

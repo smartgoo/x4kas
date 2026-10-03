@@ -8,7 +8,7 @@ use super::widgets::{
 };
 use crate::analytics::AggregatedView;
 use crate::app::{AnalyticsPanel, AnalyticsPhase, App, TimeWindow};
-use crate::format::{format_duration, format_hashrate, format_kas, format_number};
+use crate::format::{format_hashrate, format_kas, format_number};
 use crate::tx_inspect::TransactionProtocol;
 
 /// Tables taller than this scroll.
@@ -20,7 +20,19 @@ pub fn show(ui: &mut Ui, app: &mut App) {
         return;
     }
 
-    banners(ui, app);
+    // While catching up, grey out the tab under a centered progress overlay.
+    let syncing = sync_fraction(app);
+    let rect = ui.max_rect();
+    ui.add_enabled_ui(syncing.is_none(), |ui| {
+        banners(ui, app);
+        tab_contents(ui, app);
+    });
+    if let Some(fraction) = syncing {
+        sync_overlay(ui, rect, fraction);
+    }
+}
+
+fn tab_contents(ui: &mut Ui, app: &mut App) {
     let hashrate = app.node.hashrate;
 
     egui::ScrollArea::vertical().show(ui, |ui| {
@@ -79,6 +91,34 @@ pub fn show(ui: &mut Ui, app: &mut App) {
     });
 }
 
+/// Catch-up progress in `0.0..=1.0` while analytics is syncing to the tip.
+fn sync_fraction(app: &App) -> Option<f32> {
+    let status = &app.analytics.status;
+    let tip = app.node.server_info.as_ref()?.virtual_daa_score;
+    (status.phase == AnalyticsPhase::CatchingUp).then(|| status.fraction(tip).unwrap_or(0.0))
+}
+
+/// Covers `rect` with a near-opaque wash and shows "Analytics Syncing (n%)" in its middle.
+fn sync_overlay(ui: &Ui, rect: egui::Rect, fraction: f32) {
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 0.0, theme::BG.gamma_multiply(0.85));
+    let galley = painter.layout_no_wrap(
+        format!("Analytics Syncing ({:.1}%)", fraction * 100.0),
+        egui::FontId::monospace(theme::FONT_SIZE),
+        theme::WARN,
+    );
+    let text = egui::Align2::CENTER_CENTER.anchor_size(rect.center(), galley.size());
+    let frame = text.expand2(egui::vec2(16.0, 10.0));
+    painter.rect(
+        frame,
+        3.0,
+        theme::SURFACE,
+        egui::Stroke::new(1.0_f32, theme::BORDER_HI),
+        egui::StrokeKind::Inside,
+    );
+    painter.galley(text.min, galley, theme::WARN);
+}
+
 /// A card for an analytics panel, with its time window dropdown after the title. The
 /// contents get the view for that window, or a placeholder shows until there is one.
 fn panel_card(
@@ -111,31 +151,6 @@ fn panel_card(
 }
 
 fn banners(ui: &mut Ui, app: &mut App) {
-    let status = &app.analytics.status;
-    let tip = app.node.server_info.as_ref().map(|s| s.virtual_daa_score);
-    if status.phase == AnalyticsPhase::CatchingUp
-        && let Some(tip) = tip
-    {
-        let fraction = status.fraction(tip).unwrap_or(0.0);
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Syncing analytics…").color(theme::WARN));
-            ui.add(
-                egui::ProgressBar::new(fraction)
-                    .desired_width(300.0)
-                    .text(format!(
-                        "DAA {}/{} ({:.1}%)",
-                        format_number(status.current_daa.unwrap_or(0)),
-                        format_number(tip),
-                        fraction * 100.0
-                    )),
-            );
-            if let Some(eta) = status.eta(tip) {
-                ui.label(RichText::new(format!("~{} left", format_duration(eta))).weak());
-            }
-        });
-        ui.add_space(2.0);
-    }
-
     let mut dismiss = false;
     if let Some(ref msg) = app.analytics.reorg_notification {
         ui.horizontal(|ui| {
@@ -325,8 +340,11 @@ fn wide_table<const N: usize>(
 ) {
     ui.push_id(id, |ui| {
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-        // Room for the padding of clickable cells such as [`address`].
-        let row_height = theme::ROW_HEIGHT + 2.0 * ui.spacing().button_padding.y;
+        // Room for clickable cells such as [`address`]: a selectable label is at least
+        // `interact_size.y` tall and grows by `expansion` on hover, and the next row paints
+        // over anything that spills past this one.
+        let row_height =
+            ui.spacing().interact_size.y + 2.0 * ui.visuals().widgets.hovered.expansion;
         // Exact widths, recomputed every frame: a `Column::remainder` never shrinks below
         // what its content used last frame, so a fitted first column would only ever grow
         // and never shorten its values when the window narrows. All text is monospace, so

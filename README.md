@@ -14,7 +14,7 @@ Built with [egui/eframe](https://github.com/emilk/egui) and [rusty-kaspa](https:
 - **Analytics** (direct node only): transaction summary, fees, transaction inspection (opcodes, covenants, protocols), mining share by node version, mining analysis, top senders and receivers, each over a 1m / 1h / 24h window
 - **RPC Cmds**: run any of 36 read-only RPC methods (with argument forms for those that take a hash, address or number) and inspect formatted responses
 - **Connection switcher**: connect to a node by URL or through the public resolver, from inside the app
-- **Command palette**: run commands with completion and history
+- **Integrated terminal**: your login shell in a bottom pane (`` Ctrl+` ``), a full PTY terminal
 
 ## Prerequisites
 
@@ -82,18 +82,18 @@ Most actions are also available with the mouse.
 | `1` – `5` | Switch tab |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous tab |
 | `p` | Pause / resume polling |
-| `:` or `⌘K` / `Ctrl+K` | Open command palette |
+| `` Ctrl+` `` | Show / hide the terminal |
 | `?` / `F1` | Toggle help |
-| `Esc` | Close popup, palette or help |
+| `Esc` | Close popup or help |
 
-In the command palette, `Enter` runs, `Tab` completes and `↑`/`↓` steps through history. Type `help` to list commands.
+Click into the terminal to type; app shortcuts are off until you click elsewhere. The shell keeps running while the pane is hidden, and `exit` closes it.
 
 ## Architecture
 
 ```
 src/
   main.rs               Entry point: CLI, tokio runtime, GUI launch
-  app.rs                Shared App state (Arc<RwLock<App>>), tabs, command line
+  app.rs                Shared App state (Arc<RwLock<App>>), tabs
   controller.rs         UiCommand handling: connections, RPC calls, shutdown
   cli.rs                CLI argument parsing (clap)
   config.rs             Saved connection choice (~/.x4kas/connection.toml)
@@ -112,9 +112,10 @@ src/
     mod.rs              GuiApp: frame loop, top bar, shortcuts, quit
     dashboard.rs  mempool.rs  blockdag.rs  analytics.rs  rpc_explorer.rs
     connection.rs       Connection window (URL / resolver)
-    command.rs          Command palette
+    terminal.rs         Integrated terminal pane
     help.rs             Help window
     theme.rs  widgets.rs
+vendor/egui_term/       Terminal widget (alacritty_terminal), vendored with small patches
 ```
 
 The GUI runs on the main thread and never blocks on network I/O. It sends commands to a controller task on a tokio runtime, and background tasks update the shared state and request a repaint.

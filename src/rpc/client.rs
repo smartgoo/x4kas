@@ -209,7 +209,7 @@ impl RpcManager {
         }
     }
 
-    /// Run a read-only RPC method from the RPC Cmds tab or command palette. Missing or
+    /// Run a read-only RPC method from the RPC Cmds tab. Missing or
     /// empty arguments take the defaults declared in `methods::RPC_METHODS`.
     pub async fn execute_rpc_call(&self, method: &str, args: &[String]) -> Result<String> {
         let spec = methods::find(method).ok_or_else(|| {

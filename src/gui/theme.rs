@@ -13,7 +13,7 @@ use crate::app::ConnectionStatus;
 // ── Surfaces ──
 /// Main background (central panel, cards).
 pub const BG: Color32 = Color32::from_rgb(0x0d, 0x12, 0x11);
-/// Darkest background: text fields, plots, the command palette.
+/// Darkest background: text fields, plots, the terminal.
 pub const BG_DEEP: Color32 = Color32::from_rgb(0x08, 0x0b, 0x0b);
 /// Raised surfaces: top/status bars, windows.
 pub const SURFACE: Color32 = Color32::from_rgb(0x14, 0x1b, 0x1a);
@@ -145,6 +145,35 @@ fn visuals() -> Visuals {
     w.open.corner_radius = radius;
 
     v
+}
+
+/// ANSI colors for the integrated terminal, built around the app's palette.
+pub fn terminal_palette() -> egui_term::ColorPalette {
+    let hex = |c: Color32| format!("#{:02x}{:02x}{:02x}", c.r(), c.g(), c.b());
+    let rgb = |s: &str| s.to_string();
+    egui_term::ColorPalette {
+        foreground: hex(TEXT),
+        background: hex(BG_DEEP),
+        black: hex(SURFACE_HI),
+        red: hex(ERROR),
+        green: hex(OK),
+        yellow: hex(WARN),
+        blue: rgb("#6aa6d6"),
+        magenta: rgb("#c28cc8"),
+        cyan: hex(ACCENT),
+        white: hex(TEXT),
+        bright_black: hex(TEXT_DIM),
+        bright_red: rgb("#ff8f8f"),
+        bright_green: rgb("#8be3ad"),
+        bright_yellow: rgb("#f6cd7f"),
+        bright_blue: rgb("#8fc1ea"),
+        bright_magenta: rgb("#d9a8de"),
+        bright_cyan: hex(ACCENT_BRIGHT),
+        bright_white: hex(TEXT_BRIGHT),
+        bright_foreground: Some(hex(TEXT_BRIGHT)),
+        dim_foreground: hex(TEXT_DIM),
+        ..Default::default()
+    }
 }
 
 pub fn connection_status(status: &ConnectionStatus) -> (&'static str, Color32) {

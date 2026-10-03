@@ -2,12 +2,12 @@
 
 mod analytics;
 mod blockdag;
-mod command;
 mod connection;
 mod dashboard;
 mod help;
 mod mempool;
 mod rpc_explorer;
+mod terminal;
 mod theme;
 mod widgets;
 
@@ -26,6 +26,7 @@ use crate::controller::{self, CommandSender, ControllerArgs, RemoteTarget, UiCom
 use crate::format::{format_duration, format_number, now_ms};
 use crate::rpc::market;
 use connection::ConnectionWindow;
+use terminal::TerminalPane;
 use widgets::kv;
 
 /// Start background tasks on `rt` and run the GUI on the current (main) thread.
@@ -96,6 +97,7 @@ struct GuiApp {
     shutdown_complete: bool,
     show_help: bool,
     connection: ConnectionWindow,
+    terminal: TerminalPane,
 }
 
 impl GuiApp {
@@ -107,6 +109,7 @@ impl GuiApp {
             shutdown_complete: false,
             show_help: false,
             connection,
+            terminal: TerminalPane::new(),
         }
     }
 
@@ -148,7 +151,7 @@ impl eframe::App for GuiApp {
         let app_state = self.app.clone();
         let mut app = app_state.blocking_write();
 
-        handle_shortcuts(ctx, &mut app, &mut self.show_help);
+        handle_shortcuts(ctx, &mut app, &mut self.show_help, &mut self.terminal);
         let testnet = app
             .node
             .server_info
@@ -159,12 +162,18 @@ impl eframe::App for GuiApp {
         egui::TopBottomPanel::top("top_bar")
             .frame(bar_frame())
             .exact_height(TITLE_BAR_HEIGHT)
-            .show(ctx, |ui| top_bar(ui, &mut app, &mut self.show_help));
-        // Added before the palette so it stays at the very bottom, below it.
+            .show(ctx, |ui| {
+                top_bar(ui, &mut app, &mut self.show_help, &mut self.terminal)
+            });
+        // Added before the terminal so it stays at the very bottom, below it.
         egui::TopBottomPanel::bottom("status_bar")
             .frame(bar_frame())
             .show(ctx, |ui| status_bar(ui, &mut app, &mut self.connection));
-        command::show(ctx, &mut app.command_line, &self.cmd_tx);
+        self.terminal.show(ctx);
+        if self.terminal.has_focus() {
+            // Esc belongs to the shell (vim etc.), not the popups drawn below.
+            ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| match app.active_tab {
             Tab::Dashboard => dashboard::show(ui, &app),
@@ -202,26 +211,23 @@ impl eframe::App for GuiApp {
     }
 }
 
-fn handle_shortcuts(ctx: &egui::Context, app: &mut App, show_help: &mut bool) {
+fn handle_shortcuts(
+    ctx: &egui::Context,
+    app: &mut App,
+    show_help: &mut bool,
+    terminal: &mut TerminalPane,
+) {
     const TAB_KEYS: [Key; 5] = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5];
 
-    // Works even while the palette input has focus.
-    if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::K)) {
-        toggle_palette(app);
+    // Works even while the terminal or a text field has focus.
+    if ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, Key::Backtick)) {
+        terminal.toggle();
     }
-    if ctx.wants_keyboard_input() {
+    if terminal.has_focus() || ctx.wants_keyboard_input() {
         return;
     }
 
-    // Consume the typed character so it doesn't land in the palette input.
-    let (colon, question) = ctx.input_mut(|i| {
-        let colon = take_text_event(i, ":");
-        let question = take_text_event(i, "?");
-        (colon, question)
-    });
-    if colon && !app.command_line.active {
-        app.command_line.open();
-    }
+    let question = ctx.input_mut(|i| take_text_event(i, "?"));
     if question || ctx.input(|i| i.key_pressed(Key::F1)) {
         *show_help = !*show_help;
     }
@@ -251,14 +257,6 @@ fn take_text_event(input: &mut egui::InputState, text: &str) -> bool {
         .events
         .retain(|e| !matches!(e, Event::Text(t) if t == text));
     input.events.len() != before
-}
-
-fn toggle_palette(app: &mut App) {
-    if app.command_line.active {
-        app.command_line.close();
-    } else {
-        app.command_line.open();
-    }
 }
 
 fn bar_frame() -> egui::Frame {
@@ -292,8 +290,8 @@ fn title_bar_drag(ui: &mut egui::Ui) {
     }
 }
 
-/// Brand prompt, tmux-style tab strip, and the palette/help buttons.
-fn top_bar(ui: &mut egui::Ui, app: &mut App, show_help: &mut bool) {
+/// Brand prompt, tmux-style tab strip, and the terminal/help buttons.
+fn top_bar(ui: &mut egui::Ui, app: &mut App, show_help: &mut bool, terminal: &mut TerminalPane) {
     title_bar_drag(ui);
     ui.horizontal_centered(|ui| {
         if cfg!(target_os = "macos") {
@@ -318,11 +316,11 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App, show_help: &mut bool) {
                 *show_help = !*show_help;
             }
             if ui
-                .selectable_label(app.command_line.active, ">_")
-                .on_hover_text("Command palette (: or ⌘K / Ctrl+K)")
+                .selectable_label(terminal.open, ">_")
+                .on_hover_text("Terminal (Ctrl+`)")
                 .clicked()
             {
-                toggle_palette(app);
+                terminal.toggle();
             }
         });
     });

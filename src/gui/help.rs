@@ -9,15 +9,9 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("1 – 5", "Switch tab"),
     ("Ctrl+Tab / Ctrl+Shift+Tab", "Next / previous tab"),
     ("P", "Pause / resume polling"),
-    (": or ⌘K / Ctrl+K", "Open command palette"),
+    ("Ctrl+`", "Show / hide the terminal"),
     ("? / F1", "Toggle this help"),
-    ("Esc", "Close popup, palette or help"),
-];
-
-const PALETTE: &[(&str, &str)] = &[
-    ("Enter", "Run command"),
-    ("Tab", "Complete command name"),
-    ("↑ / ↓", "Command history"),
+    ("Esc", "Close popup or help"),
 ];
 
 pub fn show(ctx: &egui::Context, open: &mut bool) {
@@ -27,12 +21,11 @@ pub fn show(ctx: &egui::Context, open: &mut bool) {
     *open = modal_window(ctx, egui::Window::new("Help").resizable(false), |ui| {
         section(ui, "Shortcuts", SHORTCUTS);
         ui.add_space(8.0);
-        section(ui, "Command palette", PALETTE);
-        ui.add_space(8.0);
         ui.label(
             RichText::new(
                 "Click the connection status in the status bar to switch nodes. \
-                     Shortcuts are ignored while a text field has focus.",
+                     Shortcuts are ignored while a text field or the terminal has focus; \
+                     click outside the terminal to leave it.",
             )
             .weak(),
         );

@@ -1,4 +1,4 @@
-//! Catalog of RPC methods exposed in the RPC Cmds tab and the command palette, with their
+//! Catalog of RPC methods exposed in the RPC Cmds tab, with their
 //! parameters, plus parsing helpers for the string arguments entered in the UI.
 
 use anyhow::{Result, anyhow, bail};
@@ -69,7 +69,7 @@ impl RpcMethod {
 
     /// Fill in defaults for missing or empty arguments. Errors on a missing required
     /// argument or too many arguments. If the last parameter is a list, extra arguments
-    /// are folded into it (so `cmd 1 2 3` works in the command palette).
+    /// are folded into it (so `cmd 1 2 3` works).
     pub fn resolve_args(&self, args: &[String]) -> Result<Vec<String>> {
         let last_is_list = self
             .params

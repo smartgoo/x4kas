@@ -8,7 +8,7 @@ use anyhow::{Result, anyhow};
 use tokio::sync::{RwLock, mpsc, oneshot};
 
 use crate::analytics_streaming;
-use crate::app::{ActiveConnection, App, CommandLine, ConnectionStatus};
+use crate::app::{ActiveConnection, App, ConnectionStatus};
 use crate::polling::{PollingHandles, create_and_start_rpc, start_hashrate_polling};
 use crate::rpc::client::RpcManager;
 
@@ -22,8 +22,6 @@ pub enum UiCommand {
     ExecuteRpc { method: String, args: Vec<String> },
     /// Fetch block info and store the result in `app.dag_selection`.
     LookupBlock(String),
-    /// Run a command-line command and push the result to `app.command_line`.
-    RunCommandLine(String),
     /// Tear everything down; the sender is notified once state has been saved.
     Shutdown(oneshot::Sender<()>),
 }
@@ -82,7 +80,6 @@ impl Controller {
                 UiCommand::Disconnect => self.disconnect().await,
                 UiCommand::ExecuteRpc { method, args } => self.execute_rpc(method, args),
                 UiCommand::LookupBlock(hash) => self.lookup_block(hash),
-                UiCommand::RunCommandLine(cmd) => self.run_command_line(cmd).await,
                 UiCommand::Shutdown(done) => {
                     self.stop_all().await;
                     let _ = done.send(());
@@ -210,35 +207,6 @@ impl Controller {
                 app.dag_selection.block_loading = false;
             },
         );
-    }
-
-    async fn run_command_line(&mut self, cmd: String) {
-        let mut words = cmd.split_whitespace().map(str::to_string);
-        let command = words.next().unwrap_or_default();
-        let args: Vec<String> = words.collect();
-        match command.as_str() {
-            "help" => {
-                let mut app = self.app.write().await;
-                app.command_line
-                    .push_output(cmd, CommandLine::help_text(), false);
-                app.mark_dirty();
-            }
-            "clear" => {
-                let mut app = self.app.write().await;
-                app.command_line.output.clear();
-                app.mark_dirty();
-            }
-            _ => self.spawn_rpc(
-                move |rpc| async move { rpc.execute_rpc_call(&command, &args).await },
-                move |app, result| {
-                    let (output, is_error) = match result {
-                        Ok(response) => (response, false),
-                        Err(e) => (e.to_string(), true),
-                    };
-                    app.command_line.push_output(cmd, output, is_error);
-                },
-            ),
-        }
     }
 }
 

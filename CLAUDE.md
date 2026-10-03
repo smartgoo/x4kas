@@ -40,7 +40,7 @@ egui/eframe desktop GUI for monitoring a Kaspa L1 node via wRPC, connecting by U
 - `src/rpc/methods.rs`: `RPC_METHODS` catalog (name, description, typed params with defaults), `resolve_args`, and argument parsers.
 - `src/rpc/hash_links.rs`: finds block hashes (by field name) in JSON responses so the result viewer can link them to `get_block`.
 - `src/rpc/types.rs`: UI-friendly structs with `From` impls for kaspa RPC types.
-- `src/gui/mod.rs`: `GuiApp` (`eframe::App`). Frame loop, top bar (brand, tab strip, palette/help buttons), bottom status bar (connection, node sync and analytics indicators with details on hover, network, DAA, seconds behind the DAG tip, pause), keyboard shortcuts, quit handling.
+- `src/gui/mod.rs`: `GuiApp` (`eframe::App`). Frame loop, top bar (brand, tab strip, palette/help buttons), bottom status bar (connection, node sync and analytics indicators with details on hover, network, DAA score colored by lag behind the DAG tip, pause), keyboard shortcuts, quit handling.
 - `src/gui/dashboard.rs`: Dashboard tab (node info + block counts, markets, network stats + hashrate + supply, mempool & fees cards).
 - `src/gui/mempool.rs`: Mempool tab (`egui_extras` table, click a row for the detail window).
 - `src/gui/blockdag.rs`: BlockDAG tab (custom painter DAG visualizer, metrics, GHOSTDAG stats, tip/parent lists, Block Info window).

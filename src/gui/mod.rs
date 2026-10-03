@@ -577,19 +577,20 @@ fn status_bar(ui: &mut egui::Ui, app: &mut App, connection: &mut ConnectionWindo
             if app.paused {
                 ui.label(RichText::new("PAUSED").color(theme::WARN));
             }
-            if let Some(secs) = app.seconds_behind_tip(now_ms()) {
-                let color = match secs {
-                    s if s >= 60.0 => theme::ERROR,
-                    s if s >= 10.0 => theme::WARN,
-                    _ => theme::TEXT,
-                };
-                let secs = format_seconds(secs);
-                ui.label(RichText::new(format!("{secs}s behind")).color(color))
-                    .on_hover_text(format!("{secs} seconds behind DAG sink"));
-            }
             if let Some(ref info) = app.node.server_info {
                 widgets::divider(ui);
-                ui.label(format_number(info.virtual_daa_score));
+                // Colored by how far the node lags the DAG tip.
+                let behind = app.seconds_behind_tip(now_ms());
+                let color = match behind {
+                    Some(s) if s > 30.0 => theme::ERROR,
+                    Some(s) if s > 10.0 => theme::WARN,
+                    _ => theme::TEXT,
+                };
+                let daa =
+                    ui.label(RichText::new(format_number(info.virtual_daa_score)).color(color));
+                if let Some(secs) = behind {
+                    daa.on_hover_text(format!("{} seconds behind DAG sink", format_seconds(secs)));
+                }
                 widgets::field_label(ui, "daa");
                 widgets::divider(ui);
                 ui.label(RichText::new(&info.network_id).color(theme::ACCENT));

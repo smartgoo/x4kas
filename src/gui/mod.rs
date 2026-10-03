@@ -3,6 +3,7 @@
 mod analytics;
 mod blockdag;
 mod command;
+mod connection;
 mod dashboard;
 mod help;
 mod mempool;
@@ -20,13 +21,31 @@ use tokio::sync::{RwLock, oneshot};
 
 use crate::app::{App, DaemonStatus, Tab};
 use crate::cli::CliArgs;
-use crate::config::DaemonConfig;
-use crate::controller::{self, CommandSender, ControllerArgs, UiCommand};
+use crate::config::{ConnectionKind, ConnectionSettings, DaemonConfig};
+use crate::controller::{self, CommandSender, ControllerArgs, RemoteTarget, UiCommand};
+use connection::ConnectionWindow;
 use crate::rpc::market;
 
 /// Start background tasks on `rt` and run the GUI on the current (main) thread.
 pub fn run(rt: &tokio::runtime::Runtime, args: CliArgs, daemon_config: DaemonConfig) -> Result<()> {
     let app = Arc::new(RwLock::new(App::new(daemon_config.clone())));
+
+    // `--url` overrides the saved connection choice; with neither a URL nor an
+    // auto-started node, open the connection window so the user can pick one.
+    let mut settings = ConnectionSettings::load().unwrap_or_default();
+    let remote = args.url.clone().map(|url| {
+        settings.kind = ConnectionKind::Url;
+        settings.url = url.clone();
+        settings.network = args.network.clone();
+        RemoteTarget {
+            url: Some(url),
+            network: args.network.clone(),
+        }
+    });
+    let connection = ConnectionWindow::new(
+        settings,
+        remote.is_none() && !daemon_config.auto_start_daemon,
+    );
 
     // Background tasks use `tokio::spawn`, so spawn them inside the runtime context.
     // The guard is dropped before the GUI starts: blocking lock calls from the main
@@ -38,8 +57,7 @@ pub fn run(rt: &tokio::runtime::Runtime, args: CliArgs, daemon_config: DaemonCon
             rt.handle(),
             app.clone(),
             ControllerArgs {
-                url: args.url.clone(),
-                network: args.network.clone(),
+                remote,
                 refresh_interval_ms: args.refresh_interval_ms,
             },
             daemon_config,
@@ -60,7 +78,7 @@ pub fn run(rt: &tokio::runtime::Runtime, args: CliArgs, daemon_config: DaemonCon
         Box::new(move |cc| {
             let ctx = cc.egui_ctx.clone();
             app.blocking_write().repaint = Some(Arc::new(move || ctx.request_repaint()));
-            Ok(Box::new(GuiApp::new(app, cmd_tx)))
+            Ok(Box::new(GuiApp::new(app, cmd_tx, connection)))
         }),
     )
     .map_err(|e| anyhow::anyhow!("GUI error: {e}"))
@@ -73,16 +91,18 @@ struct GuiApp {
     shutdown_rx: Option<oneshot::Receiver<()>>,
     shutdown_complete: bool,
     show_help: bool,
+    connection: ConnectionWindow,
 }
 
 impl GuiApp {
-    fn new(app: Arc<RwLock<App>>, cmd_tx: CommandSender) -> Self {
+    fn new(app: Arc<RwLock<App>>, cmd_tx: CommandSender, connection: ConnectionWindow) -> Self {
         Self {
             app,
             cmd_tx,
             shutdown_rx: None,
             shutdown_complete: false,
             show_help: false,
+            connection,
         }
     }
 
@@ -127,7 +147,7 @@ impl eframe::App for GuiApp {
         handle_shortcuts(ctx, &mut app, &mut self.show_help);
 
         egui::TopBottomPanel::top("top_bar")
-            .show(ctx, |ui| top_bar(ui, &mut app, &mut self.show_help));
+            .show(ctx, |ui| top_bar(ui, &mut app, &mut self.show_help, &mut self.connection));
         command::show(ctx, &mut app.command_line, &self.cmd_tx);
 
         egui::CentralPanel::default().show(ctx, |ui| match app.active_tab {
@@ -139,6 +159,7 @@ impl eframe::App for GuiApp {
             Tab::BlockDag => blockdag::show(ui, &mut app, &self.cmd_tx),
         });
 
+        self.connection.show(ctx, &mut app, &self.cmd_tx);
         help::show(ctx, &mut self.show_help);
 
         if self.is_shutting_down() {
@@ -219,7 +240,7 @@ fn toggle_palette(app: &mut App) {
     }
 }
 
-fn top_bar(ui: &mut egui::Ui, app: &mut App, show_help: &mut bool) {
+fn top_bar(ui: &mut egui::Ui, app: &mut App, show_help: &mut bool, connection: &mut ConnectionWindow) {
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         ui.label(RichText::new("tui4kas").strong().color(theme::ACCENT).size(16.0));
@@ -269,8 +290,16 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App, show_help: &mut bool) {
             }
 
             let (text, color) = theme::connection_status(&app.node.connection_status);
-            ui.label(RichText::new(text).color(color));
-            ui.label(RichText::new("●").color(color));
+            if ui
+                .selectable_label(
+                    connection.open,
+                    RichText::new(format!("● {text} · {}", app.connection.label())).color(color),
+                )
+                .on_hover_text("Change connection")
+                .clicked()
+            {
+                connection.toggle();
+            }
         });
     });
     ui.add_space(4.0);

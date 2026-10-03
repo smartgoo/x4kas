@@ -4,7 +4,7 @@ use eframe::egui::{self, Color32, RichText, Ui};
 use egui_plot::{Bar, BarChart, GridMark, Line, Plot, PlotPoints};
 
 use super::theme;
-use super::widgets::{card, kv, kv_grid, placeholder, syncing_guard};
+use super::widgets::{card, direct_node_placeholder, kv, kv_grid, placeholder, syncing_guard};
 use crate::analytics::AggregatedView;
 use crate::app::{App, TimeWindow, ViewMode};
 use crate::rpc::types::format_number;
@@ -31,7 +31,7 @@ pub fn show(ui: &mut Ui, app: &mut App) {
         return;
     }
     if !app.has_direct_node {
-        placeholder(ui, "Analytics is disabled when using Kaspa PNN via Resolver.");
+        placeholder(ui, direct_node_placeholder(app, ""));
         return;
     }
 

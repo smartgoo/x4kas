@@ -35,8 +35,8 @@ pub fn show(ctx: &egui::Context, open: &mut bool) {
             ui.add_space(8.0);
             ui.label(
                 RichText::new(
-                    "Shortcuts are ignored while a text field has focus. \
-                     Most actions are also available with the mouse.",
+                    "Click the connection status in the top bar to switch nodes. \
+                     Shortcuts are ignored while a text field has focus.",
                 )
                 .weak(),
             );

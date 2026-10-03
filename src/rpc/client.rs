@@ -83,18 +83,15 @@ impl RpcManager {
         Ok(())
     }
 
-    /// Start polling from an Arc reference (used when polling is deferred until after connection).
-    pub fn start_polling_shared(self: &Arc<Self>, interval: Duration, app_state: Arc<RwLock<App>>) {
-        let client = self.client.clone();
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
-            loop {
-                ticker.tick().await;
-                if !app_state.read().await.paused {
-                    Self::poll_once(&client, &app_state).await;
-                }
+    /// Poll the node every `interval` until the surrounding task is aborted.
+    pub async fn poll_forever(&self, interval: Duration, app_state: Arc<RwLock<App>>) {
+        let mut ticker = tokio::time::interval(interval);
+        loop {
+            ticker.tick().await;
+            if !app_state.read().await.paused {
+                Self::poll_once(&self.client, &app_state).await;
             }
-        });
+        }
     }
 
     async fn poll_once(client: &KaspaRpcClient, state: &Arc<RwLock<App>>) {

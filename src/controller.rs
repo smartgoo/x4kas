@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc, oneshot};
 
 use crate::analytics_streaming;
-use crate::app::{App, CommandLine, ConnectionStatus, DaemonStatus};
+use crate::app::{ActiveConnection, App, CommandLine, ConnectionStatus, DaemonStatus};
 use crate::config::DaemonConfig;
 use crate::daemon::DaemonHandle;
 use crate::daemon_lifecycle::{self, PollingHandles, create_and_start_rpc, start_mining_polling};
@@ -14,6 +14,10 @@ use crate::rpc::client::RpcManager;
 
 /// Commands sent from the frontend to the controller task.
 pub enum UiCommand {
+    /// Stop whatever is running and connect to a remote node (URL or resolver).
+    Connect(RemoteTarget),
+    /// Stop whatever is running (including the embedded node) and stay disconnected.
+    Disconnect,
     StartDaemon(Box<DaemonConfig>),
     StopDaemon,
     /// Run an RPC method and store the result in `app.rpc_explorer`.
@@ -28,15 +32,25 @@ pub enum UiCommand {
 
 pub type CommandSender = mpsc::UnboundedSender<UiCommand>;
 
-pub struct ControllerArgs {
+/// A node reached over the network rather than the embedded daemon.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RemoteTarget {
+    /// wRPC URL, or `None` to let the public resolver pick a node.
     pub url: Option<String>,
     pub network: String,
+}
+
+pub struct ControllerArgs {
+    /// Connect here on startup (from `--url`).
+    pub remote: Option<RemoteTarget>,
     pub refresh_interval_ms: u64,
 }
 
 struct Controller {
     app: Arc<RwLock<App>>,
-    args: ControllerArgs,
+    refresh_interval_ms: u64,
+    /// The remote node to use when the embedded node is not running.
+    remote: Option<RemoteTarget>,
     rpc: Option<Arc<RpcManager>>,
     daemon: Option<DaemonHandle>,
     log_tail: Option<tokio::task::JoinHandle<()>>,
@@ -53,7 +67,8 @@ pub fn spawn(
     let (tx, rx) = mpsc::unbounded_channel();
     let controller = Controller {
         app,
-        args,
+        refresh_interval_ms: args.refresh_interval_ms,
+        remote: args.remote,
         rpc: None,
         daemon: None,
         log_tail: None,
@@ -69,6 +84,8 @@ impl Controller {
 
         while let Some(cmd) = rx.recv().await {
             match cmd {
+                UiCommand::Connect(target) => self.connect(target).await,
+                UiCommand::Disconnect => self.disconnect().await,
                 UiCommand::StartDaemon(config) => self.start_daemon(&config).await,
                 UiCommand::StopDaemon => self.stop_daemon().await,
                 UiCommand::ExecuteRpc(method) => self.execute_rpc(method),
@@ -88,65 +105,88 @@ impl Controller {
     /// Startup modes:
     /// 1. --url provided: connect directly to that node
     /// 2. auto_start_daemon (no --url): start integrated daemon, connect to it
-    /// 3. neither: start with no connection, user starts daemon from the Node tab
+    /// 3. neither: stay disconnected until the user picks a connection
     async fn startup(&mut self, config: &DaemonConfig) {
-        if self.args.url.is_some() {
-            self.app.write().await.has_direct_node = true;
-            self.connect_direct().await;
+        if self.remote.is_some() {
+            self.connect_remote().await;
         } else if config.auto_start_daemon {
             self.start_daemon(config).await;
-        } else {
-            self.app.write().await.has_direct_node = false;
-            self.set_disconnected_rpc().await;
         }
     }
 
-    async fn connect_direct(&mut self) {
+    async fn connect(&mut self, target: RemoteTarget) {
+        self.stop_all().await;
+        self.remote = Some(target);
+        self.connect_remote().await;
+    }
+
+    async fn disconnect(&mut self) {
+        self.stop_all().await;
+        self.remote = None;
+    }
+
+    /// Connect to `self.remote`. Mining and analytics need a direct node, so they are
+    /// only started for a URL, not for the resolver.
+    async fn connect_remote(&mut self) {
+        let Some(target) = self.remote.clone() else {
+            return;
+        };
+        let direct = target.url.is_some();
+        {
+            let mut app = self.app.write().await;
+            app.has_direct_node = direct;
+            app.connection = match target.url {
+                Some(ref url) => ActiveConnection::Url(url.clone()),
+                None => ActiveConnection::Resolver,
+            };
+            app.node.connection_status = ConnectionStatus::Connecting;
+            app.mark_dirty();
+        }
+
         match create_and_start_rpc(
-            self.args.url.clone(),
-            &self.args.network,
+            target.url,
+            &target.network,
             &self.app,
-            self.args.refresh_interval_ms,
+            self.refresh_interval_ms,
             false,
+            &mut self.polling,
         )
         .await
         {
             Ok(rpc) => {
-                start_mining_polling(&rpc, &self.app, &mut self.polling);
-                analytics_streaming::start_analytics_streaming(&rpc, &self.app, &mut self.polling);
+                if direct {
+                    start_mining_polling(&rpc, &self.app, &mut self.polling);
+                    analytics_streaming::start_analytics_streaming(
+                        &rpc,
+                        &self.app,
+                        &mut self.polling,
+                    );
+                }
                 self.rpc = Some(rpc);
             }
             Err(e) => {
                 let mut app = self.app.write().await;
+                app.node.connection_status = ConnectionStatus::Error(e.to_string());
                 app.node.last_error = Some(e.to_string());
                 app.mark_dirty();
             }
         }
     }
 
-    async fn set_disconnected_rpc(&mut self) {
-        self.rpc = RpcManager::new(None, &self.args.network, self.app.clone())
-            .await
-            .ok()
-            .map(Arc::new);
-    }
-
     async fn start_daemon(&mut self, config: &DaemonConfig) {
+        self.stop_background_tasks().await;
         {
             let mut app = self.app.write().await;
+            app.clear_node_data();
+            app.connection = ActiveConnection::Embedded;
             app.integrated_node.status = DaemonStatus::Starting;
             app.mark_dirty();
-        }
-
-        self.polling.abort_all();
-        if let Some(rpc) = self.rpc.take() {
-            let _ = rpc.disconnect().await;
         }
 
         match daemon_lifecycle::start_daemon_and_connect(
             config,
             &self.app,
-            self.args.refresh_interval_ms,
+            self.refresh_interval_ms,
             &mut self.polling,
         )
         .await
@@ -158,50 +198,45 @@ impl Controller {
             }
             Err(e) => {
                 // Shut down daemon if it was started but RPC failed
+                self.stop_background_tasks().await;
                 self.shutdown_daemon().await;
-                {
-                    let mut app = self.app.write().await;
-                    app.integrated_node.status = DaemonStatus::Error(e.to_string());
-                    app.mark_dirty();
-                }
-                self.set_disconnected_rpc().await;
+                let mut app = self.app.write().await;
+                app.clear_node_data();
+                app.connection = ActiveConnection::None;
+                app.has_direct_node = false;
+                app.integrated_node.status = DaemonStatus::Error(e.to_string());
+                app.mark_dirty();
             }
         }
     }
 
+    /// Stop the embedded node, then fall back to the remote node, if there is one.
     async fn stop_daemon(&mut self) {
+        self.stop_all().await;
+        self.connect_remote().await;
+    }
+
+    /// Stop polling and the embedded node, and clear all node data.
+    async fn stop_all(&mut self) {
+        let had_daemon = self.daemon.is_some();
+        if had_daemon {
+            let mut app = self.app.write().await;
+            app.integrated_node.status = DaemonStatus::Stopping;
+            app.mark_dirty();
+        }
         self.stop_background_tasks().await;
         self.shutdown_daemon().await;
 
-        let has_url = self.args.url.is_some();
-        {
-            let mut app = self.app.write().await;
-            app.node.server_info = None;
-            app.node.dag_info = None;
-            app.node.mempool_state = None;
-            app.node.coin_supply = None;
-            app.node.fee_estimate = None;
-            app.node.mining_info = None;
-            app.analytics.engine = None;
-            app.analytics.sync_progress = None;
-            app.analytics.cached_views = None;
-            app.node.node_url = None;
-            app.node.node_uid = None;
+        let mut app = self.app.write().await;
+        save_analytics_cache(&app);
+        app.clear_node_data();
+        app.connection = ActiveConnection::None;
+        app.has_direct_node = false;
+        if had_daemon {
             app.integrated_node.status = DaemonStatus::Stopped;
             app.integrated_node.started_at = None;
-            app.has_direct_node = has_url;
-            if !has_url {
-                app.node.connection_status = ConnectionStatus::Disconnected;
-            }
-            app.mark_dirty();
         }
-
-        if has_url {
-            // Restore original direct URL connection
-            self.connect_direct().await;
-        } else {
-            self.set_disconnected_rpc().await;
-        }
+        app.mark_dirty();
     }
 
     async fn stop_background_tasks(&mut self) {
@@ -223,25 +258,7 @@ impl Controller {
     }
 
     async fn shutdown(&mut self) {
-        if self.daemon.is_some() {
-            let mut app = self.app.write().await;
-            app.integrated_node.status = DaemonStatus::Stopping;
-            app.mark_dirty();
-        }
-        self.stop_background_tasks().await;
-        self.shutdown_daemon().await;
-
-        // Persist analytics cache (best-effort; the streaming task is aborted, not stopped)
-        let app = self.app.read().await;
-        if let Some(ref engine) = app.analytics.engine
-            && let Ok(eng) = engine.try_read()
-        {
-            let cache_path = dirs::home_dir()
-                .unwrap_or_default()
-                .join(".tui4kas")
-                .join("analytics_cache.bin");
-            let _ = eng.save(&cache_path);
-        }
+        self.stop_all().await;
     }
 
     fn execute_rpc(&self, method: String) {
@@ -314,5 +331,18 @@ impl Controller {
             app.command_line.push_output(cmd, output, is_error);
             app.mark_dirty();
         });
+    }
+}
+
+/// Persist the analytics cache (best-effort; the streaming task is aborted, not stopped).
+fn save_analytics_cache(app: &App) {
+    if let Some(ref engine) = app.analytics.engine
+        && let Ok(eng) = engine.try_read()
+    {
+        let cache_path = dirs::home_dir()
+            .unwrap_or_default()
+            .join(".tui4kas")
+            .join("analytics_cache.bin");
+        let _ = eng.save(&cache_path);
     }
 }

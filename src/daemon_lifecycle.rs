@@ -11,6 +11,8 @@ use crate::rpc::client::RpcManager;
 
 /// Tracks cancellable background polling tasks.
 pub struct PollingHandles {
+    /// Connects the RPC client, then polls node state.
+    pub node: Option<tokio::task::JoinHandle<()>>,
     pub mining: Option<tokio::task::JoinHandle<()>>,
     pub analytics: Option<tokio::task::JoinHandle<()>>,
 }
@@ -18,12 +20,16 @@ pub struct PollingHandles {
 impl PollingHandles {
     pub fn new() -> Self {
         Self {
+            node: None,
             mining: None,
             analytics: None,
         }
     }
 
     pub fn abort_all(&mut self) {
+        if let Some(h) = self.node.take() {
+            h.abort();
+        }
         if let Some(h) = self.mining.take() {
             h.abort();
         }
@@ -64,13 +70,15 @@ pub fn start_mining_polling(
     handles.analytics = None;
 }
 
-/// Create an RPC manager, connect, and start polling.
+/// Create an RPC manager, then connect and poll in a task tracked by `handles.node`.
+/// `url: None` connects through the public node resolver.
 pub async fn create_and_start_rpc(
     url: Option<String>,
     network: &str,
     app: &Arc<RwLock<App>>,
     refresh_interval_ms: u64,
     retry: bool,
+    handles: &mut PollingHandles,
 ) -> Result<Arc<RpcManager>> {
     let rpc_manager = RpcManager::new(url, network, app.clone()).await?;
     let rpc = Arc::new(rpc_manager);
@@ -78,7 +86,7 @@ pub async fn create_and_start_rpc(
     let rpc_for_connect = rpc.clone();
     let interval = refresh_interval_ms;
     let app_clone = app.clone();
-    tokio::spawn(async move {
+    handles.node = Some(tokio::spawn(async move {
         let max_attempts = if retry { 30 } else { 1 };
         for attempt in 0..max_attempts {
             match rpc_for_connect.connect().await {
@@ -89,8 +97,10 @@ pub async fn create_and_start_rpc(
                 Err(_) => break,
             }
         }
-        rpc_for_connect.start_polling_shared(Duration::from_millis(interval), app_clone);
-    });
+        rpc_for_connect
+            .poll_forever(Duration::from_millis(interval), app_clone)
+            .await;
+    }));
 
     Ok(rpc)
 }
@@ -184,6 +194,7 @@ pub async fn start_daemon_and_connect(
         app,
         refresh_interval_ms,
         true,
+        polling_handles,
     )
     .await?;
 

@@ -12,6 +12,7 @@ Built with [egui/eframe](https://github.com/emilk/egui) and [rusty-kaspa](https:
 - **Analytics**: fees, transaction summary, protocol activity, top senders and receivers, each as a table or chart over 1m / 1h / 24h windows
 - **RPC Cmds**: run any of 18 RPC methods and inspect formatted responses
 - **Node**: configure, start and stop an embedded kaspad, with live status and logs
+- **Connection switcher**: connect to a node by URL, through the public resolver, or via the embedded node, all from inside the app
 - **Command palette**: run commands with completion and history
 
 ## Prerequisites
@@ -30,11 +31,17 @@ cargo build --release
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `-u, --url <URL>` | wRPC endpoint (e.g., `ws://127.0.0.1:17110`) | none (see below) |
+| `-u, --url <URL>` | Connect to this wRPC endpoint on startup (e.g., `ws://127.0.0.1:17110`) | none (see below) |
 | `-n, --network <NET>` | Network: `mainnet`, `testnet-10`, `testnet-11` | `mainnet` |
 | `-r, --refresh-interval-ms <MS>` | Polling interval in milliseconds | `1000` |
 
-Without `--url`, the app starts the embedded node if `auto_start_daemon` is enabled in its config. Otherwise it waits for you to start the node from the **Node** tab.
+Without `--url`, the app starts the embedded node if `auto_start_daemon` is enabled in its config. Otherwise it opens the **Connection** window, where you choose:
+
+- **Custom URL**: any node's Borsh wRPC endpoint (port 17110 on mainnet, 17210 on testnets)
+- **Public resolver**: a public node chosen by the Kaspa resolver (mining and analytics need a direct node, so they're disabled)
+- **Embedded node**: runs kaspad in-process using the Node tab settings
+
+Click the connection status in the top bar to open the window again at any time. Switching connections stops whatever was running, including the embedded node. Your last choice is saved and pre-filled next time.
 
 ### Examples
 
@@ -45,13 +52,14 @@ tui4kas --url ws://127.0.0.1:17110
 # Connect to testnet with 2s refresh
 tui4kas --url ws://127.0.0.1:17210 --network testnet-10 --refresh-interval-ms 2000
 
-# Use the embedded node (configure it in the Node tab)
+# Pick a connection in the app (URL, public resolver, or embedded node)
 tui4kas
 ```
 
 ### Files
 
 - `~/.tui4kas/config.toml`: embedded node settings (saved from the Node tab)
+- `~/.tui4kas/connection.toml`: last connection choice (URL, network, mode)
 - `~/.tui4kas/analytics_cache.bin`: analytics cache, saved on exit
 
 ## Keyboard Shortcuts
@@ -77,7 +85,7 @@ Closing the window while the embedded node is running stops the node cleanly bef
 src/
   main.rs               Entry point: CLI, config, tokio runtime, GUI launch
   app.rs                Shared App state (Arc<RwLock<App>>), tabs, command line
-  controller.rs         UiCommand handling: node lifecycle, RPC calls, shutdown
+  controller.rs         UiCommand handling: connections, node lifecycle, RPC calls, shutdown
   cli.rs                CLI argument parsing (clap)
   config.rs             Embedded node config (~/.tui4kas/config.toml)
   daemon.rs             Embedded kaspad
@@ -92,6 +100,7 @@ src/
   gui/
     mod.rs              GuiApp: frame loop, top bar, shortcuts, quit
     dashboard.rs  mempool.rs  blockdag.rs  analytics.rs  rpc_explorer.rs  node.rs
+    connection.rs       Connection window (URL / resolver / embedded)
     command.rs          Command palette
     help.rs             Help window
     theme.rs  widgets.rs

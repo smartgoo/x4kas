@@ -3,7 +3,7 @@
 use eframe::egui::{self, RichText, Ui, WidgetText};
 
 use super::theme;
-use crate::app::App;
+use crate::app::{ActiveConnection, App};
 
 /// A titled, framed panel.
 pub fn card(ui: &mut Ui, title: &str, add_contents: impl FnOnce(&mut Ui)) {
@@ -55,4 +55,13 @@ pub fn syncing_guard(ui: &mut Ui, app: &App, title: &str) -> bool {
         );
     });
     true
+}
+
+/// Placeholder text for data that needs a direct node (URL or embedded), not the resolver.
+pub fn direct_node_placeholder<'a>(app: &App, waiting: &'a str) -> &'a str {
+    match app.connection {
+        _ if app.has_direct_node => waiting,
+        ActiveConnection::Resolver => "Disabled when using the public resolver",
+        _ => "Not connected",
+    }
 }

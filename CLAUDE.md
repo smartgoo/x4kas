@@ -18,7 +18,9 @@ egui/eframe desktop GUI for monitoring a Kaspa L1 node via wRPC, with an optiona
 - `main` builds a tokio multi-thread `Runtime` by hand (no `#[tokio::main]`). eframe owns the **main thread**, which must stay **outside** the runtime context: `RwLock::blocking_read/blocking_write` panic inside it. `gui::run` enters the runtime only briefly to spawn background tasks, then drops the guard.
 - **Shared state:** `Arc<tokio::sync::RwLock<App>>`. The GUI takes `blocking_write` once per frame; background tasks use `.write().await`.
 - **Repaint:** background writers call `app.mark_dirty()`, which invokes the injected `App.repaint` hook (`ctx.request_repaint()`). The GUI also schedules a 1s repaint so clocks and uptime tick. Don't busy-repaint.
-- **Commands:** the GUI never awaits. It sends `UiCommand`s (`StartDaemon`, `StopDaemon`, `ExecuteRpc`, `LookupBlock`, `RunCommandLine`, `Shutdown`) over an mpsc channel to the controller task, which writes results back into `App`.
+- **Commands:** the GUI never awaits. It sends `UiCommand`s (`Connect(RemoteTarget)`, `Disconnect`, `StartDaemon`, `StopDaemon`, `ExecuteRpc`, `LookupBlock`, `RunCommandLine`, `Shutdown`) over an mpsc channel to the controller task, which writes results back into `App`.
+- **Connections:** exactly one active source at a time (`App.connection: ActiveConnection`): a URL, the public resolver (`RemoteTarget { url: None }`), or the embedded node. Switching calls `Controller::stop_all` (abort polling, stop the daemon, save the analytics cache, `App::clear_node_data`). Stopping the embedded node falls back to the remembered remote target. Mining and analytics only run with a direct node (`has_direct_node`: URL or embedded), not the resolver.
+- **Task tracking:** every background task (node polling via `create_and_start_rpc`, mining, analytics) is stored in `PollingHandles` so `abort_all` stops it. Never spawn an untracked task that writes node data, or it keeps writing stale data after a switch.
 - **Graceful quit:** a close request while a node is running is cancelled, `Shutdown(oneshot)` is sent, a "Stopping node…" modal is shown, and the window closes once the controller signals completion (daemon stopped, analytics cache saved).
 
 ### Module Layout
@@ -26,10 +28,10 @@ egui/eframe desktop GUI for monitoring a Kaspa L1 node via wRPC, with an optiona
 - `src/main.rs`: entry point. Parses CLI, loads `DaemonConfig`, builds the runtime, calls `gui::run`.
 - `src/app.rs`: central state. `App`, `Tab` (6 tabs), `CommandLine`, `RpcExplorerState`, `DagVisualizer`, `DagSelection`, analytics state (`TimeWindow`, `ViewMode`), and `mark_dirty()`.
 - `src/cli.rs`: clap args (`--url`, `--network`, `--refresh-interval-ms`).
-- `src/controller.rs`: the `UiCommand` enum and the controller task. Owns the RPC manager, daemon handle, polling and log-tail handles. Handles the startup modes (direct `--url`, auto-start daemon, or idle), start/stop, command-line execution, and shutdown.
+- `src/controller.rs`: the `UiCommand` enum, `RemoteTarget`, and the controller task. Owns the RPC manager, daemon handle, polling and log-tail handles. Handles the startup modes (`--url`, auto-start daemon, or idle with the connection window open), connect/disconnect, daemon start/stop, command-line execution, and shutdown.
 - `src/daemon.rs`: embedded kaspad (`DaemonHandle`).
 - `src/daemon_lifecycle.rs`: RPC creation, mining polling, log tailing, start-daemon-and-connect helpers.
-- `src/config.rs`: `DaemonConfig`, persisted at `~/.tui4kas/config.toml`.
+- `src/config.rs`: `DaemonConfig` (`~/.tui4kas/config.toml`) and `ConnectionSettings`/`ConnectionKind`, the last connection choice (`~/.tui4kas/connection.toml`).
 - `src/analytics.rs` / `src/analytics_streaming.rs`: chain analytics aggregation and its streaming task (cache at `~/.tui4kas/analytics_cache.bin`).
 - `src/format.rs`: pure formatting helpers (`format_hashrate`, `format_usd`, `truncate_hash`, …).
 - `src/rpc/client.rs`: `RpcManager`. Connect, background polling, RPC execution, mining/analytics fetches, block lookup.
@@ -42,6 +44,7 @@ egui/eframe desktop GUI for monitoring a Kaspa L1 node via wRPC, with an optiona
 - `src/gui/analytics.rs`: Analytics tab (5 panels with a Table/Chart toggle and time window; `egui_plot` charts).
 - `src/gui/rpc_explorer.rs`: RPC Cmds tab (method list and read-only result viewer).
 - `src/gui/node.rs`: Node tab (settings form bound to a `DaemonConfig` copy, Start/Stop/Save, status, log viewer).
+- `src/gui/connection.rs`: `ConnectionWindow`, opened from the top-bar status button. Custom URL / public resolver / embedded node, network, Connect/Disconnect.
 - `src/gui/command.rs`: command palette (bottom panel: input, suggestions, output).
 - `src/gui/help.rs`: help window (shortcuts).
 - `src/gui/theme.rs`: color constants and status → label/color mapping.

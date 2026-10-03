@@ -1,7 +1,7 @@
 use eframe::egui::{self, RichText, Ui};
 
 use super::theme;
-use super::widgets::{card, kv, kv_grid, placeholder};
+use super::widgets::{card, direct_node_placeholder, kv, kv_grid, placeholder};
 use crate::app::App;
 use crate::format::{format_hashrate, format_usd};
 use crate::rpc::types::{format_number, sompi_to_kas};
@@ -152,11 +152,7 @@ fn mining_info(ui: &mut Ui, app: &App) {
         return;
     }
     let Some(ref mining) = app.node.mining_info else {
-        if app.has_direct_node {
-            placeholder(ui, "Collecting mining data…");
-        } else {
-            placeholder(ui, "Disabled when using Kaspa PNN via Resolver");
-        }
+        placeholder(ui, direct_node_placeholder(app, "Collecting mining data…"));
         return;
     };
     kv_grid(ui, "mining_info", |ui| {

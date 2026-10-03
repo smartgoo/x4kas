@@ -250,7 +250,28 @@ pub enum ConnectionStatus {
     Disconnected,
     Connecting,
     Connected,
-    Error(#[allow(dead_code)] String),
+    Error(String),
+}
+
+/// What the app is currently connected to (or trying to connect to).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum ActiveConnection {
+    #[default]
+    None,
+    Url(String),
+    Resolver,
+    Embedded,
+}
+
+impl ActiveConnection {
+    pub fn label(&self) -> &str {
+        match self {
+            ActiveConnection::None => "Not connected",
+            ActiveConnection::Url(url) => url,
+            ActiveConnection::Resolver => "Public resolver",
+            ActiveConnection::Embedded => "Embedded node",
+        }
+    }
 }
 
 pub struct RpcExplorerState {
@@ -458,6 +479,7 @@ pub struct App {
     /// Called by `mark_dirty()` so a frontend can wake up and redraw.
     pub repaint: Option<RepaintFn>,
     pub has_direct_node: bool,
+    pub connection: ActiveConnection,
 
     pub integrated_node: IntegratedNodeState,
 }
@@ -477,6 +499,7 @@ impl App {
             paused: false,
             repaint: None,
             has_direct_node: false,
+            connection: ActiveConnection::None,
             integrated_node: IntegratedNodeState::new(daemon_config),
         }
     }
@@ -486,6 +509,21 @@ impl App {
         if let Some(ref repaint) = self.repaint {
             repaint();
         }
+    }
+
+    /// Drop all data fetched from the current node, e.g. before switching nodes.
+    pub fn clear_node_data(&mut self) {
+        self.node = NodeState::default();
+        self.analytics.engine = None;
+        self.analytics.sync_progress = None;
+        self.analytics.cached_views = None;
+        self.analytics.reorg_notification = None;
+        self.mempool_selected = 0;
+        self.mempool_detail = None;
+        self.dag_selection.block_detail = None;
+        self.dag_selection.block_loading = false;
+        self.rpc_explorer.last_response = None;
+        self.rpc_explorer.is_loading = false;
     }
 
     pub fn is_daemon_active(&self) -> bool {
@@ -560,6 +598,40 @@ impl App {
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
+
+    // --- Connection ---
+
+    #[test]
+    fn clear_node_data_resets_fetched_state() {
+        let mut app = App::new(DaemonConfig::default());
+        app.node.node_url = Some("ws://node:17110".to_string());
+        app.node.last_error = Some("boom".to_string());
+        app.node.connection_status = ConnectionStatus::Connected;
+        app.mempool_selected = 3;
+        app.mempool_detail = Some("tx".to_string());
+        app.dag_selection.block_loading = true;
+        app.rpc_explorer.last_response = Some("resp".to_string());
+        app.paused = true;
+
+        app.clear_node_data();
+
+        assert_eq!(app.node.node_url, None);
+        assert_eq!(app.node.last_error, None);
+        assert!(matches!(app.node.connection_status, ConnectionStatus::Disconnected));
+        assert_eq!(app.mempool_selected, 0);
+        assert_eq!(app.mempool_detail, None);
+        assert!(!app.dag_selection.block_loading);
+        assert_eq!(app.rpc_explorer.last_response, None);
+        assert!(app.paused, "user settings survive a reconnect");
+    }
+
+    #[test]
+    fn active_connection_labels() {
+        assert_eq!(ActiveConnection::None.label(), "Not connected");
+        assert_eq!(ActiveConnection::Url("ws://x:1".into()).label(), "ws://x:1");
+        assert_eq!(ActiveConnection::Resolver.label(), "Public resolver");
+        assert_eq!(ActiveConnection::Embedded.label(), "Embedded node");
+    }
 
     // --- Tab ---
 

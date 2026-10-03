@@ -66,7 +66,7 @@ fn settings(ui: &mut Ui, state: &mut IntegratedNodeState, cmd_tx: &CommandSender
     }
 }
 
-fn start_daemon(state: &mut IntegratedNodeState, cmd_tx: &CommandSender) {
+pub(super) fn start_daemon(state: &mut IntegratedNodeState, cmd_tx: &CommandSender) {
     state.log_lines.clear();
     state.status_message = None;
     match cmd_tx.send(UiCommand::StartDaemon(Box::new(state.config.clone()))) {

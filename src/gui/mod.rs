@@ -18,6 +18,7 @@ use anyhow::Result;
 use eframe::egui::{self, Button, Event, Key, Modifiers, RichText, Stroke, ViewportCommand};
 use tokio::sync::{RwLock, oneshot};
 
+use crate::analytics_streaming;
 use crate::app::{ActiveConnection, AnalyticsPhase, App, ConnectionStatus, StartPoint, Tab};
 use crate::cli::CliArgs;
 use crate::config::{ConnectionKind, ConnectionSettings};
@@ -448,21 +449,43 @@ fn analytics_chip(ui: &mut egui::Ui, app: &App) {
             theme::WARN,
             "Catching up to the DAG tip",
         ),
-        AnalyticsPhase::Live => (
-            "● Analytics live".into(),
-            theme::OK,
-            "Up to date, checking every 2s",
-        ),
+        AnalyticsPhase::Live => ("● Analytics synced".into(), theme::OK, "Up to date"),
         AnalyticsPhase::Error(_) => (
             "× Analytics error".into(),
             theme::ERROR,
-            "Request failed, retrying every 5s",
+            "Request failed, retrying",
         ),
     };
 
     widgets::divider(ui);
     widgets::status_chip(ui, "analytics_status", &text, color, |ui| {
-        kv(ui, "Status", summary);
+        // Distance to the tip once known, otherwise what the task is doing.
+        match tip.and_then(|tip| status.behind(tip)) {
+            Some((daa, time)) => kv(
+                ui,
+                "Status",
+                format!(
+                    "{} DAA ({} seconds) behind DAG Tip",
+                    format_number(daa),
+                    format_number(time.as_secs())
+                ),
+            ),
+            None => kv(ui, "Status", summary),
+        }
+        let frequency = if app.paused {
+            Some("Paused".to_string())
+        } else {
+            analytics_streaming::poll_interval(&status.phase).map(|d| {
+                if d < Duration::from_secs(1) {
+                    format!("Every {} ms", d.as_millis())
+                } else {
+                    format!("Every {}", format_duration(d))
+                }
+            })
+        };
+        if let Some(frequency) = frequency {
+            kv(ui, "Poll frequency", frequency);
+        }
         if let AnalyticsPhase::Error(ref err) = status.phase {
             kv(ui, "Error", RichText::new(err).color(theme::ERROR));
         }
@@ -479,20 +502,6 @@ fn analytics_chip(ui: &mut egui::Ui, app: &App) {
             Some(StartPoint::PruningPoint) => kv(ui, "Started from", "pruning point"),
             None => {}
         }
-        if let (Some(current), Some(tip)) = (status.current_daa, tip) {
-            let pct = fraction
-                .map(|f| format!(" ({:.1}%)", f * 100.0))
-                .unwrap_or_default();
-            kv(
-                ui,
-                "Progress",
-                format!(
-                    "DAA {} / {}{pct}",
-                    format_number(current),
-                    format_number(tip)
-                ),
-            );
-        }
         if status.phase == AnalyticsPhase::CatchingUp {
             if let Some(rate) = status.daa_per_sec {
                 kv(ui, "Speed", format!("{} DAA/s", format_number(rate as u64)));
@@ -502,20 +511,27 @@ fn analytics_chip(ui: &mut egui::Ui, app: &App) {
             }
         }
         kv(ui, "Chain blocks", format_number(status.blocks_processed));
-        if let Some(at) = status.last_batch_at {
-            kv(
-                ui,
-                "Last batch",
-                format!("{} ago", format_duration(at.elapsed())),
-            );
-        }
     });
 }
 
-/// Status bar text, e.g. "Connected to ws://127.0.0.1:17110".
+/// Hover text for the connection button: the node URL, then what a click does.
+fn connection_tooltip(app: &App) -> String {
+    // The resolver's node URL is only known once connected.
+    let url = app.node.node_url.as_deref().or(match app.connection {
+        ActiveConnection::Url(ref url) => Some(url.as_str()),
+        _ => None,
+    });
+    match url {
+        Some(url) => format!("{url}\nClick to change connection"),
+        None => "Click to change connection".to_string(),
+    }
+}
+
+/// Status bar text, e.g. "Connected to node".
 fn connection_summary(app: &App) -> String {
+    // The URL is in the hover text, so the label stays short.
     let target = match app.connection {
-        ActiveConnection::Url(ref url) => url.as_str(),
+        ActiveConnection::Url(_) => "node",
         ActiveConnection::Resolver => "public resolver",
         ActiveConnection::None => return "Not connected".to_string(),
     };
@@ -536,7 +552,7 @@ fn status_bar(ui: &mut egui::Ui, app: &mut App, connection: &mut ConnectionWindo
                 connection.open,
                 RichText::new(format!("● {}", connection_summary(app))).color(color),
             )
-            .on_hover_text("Change connection")
+            .on_hover_text(connection_tooltip(app))
             .clicked()
         {
             connection.toggle();

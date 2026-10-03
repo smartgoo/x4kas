@@ -17,8 +17,25 @@ pub fn cache_path() -> PathBuf {
     config::data_dir().join("analytics_cache.bin")
 }
 
+/// Delay between requests while catching up to the tip.
+const CATCH_UP_INTERVAL: Duration = Duration::from_millis(100);
+/// Delay between requests once at the tip.
+const LIVE_INTERVAL: Duration = Duration::from_secs(2);
 /// How long to wait before retrying a failed request.
 const RETRY_DELAY: Duration = Duration::from_secs(5);
+/// How often to check whether the node is ready.
+const NODE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How often the task polls in `phase`, for display.
+pub fn poll_interval(phase: &AnalyticsPhase) -> Option<Duration> {
+    match phase {
+        AnalyticsPhase::WaitingForNode => Some(NODE_CHECK_INTERVAL),
+        AnalyticsPhase::CatchingUp => Some(CATCH_UP_INTERVAL),
+        AnalyticsPhase::Live => Some(LIVE_INTERVAL),
+        AnalyticsPhase::Error(_) => Some(RETRY_DELAY),
+        AnalyticsPhase::Idle | AnalyticsPhase::LoadingCache => None,
+    }
+}
 
 /// Start the analytics VSPC V2 streaming task.
 pub fn start_analytics_streaming(
@@ -148,12 +165,13 @@ async fn run(rpc: Arc<RpcManager>, app: Arc<RwLock<App>>) {
             app.mark_dirty();
         }
 
-        if synced {
-            tokio::time::sleep(Duration::from_secs(2)).await;
+        // Poll fast while catching up, but yield to the UI.
+        tokio::time::sleep(if synced {
+            LIVE_INTERVAL
         } else {
-            // During initial sync, poll fast but yield to UI
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+            CATCH_UP_INTERVAL
+        })
+        .await;
     }
 }
 
@@ -181,6 +199,6 @@ async fn wait_for_node(app: &RwLock<App>) {
                 app.mark_dirty();
             }
         }
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(NODE_CHECK_INTERVAL).await;
     }
 }

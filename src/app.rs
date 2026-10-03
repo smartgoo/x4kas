@@ -529,6 +529,10 @@ pub struct PanelState {
     pub mode: ViewMode,
 }
 
+/// DAA score growth per second: 10 blocks per second since Crescendo, on mainnet and
+/// testnet-10.
+pub const DAA_SCORE_PER_SEC: f64 = 10.0;
+
 /// What the analytics streaming task is doing.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum AnalyticsPhase {
@@ -578,6 +582,13 @@ impl AnalyticsStatus {
             return Some(1.0);
         }
         Some((current.saturating_sub(start) as f32 / (tip_daa - start) as f32).min(1.0))
+    }
+
+    /// How far the processed chain lags `tip_daa`: the DAA score difference and the
+    /// time it spans on the network.
+    pub fn behind(&self, tip_daa: u64) -> Option<(u64, Duration)> {
+        let daa = tip_daa.saturating_sub(self.current_daa?);
+        Some((daa, Duration::from_secs_f64(daa as f64 / DAA_SCORE_PER_SEC)))
     }
 
     /// Estimated time left to reach `tip_daa` at the current speed.
@@ -844,6 +855,15 @@ mod tests {
         // The tip can't be behind the processed blocks.
         assert_eq!(s.fraction(1_200), Some(1.0));
         assert_eq!(s.fraction(900), Some(1.0));
+    }
+
+    #[test]
+    fn analytics_status_behind_tip() {
+        let mut s = AnalyticsStatus::default();
+        assert_eq!(s.behind(2_000), None);
+        s.record_batch(1, 1_000, Instant::now());
+        assert_eq!(s.behind(1_600), Some((600, Duration::from_secs(60))));
+        assert_eq!(s.behind(900), Some((0, Duration::ZERO)));
     }
 
     #[test]

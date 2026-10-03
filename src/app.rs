@@ -54,11 +54,9 @@ impl DagVisualizer {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct DagSample {
     pub timestamp: Instant,
     pub blue_score: u64,
-    pub daa_score: u64,
     pub block_count: u64,
     pub header_count: u64,
     pub tip_count: usize,
@@ -77,7 +75,6 @@ impl DagStats {
         self.samples.push_back(DagSample {
             timestamp: Instant::now(),
             blue_score: blue_score.unwrap_or(0),
-            daa_score: dag_info.virtual_daa_score,
             block_count: dag_info.block_count,
             header_count: dag_info.header_count,
             tip_count: dag_info.tip_hashes.len(),

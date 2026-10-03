@@ -14,7 +14,7 @@ struct CoinGeckoResponse {
     kaspa: Option<KaspaPrice>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct KaspaPrice {
     usd: Option<f64>,
     btc: Option<f64>,
@@ -47,13 +47,7 @@ pub fn start_market_polling(app_state: Arc<RwLock<App>>, interval: Duration) {
 
 async fn fetch_market_data(client: &reqwest::Client) -> Result<MarketData, reqwest::Error> {
     let resp: CoinGeckoResponse = client.get(COINGECKO_URL).send().await?.json().await?;
-    let kaspa = resp.kaspa.unwrap_or(KaspaPrice {
-        usd: None,
-        btc: None,
-        usd_market_cap: None,
-        usd_24h_vol: None,
-        usd_24h_change: None,
-    });
+    let kaspa = resp.kaspa.unwrap_or_default();
     Ok(MarketData {
         price_usd: kaspa.usd.unwrap_or(0.0),
         price_btc: kaspa.btc.unwrap_or(0.0),

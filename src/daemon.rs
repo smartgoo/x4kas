@@ -98,12 +98,12 @@ fn build_kaspad_args(config: &DaemonConfig) -> KaspadArgs {
         simnet,
         // Enable wRPC Borsh server on default port
         rpclisten_borsh: Some(WrpcNetAddress::Default),
-        // Disable gRPC and JSON wRPC (not needed for TUI)
+        // Disable gRPC and JSON wRPC (the app only uses Borsh wRPC)
         disable_grpc: true,
         rpclisten_json: None,
-        // Non-interactive mode: auto-approve DB resets (stdin is captured by TUI raw mode)
+        // Non-interactive mode: auto-approve DB resets (there is no stdin prompt in the GUI)
         yes: true,
-        // Enable log files for log tailing in the TUI
+        // Enable log files for the Node tab log viewer
         no_log_files: false,
         log_level: config.log_level.clone(),
         async_threads: config.async_threads,
@@ -133,7 +133,7 @@ fn build_kaspad_args(config: &DaemonConfig) -> KaspadArgs {
     }
 }
 
-/// Initialize log4rs with file-only appenders (no stdout, which would corrupt the TUI).
+/// Initialize log4rs with file-only appenders (the Node tab tails these files).
 /// Uses the same log file format and rolling policy as kaspad's built-in logger.
 fn init_file_logger(log_dir_path: &std::path::Path, log_level: &str) {
     std::fs::create_dir_all(log_dir_path).ok();
@@ -254,13 +254,13 @@ pub fn start_daemon(config: &DaemonConfig) -> Result<DaemonHandle> {
         - args.outbound_target as i32;
 
     // Initialize file-only logger before creating the core.
-    // We skip kaspad's built-in logger (which writes to stdout and would corrupt the TUI)
+    // We skip kaspad's built-in logger (which also writes to stdout)
     // and instead set up log4rs with only file appenders.
     let log_dir_path = log_dir(config);
     init_file_logger(&log_dir_path, &config.log_level);
 
     // Create runtime manually to avoid kaspad's logger/panic hook initialization
-    // which would conflict with TUI's terminal management
+    // which would interfere with the host app
     let runtime = Runtime::default();
 
     let (core, rpc_core_service) = create_core_with_runtime(&runtime, &args, fd_total_budget);

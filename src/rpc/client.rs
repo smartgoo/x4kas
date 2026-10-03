@@ -499,7 +499,6 @@ impl Drop for RpcManager {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::rpc::types::RPC_METHODS;
     use std::collections::HashSet;
 

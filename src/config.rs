@@ -76,7 +76,7 @@ impl Default for DaemonConfig {
             ram_scale: 1.0,
             app_dir: default_app_dir(),
             log_level: "WARN".to_string(),
-            async_threads: num_cpus::get(),
+            async_threads: std::thread::available_parallelism().map_or(1, |n| n.get()),
             auto_start_daemon: false,
 
             listen: None,
@@ -100,7 +100,6 @@ impl Default for DaemonConfig {
     }
 }
 
-#[allow(dead_code)]
 impl DaemonConfig {
     pub fn config_path() -> PathBuf {
         dirs::home_dir()

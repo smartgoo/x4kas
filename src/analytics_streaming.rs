@@ -1,11 +1,18 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::RwLock;
 
 use crate::app::App;
+use crate::config::DaemonConfig;
 use crate::daemon_lifecycle::PollingHandles;
 use crate::rpc::client::RpcManager;
+
+/// Where the analytics engine is persisted (`~/.tui4kas/analytics_cache.bin`).
+pub fn cache_path() -> PathBuf {
+    DaemonConfig::config_path().with_file_name("analytics_cache.bin")
+}
 
 /// Start the analytics VSPC V2 streaming task.
 pub fn start_analytics_streaming(
@@ -20,13 +27,9 @@ pub fn start_analytics_streaming(
         use crate::analytics::AnalyticsEngine;
         use std::str::FromStr;
 
-        let cache_path = dirs::home_dir()
-            .unwrap_or_default()
-            .join(".tui4kas")
-            .join("analytics_cache.bin");
-
         // Try to load persisted state
-        let engine = AnalyticsEngine::load(&cache_path).unwrap_or_else(|_| AnalyticsEngine::new());
+        let engine =
+            AnalyticsEngine::load(&cache_path()).unwrap_or_else(|_| AnalyticsEngine::new());
 
         // Wrap engine in Arc<RwLock> for shared access with UI
         let engine = Arc::new(tokio::sync::RwLock::new(engine));

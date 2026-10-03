@@ -4,7 +4,6 @@ use kaspa_rpc_core::{
 };
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct ServerInfo {
     pub server_version: String,
     pub network_id: String,
@@ -431,7 +430,7 @@ mod tests {
     #[test]
     fn shorten_address_long() {
         let addr = "kaspa:abcdefghijklmnopqrstuvwxyz0123456789";
-        let result = shorten_address(&addr, 10, 6);
+        let result = shorten_address(addr, 10, 6);
         assert!(result.contains("..."));
         assert!(result.starts_with("kaspa:abcd"));
         assert!(result.ends_with("456789"));

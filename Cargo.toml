@@ -9,7 +9,6 @@ clap = { version = "4", features = ["derive"] }
 kaspa-rpc-core = { git = "https://github.com/kaspanet/rusty-kaspa.git", rev = "10116df" }
 kaspa-wrpc-client = { git = "https://github.com/kaspanet/rusty-kaspa.git", rev = "10116df" }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 reqwest = { version = "0.12", features = ["json"] }
 tokio = { version = "1", features = ["full"] }
 toml = "0.8"
@@ -17,12 +16,10 @@ dirs = "5"
 bincode = "1"
 futures = "0.3"
 indexmap = { version = "2", features = ["serde"] }
-num_cpus = "1"
 
 # Integrated node dependencies
 kaspad-lib = { git = "https://github.com/kaspanet/rusty-kaspa.git", rev = "10116df", package = "kaspad" }
 kaspa-core = { git = "https://github.com/kaspanet/rusty-kaspa.git", rev = "10116df" }
-kaspa-consensus-core = { git = "https://github.com/kaspanet/rusty-kaspa.git", rev = "10116df" }
 kaspa-rpc-service = { git = "https://github.com/kaspanet/rusty-kaspa.git", rev = "10116df" }
 kaspa-utils = { git = "https://github.com/kaspanet/rusty-kaspa.git", rev = "10116df" }
 kaspa-wrpc-server = { git = "https://github.com/kaspanet/rusty-kaspa.git", rev = "10116df" }
@@ -31,6 +28,9 @@ log4rs = { version = "1.2", features = ["all_components", "gzip", "background_ro
 eframe = "0.33"
 egui_extras = "0.33"
 egui_plot = "0.34"
+
+[dev-dependencies]
+serde_json = "1"
 
 # Patch workflow-perf-monitor for macOS 15+ compatibility (opaque malloc_zone_t)
 [patch.crates-io]

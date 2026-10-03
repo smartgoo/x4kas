@@ -92,14 +92,14 @@ impl Controller {
                 UiCommand::LookupBlock(hash) => self.lookup_block(hash),
                 UiCommand::RunCommandLine(cmd) => self.run_command_line(cmd),
                 UiCommand::Shutdown(done) => {
-                    self.shutdown().await;
+                    self.stop_all().await;
                     let _ = done.send(());
                     return;
                 }
             }
         }
         // Frontend dropped the channel without an explicit shutdown.
-        self.shutdown().await;
+        self.stop_all().await;
     }
 
     /// Startup modes:
@@ -257,10 +257,6 @@ impl Controller {
         }
     }
 
-    async fn shutdown(&mut self) {
-        self.stop_all().await;
-    }
-
     fn execute_rpc(&self, method: String) {
         let rpc = self.rpc.clone();
         let app = self.app.clone();
@@ -339,10 +335,6 @@ fn save_analytics_cache(app: &App) {
     if let Some(ref engine) = app.analytics.engine
         && let Ok(eng) = engine.try_read()
     {
-        let cache_path = dirs::home_dir()
-            .unwrap_or_default()
-            .join(".tui4kas")
-            .join("analytics_cache.bin");
-        let _ = eng.save(&cache_path);
+        let _ = eng.save(&analytics_streaming::cache_path());
     }
 }

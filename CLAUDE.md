@@ -4,7 +4,8 @@
 
 ```bash
 cargo build              # compile
-cargo clippy -- -D warnings  # lint (treat warnings as errors)
+cargo fmt                # format (CI runs `cargo fmt --all -- --check`)
+cargo clippy --all-targets -- -D warnings  # lint incl. tests (treat warnings as errors)
 cargo test               # run test suite (100+ tests)
 cargo run -- --url ws://127.0.0.1:17110   # run against a node
 ```
@@ -59,7 +60,7 @@ egui/eframe desktop GUI for monitoring a Kaspa L1 node via wRPC, with an optiona
 
 ## Conventions
 
-- Run `cargo clippy -- -D warnings` and `cargo test` after changes. Tests cover app state, config, types, formatting and analytics. GUI code is not unit-tested.
+- Run `cargo fmt`, `cargo clippy --all-targets -- -D warnings` and `cargo test` after changes. Tests cover app state, config, types, formatting and analytics. GUI code is not unit-tested.
 - Keep async and RPC work out of `gui/`. Add a `UiCommand` and handle it in the controller instead.
 - Background code that mutates `App` must call `app.mark_dirty()` so the GUI repaints.
 - GUI-only view state (popups open, help visible) lives in `GuiApp` or egui memory, not `App`, unless tests need it.

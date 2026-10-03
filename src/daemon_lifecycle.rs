@@ -52,7 +52,11 @@ pub fn start_mining_polling(
         loop {
             ticker.tick().await;
             let app_guard = app_for_mining.read().await;
-            let is_synced = app_guard.node.server_info.as_ref().is_some_and(|s| s.is_synced);
+            let is_synced = app_guard
+                .node
+                .server_info
+                .as_ref()
+                .is_some_and(|s| s.is_synced);
             let is_paused = app_guard.paused;
             drop(app_guard);
             if !is_paused
@@ -105,7 +109,10 @@ pub async fn create_and_start_rpc(
     Ok(rpc)
 }
 
-pub fn start_log_tailing(config: &DaemonConfig, app: Arc<RwLock<App>>) -> tokio::task::JoinHandle<()> {
+pub fn start_log_tailing(
+    config: &DaemonConfig,
+    app: Arc<RwLock<App>>,
+) -> tokio::task::JoinHandle<()> {
     let log_dir = daemon::log_dir(config);
     tokio::spawn(async move {
         // Brief wait for log file to be created
@@ -161,7 +168,10 @@ pub fn start_log_tailing(config: &DaemonConfig, app: Arc<RwLock<App>>) -> tokio:
                 let mut app_guard = app.write().await;
                 for line in buf.lines() {
                     if !line.trim().is_empty() {
-                        app_guard.integrated_node.log_lines.push_back(line.to_string());
+                        app_guard
+                            .integrated_node
+                            .log_lines
+                            .push_back(line.to_string());
                     }
                 }
                 // Cap at 1000 lines (O(1) per pop with VecDeque)
@@ -181,7 +191,11 @@ pub async fn start_daemon_and_connect(
     app: &Arc<RwLock<App>>,
     refresh_interval_ms: u64,
     polling_handles: &mut PollingHandles,
-) -> Result<(daemon::DaemonHandle, Arc<RpcManager>, tokio::task::JoinHandle<()>)> {
+) -> Result<(
+    daemon::DaemonHandle,
+    Arc<RpcManager>,
+    tokio::task::JoinHandle<()>,
+)> {
     let handle = daemon::start_daemon(config)?;
 
     // Wait for wRPC server readiness

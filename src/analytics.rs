@@ -441,7 +441,8 @@ fn build_aggregated_view<'a>(items: impl Iterator<Item = AggregateItem<'a>>) -> 
             0.0
         };
         view.fee_over_time.push((item.timestamp_ms, avg));
-        view.tx_over_time.push((item.timestamp_ms, item.tx_count as f64));
+        view.tx_over_time
+            .push((item.timestamp_ms, item.tx_count as f64));
     }
 
     view.avg_fee = if view.fee_count > 0 {
@@ -718,9 +719,21 @@ mod tests {
     #[test]
     fn protocol_counts_in_view() {
         let mut engine = AnalyticsEngine::new();
-        engine.add_block(make_block_with_protocol("b1", 1000, TransactionProtocol::Krc));
-        engine.add_block(make_block_with_protocol("b2", 2000, TransactionProtocol::Krc));
-        engine.add_block(make_block_with_protocol("b3", 3000, TransactionProtocol::Kns));
+        engine.add_block(make_block_with_protocol(
+            "b1",
+            1000,
+            TransactionProtocol::Krc,
+        ));
+        engine.add_block(make_block_with_protocol(
+            "b2",
+            2000,
+            TransactionProtocol::Krc,
+        ));
+        engine.add_block(make_block_with_protocol(
+            "b3",
+            3000,
+            TransactionProtocol::Kns,
+        ));
 
         let view = engine.get_view(TimeWindow::OneMin);
         assert_eq!(view.protocol_counts.len(), 2);
@@ -741,7 +754,11 @@ mod tests {
     fn persistence_round_trip() {
         let mut engine = AnalyticsEngine::new();
         engine.add_block(make_block("b1", 1000, 5, 100));
-        engine.add_block(make_block_with_protocol("b2", 2000, TransactionProtocol::Krc));
+        engine.add_block(make_block_with_protocol(
+            "b2",
+            2000,
+            TransactionProtocol::Krc,
+        ));
 
         let dir = std::env::temp_dir().join("tui4kas_test_analytics");
         let path = dir.join("test_cache.bin");
@@ -751,10 +768,7 @@ mod tests {
         assert_eq!(loaded.total_blocks_processed, 2);
         assert_eq!(loaded.total_transactions, 6);
         assert_eq!(loaded.recent_blocks.len(), 2);
-        assert_eq!(
-            loaded.last_known_chain_block,
-            Some("b2".to_string())
-        );
+        assert_eq!(loaded.last_known_chain_block, Some("b2".to_string()));
 
         // Cleanup
         let _ = std::fs::remove_dir_all(dir);
@@ -762,9 +776,7 @@ mod tests {
 
     #[test]
     fn cap_hashmap_limits_entries() {
-        let mut map: HashMap<String, usize> = (0..200)
-            .map(|i| (format!("addr{}", i), i))
-            .collect();
+        let mut map: HashMap<String, usize> = (0..200).map(|i| (format!("addr{}", i), i)).collect();
         cap_hashmap(&mut map, 10);
         assert_eq!(map.len(), 10);
         // Top entries should be the highest counts

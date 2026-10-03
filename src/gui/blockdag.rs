@@ -90,7 +90,10 @@ fn visualizer(ui: &mut Ui, vis: &DagVisualizer) -> Option<String> {
                 .enumerate()
                 .map(|(ri, b)| {
                     let center = Pos2::new(x, y0 + ri as f32 * ROW_HEIGHT);
-                    (Rect::from_center_size(center, vec2(BLOCK_SIZE, BLOCK_SIZE)), b)
+                    (
+                        Rect::from_center_size(center, vec2(BLOCK_SIZE, BLOCK_SIZE)),
+                        b,
+                    )
                 })
                 .collect()
         })
@@ -152,7 +155,11 @@ fn metrics(ui: &mut Ui, app: &App) {
         hash_kv(ui, "Pruning Point", &dag.pruning_point_hash);
         hash_kv(ui, "Sink", &dag.sink);
         kv(ui, "Tips Count", dag.tip_hashes.len().to_string());
-        kv(ui, "Virtual Parents", dag.virtual_parent_hashes.len().to_string());
+        kv(
+            ui,
+            "Virtual Parents",
+            dag.virtual_parent_hashes.len().to_string(),
+        );
     });
 }
 
@@ -174,7 +181,10 @@ fn ghostdag(ui: &mut Ui, app: &App) {
         kv(
             ui,
             "Blue Score",
-            stats.sink_blue_score.map(format_number).unwrap_or_else(dash),
+            stats
+                .sink_blue_score
+                .map(format_number)
+                .unwrap_or_else(dash),
         );
         kv(
             ui,

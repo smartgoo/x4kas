@@ -9,7 +9,9 @@ use crate::daemon::DaemonHandle;
 
 pub fn show(ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
     match app.integrated_node.status {
-        DaemonStatus::Stopped | DaemonStatus::Error(_) => settings(ui, &mut app.integrated_node, cmd_tx),
+        DaemonStatus::Stopped | DaemonStatus::Error(_) => {
+            settings(ui, &mut app.integrated_node, cmd_tx)
+        }
         _ => running(ui, app, cmd_tx),
     }
 }
@@ -41,7 +43,11 @@ fn settings(ui: &mut Ui, state: &mut IntegratedNodeState, cmd_tx: &CommandSender
                 Err(e) => state.status_message = Some((format!("Load failed: {e}"), true)),
             }
         }
-        ui.label(RichText::new("Changes are saved automatically.").weak().small());
+        ui.label(
+            RichText::new("Changes are saved automatically.")
+                .weak()
+                .small(),
+        );
     });
 
     if let DaemonStatus::Error(ref msg) = state.status {
@@ -82,13 +88,28 @@ fn config_form(ui: &mut Ui, cfg: &mut DaemonConfig) -> bool {
     let mut changed = false;
 
     section(ui, "General", |ui| {
-        changed |= combo(ui, "Network", &mut cfg.network, DaemonConfig::valid_networks());
+        changed |= combo(
+            ui,
+            "Network",
+            &mut cfg.network,
+            DaemonConfig::valid_networks(),
+        );
         changed |= check(ui, "UTXO Index", &mut cfg.utxo_index);
         changed |= check(ui, "Archival", &mut cfg.archival);
         changed |= field(ui, "RAM Scale", |ui| {
-            ui.add(DragValue::new(&mut cfg.ram_scale).range(0.1..=10.0).speed(0.1).fixed_decimals(1))
+            ui.add(
+                DragValue::new(&mut cfg.ram_scale)
+                    .range(0.1..=10.0)
+                    .speed(0.1)
+                    .fixed_decimals(1),
+            )
         });
-        changed |= combo(ui, "Log Level", &mut cfg.log_level, DaemonConfig::valid_log_levels());
+        changed |= combo(
+            ui,
+            "Log Level",
+            &mut cfg.log_level,
+            DaemonConfig::valid_log_levels(),
+        );
         changed |= field(ui, "Async Threads", |ui| {
             ui.add(DragValue::new(&mut cfg.async_threads).range(1..=256))
         });
@@ -104,7 +125,12 @@ fn config_form(ui: &mut Ui, cfg: &mut DaemonConfig) -> bool {
         changed |= field(ui, "Max Inbound", |ui| {
             ui.add(DragValue::new(&mut cfg.inbound_limit).range(0..=4096))
         });
-        changed |= text(ui, "Connect Peers", &mut cfg.connect_peers, "host:port, host:port");
+        changed |= text(
+            ui,
+            "Connect Peers",
+            &mut cfg.connect_peers,
+            "host:port, host:port",
+        );
         changed |= text(ui, "Add Peers", &mut cfg.add_peers, "host:port, host:port");
         changed |= check(ui, "Disable UPnP", &mut cfg.disable_upnp);
         changed |= check(ui, "Disable DNS Seed", &mut cfg.disable_dns_seed);
@@ -119,7 +145,9 @@ fn config_form(ui: &mut Ui, cfg: &mut DaemonConfig) -> bool {
             DaemonConfig::valid_rocksdb_presets(),
         );
         changed |= opt_text(ui, "RocksDB WAL Dir", &mut cfg.rocksdb_wal_dir, "default");
-        changed |= field(ui, "RocksDB Cache MB", |ui| opt_number(ui, &mut cfg.rocksdb_cache_size, 1.0));
+        changed |= field(ui, "RocksDB Cache MB", |ui| {
+            opt_number(ui, &mut cfg.rocksdb_cache_size, 1.0)
+        });
         changed |= field(ui, "Retention Days", |ui| {
             opt_number(ui, &mut cfg.retention_period_days, 0.1)
         });
@@ -181,7 +209,11 @@ fn combo(ui: &mut Ui, label: &str, value: &mut String, options: &[&str]) -> bool
 
 fn text(ui: &mut Ui, label: &str, value: &mut String, hint: &str) -> bool {
     field(ui, label, |ui| {
-        ui.add(TextEdit::singleline(value).hint_text(hint).desired_width(360.0))
+        ui.add(
+            TextEdit::singleline(value)
+                .hint_text(hint)
+                .desired_width(360.0),
+        )
     })
 }
 
@@ -258,7 +290,11 @@ fn status_rows(ui: &mut Ui, app: &App) {
     });
     ui.end_row();
     kv(ui, "Network", &state.config.network);
-    kv(ui, "wRPC", DaemonHandle::wrpc_borsh_url(&state.config.network));
+    kv(
+        ui,
+        "wRPC",
+        DaemonHandle::wrpc_borsh_url(&state.config.network),
+    );
     kv(ui, "Uptime", uptime(state));
 }
 

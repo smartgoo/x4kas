@@ -178,7 +178,9 @@ impl Tab {
 
     /// Title without the numeric shortcut prefix.
     pub fn label(&self) -> &'static str {
-        self.title().split_once(':').map_or(self.title(), |(_, name)| name)
+        self.title()
+            .split_once(':')
+            .map_or(self.title(), |(_, name)| name)
     }
 }
 
@@ -531,12 +533,7 @@ impl App {
     }
 
     pub fn is_node_syncing(&self) -> bool {
-        self.is_daemon_active()
-            && !self
-                .node
-                .server_info
-                .as_ref()
-                .is_some_and(|s| s.is_synced)
+        self.is_daemon_active() && !self.node.server_info.as_ref().is_some_and(|s| s.is_synced)
     }
 
     /// Open the detail popup for the mempool entry at `index`, if it exists.
@@ -617,7 +614,10 @@ mod tests {
 
         assert_eq!(app.node.node_url, None);
         assert_eq!(app.node.last_error, None);
-        assert!(matches!(app.node.connection_status, ConnectionStatus::Disconnected));
+        assert!(matches!(
+            app.node.connection_status,
+            ConnectionStatus::Disconnected
+        ));
         assert_eq!(app.mempool_selected, 0);
         assert_eq!(app.mempool_detail, None);
         assert!(!app.dag_selection.block_loading);
@@ -766,7 +766,10 @@ mod tests {
         let mut cl = CommandLine::default();
         cl.input = "get_server_info".to_string();
         cl.submit();
-        assert_eq!(cl.history, VecDeque::from(vec!["get_server_info".to_string()]));
+        assert_eq!(
+            cl.history,
+            VecDeque::from(vec!["get_server_info".to_string()])
+        );
     }
 
     #[test]
@@ -821,7 +824,10 @@ mod tests {
     #[test]
     fn suggestions_filter_by_prefix() {
         let mut cl = CommandLine::default();
-        assert_eq!(cl.suggestions().len(), CommandLine::available_commands().len());
+        assert_eq!(
+            cl.suggestions().len(),
+            CommandLine::available_commands().len()
+        );
         cl.input = "cl".to_string();
         assert_eq!(cl.suggestions(), vec![("clear", "Clear command output")]);
         cl.input = "get_".to_string();

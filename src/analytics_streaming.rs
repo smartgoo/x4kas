@@ -26,8 +26,7 @@ pub fn start_analytics_streaming(
             .join("analytics_cache.bin");
 
         // Try to load persisted state
-        let engine =
-            AnalyticsEngine::load(&cache_path).unwrap_or_else(|_| AnalyticsEngine::new());
+        let engine = AnalyticsEngine::load(&cache_path).unwrap_or_else(|_| AnalyticsEngine::new());
 
         // Wrap engine in Arc<RwLock> for shared access with UI
         let engine = Arc::new(tokio::sync::RwLock::new(engine));
@@ -83,7 +82,12 @@ pub fn start_analytics_streaming(
                     continue;
                 }
                 // Only run when node is synced
-                if !app_guard.node.server_info.as_ref().is_some_and(|s| s.is_synced) {
+                if !app_guard
+                    .node
+                    .server_info
+                    .as_ref()
+                    .is_some_and(|s| s.is_synced)
+                {
                     drop(app_guard);
                     tokio::time::sleep(Duration::from_secs(2)).await;
                     continue;
@@ -92,8 +96,7 @@ pub fn start_analytics_streaming(
 
             match rpc.fetch_vspc_v2(current_hash).await {
                 Ok(response) => {
-                    let (summaries, removed) =
-                        RpcManager::extract_block_summaries(&response);
+                    let (summaries, removed) = RpcManager::extract_block_summaries(&response);
 
                     let block_count = summaries.len();
 

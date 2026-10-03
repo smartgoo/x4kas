@@ -23,8 +23,8 @@ use crate::app::{App, DaemonStatus, Tab};
 use crate::cli::CliArgs;
 use crate::config::{ConnectionKind, ConnectionSettings, DaemonConfig};
 use crate::controller::{self, CommandSender, ControllerArgs, RemoteTarget, UiCommand};
-use connection::ConnectionWindow;
 use crate::rpc::market;
+use connection::ConnectionWindow;
 
 /// Start background tasks on `rt` and run the GUI on the current (main) thread.
 pub fn run(rt: &tokio::runtime::Runtime, args: CliArgs, daemon_config: DaemonConfig) -> Result<()> {
@@ -146,8 +146,9 @@ impl eframe::App for GuiApp {
 
         handle_shortcuts(ctx, &mut app, &mut self.show_help);
 
-        egui::TopBottomPanel::top("top_bar")
-            .show(ctx, |ui| top_bar(ui, &mut app, &mut self.show_help, &mut self.connection));
+        egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
+            top_bar(ui, &mut app, &mut self.show_help, &mut self.connection)
+        });
         command::show(ctx, &mut app.command_line, &self.cmd_tx);
 
         egui::CentralPanel::default().show(ctx, |ui| match app.active_tab {
@@ -182,7 +183,14 @@ impl eframe::App for GuiApp {
 }
 
 fn handle_shortcuts(ctx: &egui::Context, app: &mut App, show_help: &mut bool) {
-    const TAB_KEYS: [Key; 6] = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6];
+    const TAB_KEYS: [Key; 6] = [
+        Key::Num1,
+        Key::Num2,
+        Key::Num3,
+        Key::Num4,
+        Key::Num5,
+        Key::Num6,
+    ];
 
     // Works even while the palette input has focus.
     if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::K)) {
@@ -240,10 +248,20 @@ fn toggle_palette(app: &mut App) {
     }
 }
 
-fn top_bar(ui: &mut egui::Ui, app: &mut App, show_help: &mut bool, connection: &mut ConnectionWindow) {
+fn top_bar(
+    ui: &mut egui::Ui,
+    app: &mut App,
+    show_help: &mut bool,
+    connection: &mut ConnectionWindow,
+) {
     ui.add_space(4.0);
     ui.horizontal(|ui| {
-        ui.label(RichText::new("tui4kas").strong().color(theme::ACCENT).size(16.0));
+        ui.label(
+            RichText::new("tui4kas")
+                .strong()
+                .color(theme::ACCENT)
+                .size(16.0),
+        );
         ui.separator();
 
         for (i, tab) in Tab::all().iter().enumerate() {
@@ -268,8 +286,16 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App, show_help: &mut bool, connection: &
             {
                 toggle_palette(app);
             }
-            let pause_label = if app.paused { "▶ Resume" } else { "⏸ Pause" };
-            if ui.button(pause_label).on_hover_text("Shortcut: P").clicked() {
+            let pause_label = if app.paused {
+                "▶ Resume"
+            } else {
+                "⏸ Pause"
+            };
+            if ui
+                .button(pause_label)
+                .on_hover_text("Shortcut: P")
+                .clicked()
+            {
                 app.paused = !app.paused;
             }
 

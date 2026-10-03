@@ -78,7 +78,11 @@ fn banners(ui: &mut Ui, app: &mut App) {
     let mut dismiss = false;
     if let Some(ref msg) = app.analytics.reorg_notification {
         ui.horizontal(|ui| {
-            ui.label(RichText::new(format!("⚠ {msg}")).strong().color(theme::WARN));
+            ui.label(
+                RichText::new(format!("⚠ {msg}"))
+                    .strong()
+                    .color(theme::WARN),
+            );
             dismiss = ui.small_button("Dismiss").clicked();
         });
         ui.add_space(4.0);
@@ -92,7 +96,11 @@ fn panel(ui: &mut Ui, app: &mut App, i: usize) {
     card(ui, PANELS[i], |ui| {
         ui.horizontal(|ui| {
             let mut window = app.analytics.time_windows[i];
-            for w in [TimeWindow::OneMin, TimeWindow::OneHour, TimeWindow::TwentyFourHour] {
+            for w in [
+                TimeWindow::OneMin,
+                TimeWindow::OneHour,
+                TimeWindow::TwentyFourHour,
+            ] {
                 ui.selectable_value(&mut window, w, w.label());
             }
             if window != app.analytics.time_windows[i] {
@@ -114,9 +122,13 @@ fn panel(ui: &mut Ui, app: &mut App, i: usize) {
         let id = format!("analytics_{i}");
         match (i, app.analytics.view_modes[i]) {
             (0, ViewMode::Table) => fee_table(ui, &id, view),
-            (0, ViewMode::Chart) => time_chart(ui, &id, "Avg fee", &view.fee_over_time, theme::ACCENT),
+            (0, ViewMode::Chart) => {
+                time_chart(ui, &id, "Avg fee", &view.fee_over_time, theme::ACCENT)
+            }
             (1, ViewMode::Table) => tx_table(ui, &id, view),
-            (1, ViewMode::Chart) => time_chart(ui, &id, "Transactions", &view.tx_over_time, theme::OK),
+            (1, ViewMode::Chart) => {
+                time_chart(ui, &id, "Transactions", &view.tx_over_time, theme::OK)
+            }
             (2, ViewMode::Table) => protocol_table(ui, &id, view),
             (2, ViewMode::Chart) => protocol_chart(ui, &id, view),
             (3, ViewMode::Table) => address_table(ui, &id, &view.top_senders, "sender"),
@@ -149,8 +161,16 @@ fn fee_table(ui: &mut Ui, id: &str, view: &AggregatedView) {
 
 fn tx_table(ui: &mut Ui, id: &str, view: &AggregatedView) {
     kv_grid(ui, id, |ui| {
-        kv(ui, "Time Periods", format_number(view.blocks_analyzed as u64));
-        kv(ui, "Total Transactions", format_number(view.tx_count as u64));
+        kv(
+            ui,
+            "Time Periods",
+            format_number(view.blocks_analyzed as u64),
+        );
+        kv(
+            ui,
+            "Total Transactions",
+            format_number(view.tx_count as u64),
+        );
         kv(ui, "Unique Senders", view.top_senders.len().to_string());
         kv(ui, "Unique Receivers", view.top_receivers.len().to_string());
     });

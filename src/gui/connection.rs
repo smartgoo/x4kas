@@ -134,7 +134,10 @@ impl ConnectionWindow {
                 self.connect(app, cmd_tx);
             }
             let connected = app.connection != ActiveConnection::None || daemon_running;
-            if ui.add_enabled(connected, Button::new("Disconnect")).clicked() {
+            if ui
+                .add_enabled(connected, Button::new("Disconnect"))
+                .clicked()
+            {
                 let _ = cmd_tx.send(UiCommand::Disconnect);
             }
         });

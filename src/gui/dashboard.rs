@@ -15,7 +15,9 @@ pub fn show(ui: &mut Ui, app: &App) {
 
             card(&mut cols[1], "Network Stats", |ui| network_stats(ui, app));
             cols[1].add_space(8.0);
-            card(&mut cols[1], "Mempool & Fees", |ui| mempool_summary(ui, app));
+            card(&mut cols[1], "Mempool & Fees", |ui| {
+                mempool_summary(ui, app)
+            });
         });
         ui.add_space(8.0);
         card(ui, "Mining Info", |ui| mining_info(ui, app));
@@ -38,7 +40,11 @@ fn node_info(ui: &mut Ui, app: &App) {
     kv_grid(ui, "node_info", |ui| {
         kv(ui, "Version", &info.server_version);
         kv(ui, "Network", &info.network_id);
-        let synced_color = if info.is_synced { theme::OK } else { theme::ERROR };
+        let synced_color = if info.is_synced {
+            theme::OK
+        } else {
+            theme::ERROR
+        };
         kv(
             ui,
             "Synced",
@@ -87,8 +93,16 @@ fn network_stats(ui: &mut Ui, app: &App) {
             } else {
                 0.0
             };
-            kv(ui, "Max Supply", format!("{} KAS", format_number(max_kas as u64)));
-            kv(ui, "Circulating", format!("{} KAS", format_number(circ_kas as u64)));
+            kv(
+                ui,
+                "Max Supply",
+                format!("{} KAS", format_number(max_kas as u64)),
+            );
+            kv(
+                ui,
+                "Circulating",
+                format!("{} KAS", format_number(circ_kas as u64)),
+            );
             kv(ui, "% Circulating", format!("{pct:.2}%"));
         }
     });
@@ -128,7 +142,11 @@ fn mempool_summary(ui: &mut Ui, app: &App) {
         return;
     };
     kv_grid(ui, "mempool_summary", |ui| {
-        kv(ui, "Transactions", format_number(mempool.entry_count as u64));
+        kv(
+            ui,
+            "Transactions",
+            format_number(mempool.entry_count as u64),
+        );
         kv(
             ui,
             "Total Fees",

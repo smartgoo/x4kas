@@ -159,5 +159,4 @@ mod tests {
         assert!(result.ends_with("ef1234567890"));
         assert!(result.contains("..."));
     }
-
 }

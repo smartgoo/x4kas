@@ -5,9 +5,7 @@ use std::time::Duration;
 use anyhow::Result;
 use futures::stream::{self, StreamExt};
 use kaspa_rpc_core::api::rpc::RpcApi;
-use kaspa_rpc_core::{
-    GetVirtualChainFromBlockV2Response, RpcDataVerbosityLevel, RpcHash,
-};
+use kaspa_rpc_core::{GetVirtualChainFromBlockV2Response, RpcDataVerbosityLevel, RpcHash};
 use kaspa_wrpc_client::prelude::*;
 use std::str::FromStr;
 use tokio::sync::RwLock;
@@ -129,7 +127,8 @@ impl RpcManager {
             match dag_info {
                 Ok(v) => {
                     let info: crate::rpc::types::DagInfo = v.into();
-                    app.node.dag_visualizer
+                    app.node
+                        .dag_visualizer
                         .update(&info.tip_hashes, &info.virtual_parent_hashes);
                     app.node.dag_info = Some(info);
                 }
@@ -394,10 +393,7 @@ impl RpcManager {
 
         for chain_block in response.chain_block_accepted_transactions.iter() {
             let header = &chain_block.chain_block_header;
-            let hash = header
-                .hash
-                .map(|h| h.to_string())
-                .unwrap_or_default();
+            let hash = header.hash.map(|h| h.to_string()).unwrap_or_default();
             let timestamp_ms = header.timestamp.unwrap_or(0);
             let daa_score = header.daa_score.unwrap_or(0);
             let _ = daa_score; // available for sync progress tracking

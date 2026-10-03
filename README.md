@@ -10,7 +10,7 @@ Built with [egui/eframe](https://github.com/emilk/egui) and [rusty-kaspa](https:
 - **Mempool**: live transaction table; click a row for details
 - **BlockDAG**: interactive DAG visualizer, DAG metrics, GHOSTDAG stats, tip and virtual-parent hashes; click any block for full block info
 - **Analytics**: fees, transaction summary, protocol activity, top senders and receivers, each as a table or chart over 1m / 1h / 24h windows
-- **RPC Cmds**: run any of 18 RPC methods and inspect formatted responses
+- **RPC Cmds**: run any of 36 read-only RPC methods (with argument forms for those that take a hash, address or number) and inspect formatted responses
 - **Node**: configure, start and stop an embedded kaspad, with live status and logs
 - **Connection switcher**: connect to a node by URL, through the public resolver, or via the embedded node, all from inside the app
 - **Command palette**: run commands with completion and history
@@ -96,6 +96,7 @@ src/
   rpc/
     client.rs           RpcManager (connect, poll, execute)
     market.rs           CoinGecko market data
+    methods.rs          RPC method catalog and argument parsing
     types.rs            UI-friendly RPC type wrappers
   gui/
     mod.rs              GuiApp: frame loop, top bar, shortcuts, quit

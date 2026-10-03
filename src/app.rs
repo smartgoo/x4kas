@@ -1,6 +1,6 @@
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::analytics::{AggregatedView, AnalyticsEngine};
 use crate::config::DaemonConfig;
@@ -276,21 +276,71 @@ impl ActiveConnection {
 pub struct RpcExplorerState {
     pub selected_method: usize,
     pub available_methods: Vec<&'static str>,
+    /// Argument inputs for the selected method, one per parameter.
+    pub args: Vec<String>,
     pub last_response: Option<String>,
     pub is_loading: bool,
+    /// Re-run the selected (parameterless) method every `loop_interval_secs`.
+    pub loop_enabled: bool,
+    pub loop_interval_secs: f64,
+    pub last_run: Option<Instant>,
 }
 
 impl Default for RpcExplorerState {
     fn default() -> Self {
-        Self {
+        let mut available_methods: Vec<_> = crate::rpc::methods::RPC_METHODS
+            .iter()
+            .map(|m| m.name)
+            .collect();
+        available_methods.sort_unstable();
+        let mut state = Self {
             selected_method: 0,
-            available_methods: crate::rpc::types::RPC_METHODS
-                .iter()
-                .map(|(name, _)| *name)
-                .collect(),
+            available_methods,
+            args: Vec::new(),
             last_response: None,
             is_loading: false,
+            loop_enabled: false,
+            loop_interval_secs: 1.0,
+            last_run: None,
+        };
+        state.select(0);
+        state
+    }
+}
+
+impl RpcExplorerState {
+    pub fn method(&self) -> Option<&'static crate::rpc::methods::RpcMethod> {
+        self.available_methods
+            .get(self.selected_method)
+            .and_then(|name| crate::rpc::methods::find(name))
+    }
+
+    /// Time left until the next loop run (`Duration::ZERO` if due), or `None` when
+    /// not looping or a request is still in flight.
+    pub fn loop_wait(&self, now: Instant) -> Option<Duration> {
+        if !self.loop_enabled || self.is_loading {
+            return None;
         }
+        let interval = Duration::from_secs_f64(self.loop_interval_secs.max(0.1));
+        Some(match self.last_run {
+            Some(t) => interval.saturating_sub(now.saturating_duration_since(t)),
+            None => Duration::ZERO,
+        })
+    }
+
+    /// Select a method and reset the argument inputs to its defaults. Stops any loop.
+    pub fn select(&mut self, index: usize) {
+        self.selected_method = index;
+        self.loop_enabled = false;
+        self.args = self
+            .method()
+            .map(|m| {
+                m.params
+                    .iter()
+                    .map(|p| p.default.unwrap_or_default().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
     }
 }
 
@@ -394,7 +444,11 @@ impl CommandLine {
             ("help", "Show this help message"),
             ("clear", "Clear command output"),
         ];
-        cmds.extend_from_slice(crate::rpc::types::RPC_METHODS);
+        cmds.extend(
+            crate::rpc::methods::RPC_METHODS
+                .iter()
+                .map(|m| (m.name, m.description)),
+        );
         cmds
     }
 }
@@ -982,6 +1036,62 @@ mod tests {
         let dag = make_dag_info(4, 3, 1000, 1010);
         stats.update(&dag, Some(500));
         assert!(stats.blue_block_rate().is_none());
+    }
+
+    #[test]
+    fn rpc_explorer_loop_wait() {
+        let mut state = RpcExplorerState::default();
+        let now = Instant::now();
+        assert_eq!(state.loop_wait(now), None);
+
+        state.loop_enabled = true;
+        assert_eq!(state.loop_wait(now), Some(Duration::ZERO));
+
+        state.last_run = Some(now);
+        state.loop_interval_secs = 2.0;
+        assert_eq!(
+            state.loop_wait(now + Duration::from_millis(500)),
+            Some(Duration::from_millis(1500))
+        );
+        assert_eq!(
+            state.loop_wait(now + Duration::from_secs(3)),
+            Some(Duration::ZERO)
+        );
+
+        state.is_loading = true;
+        assert_eq!(state.loop_wait(now), None);
+
+        state.is_loading = false;
+        state.select(1);
+        assert!(!state.loop_enabled);
+    }
+
+    #[test]
+    fn rpc_explorer_methods_are_sorted() {
+        let state = RpcExplorerState::default();
+        assert!(state.available_methods.is_sorted());
+    }
+
+    #[test]
+    fn rpc_explorer_select_resets_args_to_defaults() {
+        let mut state = RpcExplorerState::default();
+        let i = state
+            .available_methods
+            .iter()
+            .position(|m| *m == "get_block")
+            .unwrap();
+        state.select(i);
+        assert_eq!(state.args, vec![String::new(), "true".to_string()]);
+        state.args[0] = "abc".into();
+        let ping = state
+            .available_methods
+            .iter()
+            .position(|m| *m == "ping")
+            .unwrap();
+        state.select(ping);
+        assert!(state.args.is_empty());
+        state.select(i);
+        assert_eq!(state.args[0], "");
     }
 
     #[test]

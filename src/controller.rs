@@ -11,6 +11,7 @@ use crate::config::DaemonConfig;
 use crate::daemon::DaemonHandle;
 use crate::daemon_lifecycle::{self, PollingHandles, create_and_start_rpc, start_mining_polling};
 use crate::rpc::client::RpcManager;
+use crate::rpc::methods;
 
 /// Commands sent from the frontend to the controller task.
 pub enum UiCommand {
@@ -20,8 +21,11 @@ pub enum UiCommand {
     Disconnect,
     StartDaemon(Box<DaemonConfig>),
     StopDaemon,
-    /// Run an RPC method and store the result in `app.rpc_explorer`.
-    ExecuteRpc(String),
+    /// Run an RPC method with its arguments and store the result in `app.rpc_explorer`.
+    ExecuteRpc {
+        method: String,
+        args: Vec<String>,
+    },
     /// Fetch block info and store the result in `app.dag_selection`.
     LookupBlock(String),
     /// Run a command-line command and push the result to `app.command_line`.
@@ -88,7 +92,7 @@ impl Controller {
                 UiCommand::Disconnect => self.disconnect().await,
                 UiCommand::StartDaemon(config) => self.start_daemon(&config).await,
                 UiCommand::StopDaemon => self.stop_daemon().await,
-                UiCommand::ExecuteRpc(method) => self.execute_rpc(method),
+                UiCommand::ExecuteRpc { method, args } => self.execute_rpc(method, args),
                 UiCommand::LookupBlock(hash) => self.lookup_block(hash),
                 UiCommand::RunCommandLine(cmd) => self.run_command_line(cmd),
                 UiCommand::Shutdown(done) => {
@@ -257,12 +261,12 @@ impl Controller {
         }
     }
 
-    fn execute_rpc(&self, method: String) {
+    fn execute_rpc(&self, method: String, args: Vec<String>) {
         let rpc = self.rpc.clone();
         let app = self.app.clone();
         tokio::spawn(async move {
             let result = match rpc {
-                Some(rpc) => match rpc.execute_rpc_call(&method).await {
+                Some(rpc) => match rpc.execute_rpc_call(&method, &args).await {
                     Ok(response) => response,
                     Err(e) => format!("Error: {}", e),
                 },
@@ -297,12 +301,19 @@ impl Controller {
         let rpc = self.rpc.clone();
         let app = self.app.clone();
         tokio::spawn(async move {
-            let command = cmd.trim().split(' ').next().unwrap_or_default().to_string();
+            let mut words = cmd.split_whitespace().map(str::to_string);
+            let command = words.next().unwrap_or_default();
+            let args: Vec<String> = words.collect();
             let (output, is_error) = match command.as_str() {
                 "help" => {
                     let mut help_text = String::from("Available commands:\n\n");
                     for (name, desc) in CommandLine::available_commands() {
-                        help_text.push_str(&format!("  {:<28} {}\n", name, desc));
+                        help_text.push_str(&format!("  {:<34} {}\n", name, desc));
+                        if let Some(m) = methods::find(name)
+                            && !m.params.is_empty()
+                        {
+                            help_text.push_str(&format!("      usage: {}\n", m.usage()));
+                        }
                     }
                     help_text.push_str(
                         "\nOpen with ':' or Ctrl+K · Tab completes · Up/Down for history · Esc closes",
@@ -316,7 +327,7 @@ impl Controller {
                     return;
                 }
                 _ => match rpc {
-                    Some(rpc) => match rpc.execute_rpc_call(&command).await {
+                    Some(rpc) => match rpc.execute_rpc_call(&command, &args).await {
                         Ok(response) => (response, false),
                         Err(e) => (e.to_string(), true),
                     },

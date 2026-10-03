@@ -5,6 +5,7 @@ use eframe::egui::{self, Key, Modifiers, RichText, TextEdit, Ui};
 use super::theme;
 use crate::app::CommandLine;
 use crate::controller::{CommandSender, UiCommand};
+use crate::rpc::methods;
 
 const MAX_SUGGESTIONS: usize = 6;
 
@@ -87,6 +88,18 @@ fn move_cursor_to_end(ctx: &egui::Context, id: egui::Id, text: &str) {
 fn suggestions(ui: &mut Ui, cl: &mut CommandLine) {
     let typed = cl.input.trim();
     if typed.is_empty() {
+        return;
+    }
+    // Once a method with arguments is typed, show its usage instead of suggestions.
+    let first = typed.split_whitespace().next().unwrap_or_default();
+    if let Some(m) = methods::find(first)
+        && !m.params.is_empty()
+    {
+        ui.label(
+            RichText::new(format!("usage: {}", m.usage()))
+                .monospace()
+                .weak(),
+        );
         return;
     }
     let matches = cl.suggestions();

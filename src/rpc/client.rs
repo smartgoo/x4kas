@@ -12,7 +12,11 @@ use tokio::sync::RwLock;
 
 use crate::analytics::{BlockSummary, detect_protocol};
 use crate::app::{App, ConnectionStatus};
-use crate::rpc::types::shorten_address;
+use crate::rpc::methods::{
+    self, parse_address, parse_addresses, parse_bool, parse_hash, parse_opt_u64,
+    parse_subnetwork_id, parse_u64, parse_u64_list, parse_verbosity,
+};
+use crate::rpc::types::{shorten_address, sompi_to_kas};
 
 pub struct RpcManager {
     client: Arc<KaspaRpcClient>,
@@ -184,103 +188,164 @@ impl RpcManager {
         }
     }
 
-    pub async fn execute_rpc_call(&self, method: &str) -> Result<String> {
-        match method {
-            "get_server_info" => {
-                let r = self.client.get_server_info().await?;
-                Ok(format!("{:#?}", r))
+    /// Run a read-only RPC method from the RPC Cmds tab or command palette. Missing or
+    /// empty arguments take the defaults declared in `methods::RPC_METHODS`.
+    pub async fn execute_rpc_call(&self, method: &str, args: &[String]) -> Result<String> {
+        let spec = methods::find(method).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Unknown command: '{}'. Type 'help' for available commands.",
+                method
+            )
+        })?;
+        let args = spec.resolve_args(args)?;
+        let arg = |i: usize| args[i].as_str();
+        let c = &self.client;
+
+        let out = match method {
+            "ping" => {
+                let start = std::time::Instant::now();
+                c.ping().await?;
+                format!("Pong! ({:.2}ms)", start.elapsed().as_secs_f64() * 1000.0)
             }
-            "get_block_dag_info" => {
-                let r = self.client.get_block_dag_info().await?;
-                Ok(format!("{:#?}", r))
-            }
-            "get_mempool_entries" => {
-                let r = self.client.get_mempool_entries(true, false).await?;
-                Ok(format!("{:#?}", r))
-            }
-            "get_coin_supply" => {
-                let r = self.client.get_coin_supply().await?;
-                Ok(format!("{:#?}", r))
-            }
-            "get_fee_estimate" => {
-                let r = self.client.get_fee_estimate().await?;
-                Ok(format!("{:#?}", r))
-            }
-            "get_fee_estimate_experimental" => {
-                let r = self.client.get_fee_estimate_experimental(true).await?;
-                Ok(format!("{:#?}", r))
-            }
-            "get_connected_peer_info" => {
-                let r = self.client.get_connected_peer_info().await?;
-                Ok(format!("{:#?}", r))
-            }
-            "get_peer_addresses" => {
-                let r = self.client.get_peer_addresses().await?;
-                Ok(format!("{:#?}", r))
-            }
-            "get_current_network" => {
-                let r = self.client.get_current_network().await?;
-                Ok(format!("{:#?}", r))
-            }
-            "get_sink" => {
-                let r = self.client.get_sink().await?;
-                Ok(format!("{:#?}", r))
-            }
-            "get_sink_blue_score" => {
-                let r = self.client.get_sink_blue_score().await?;
-                Ok(format!("{:#?}", r))
-            }
-            "get_info" => {
-                let r = self.client.get_info().await?;
-                Ok(format!("{:#?}", r))
-            }
-            "get_block_count" => {
-                let r = self.client.get_block_count().await?;
-                Ok(format!("{:#?}", r))
-            }
+            "get_info" => format!("{:#?}", c.get_info().await?),
+            "get_server_info" => format!("{:#?}", c.get_server_info().await?),
+            "get_system_info" => format!("{:#?}", c.get_system_info().await?),
+            "get_metrics" => format!(
+                "{:#?}",
+                c.get_metrics(true, true, true, true, true, true).await?
+            ),
+            "get_connections" => format!("{:#?}", c.get_connections(true).await?),
+            "get_sync_status" => format!("Synced: {}", c.get_sync_status().await?),
+            "get_current_network" => format!("{:#?}", c.get_current_network().await?),
+            "get_connected_peer_info" => format!("{:#?}", c.get_connected_peer_info().await?),
+            "get_peer_addresses" => format!("{:#?}", c.get_peer_addresses().await?),
+            "get_block_dag_info" => format!("{:#?}", c.get_block_dag_info().await?),
+            "get_block_count" => format!("{:#?}", c.get_block_count().await?),
+            "get_sink" => format!("{:#?}", c.get_sink().await?),
+            "get_sink_blue_score" => format!("{:#?}", c.get_sink_blue_score().await?),
+            "get_coin_supply" => format!("{:#?}", c.get_coin_supply().await?),
             "estimate_network_hashes_per_second" => {
-                let dag = self.client.get_block_dag_info().await?;
-                let r = self
-                    .client
+                let dag = c.get_block_dag_info().await?;
+                let r = c
                     .estimate_network_hashes_per_second(1000, Some(dag.sink))
                     .await?;
-                Ok(format!("Estimated network hash rate: {} hashes/second", r))
-            }
-            "get_headers" => {
-                let r = self.client.get_block_count().await?;
-                Ok(format!("Header count: {}", r.header_count))
-            }
-            "get_sync_status" => {
-                let r = self.client.get_server_info().await?;
-                Ok(format!(
-                    "Synced: {}\nVirtual DAA Score: {}\nServer Version: {}",
-                    r.is_synced, r.virtual_daa_score, r.server_version
-                ))
+                format!("Estimated network hash rate: {} hashes/second", r)
             }
             "get_virtual_chain" => {
-                let dag = self.client.get_block_dag_info().await?;
-                let r = self
-                    .client
+                let dag = c.get_block_dag_info().await?;
+                let r = c
                     .get_virtual_chain_from_block(dag.pruning_point_hash, false, None)
                     .await?;
-                Ok(format!(
+                format!(
                     "Removed chain blocks: {}\nAdded chain blocks: {}\nAccepted transaction IDs: {}",
                     r.removed_chain_block_hashes.len(),
                     r.added_chain_block_hashes.len(),
                     r.accepted_transaction_ids.len(),
-                ))
+                )
             }
-            "ping" => {
-                let start = std::time::Instant::now();
-                self.client.ping().await?;
-                let elapsed = start.elapsed();
-                Ok(format!("Pong! ({:.2}ms)", elapsed.as_secs_f64() * 1000.0))
+            "get_block" => format!(
+                "{:#?}",
+                c.get_block(parse_hash(arg(0))?, parse_bool(arg(1))?)
+                    .await?
+            ),
+            "get_blocks" => format!(
+                "{:#?}",
+                c.get_blocks(
+                    Some(parse_hash(arg(0))?),
+                    parse_bool(arg(1))?,
+                    parse_bool(arg(2))?
+                )
+                .await?
+            ),
+            "get_headers" => format!(
+                "{:#?}",
+                c.get_headers(parse_hash(arg(0))?, parse_u64(arg(1))?, parse_bool(arg(2))?)
+                    .await?
+            ),
+            "get_current_block_color" => format!(
+                "{:#?}",
+                c.get_current_block_color(parse_hash(arg(0))?).await?
+            ),
+            "get_block_reward_info" => {
+                format!("{:#?}", c.get_block_reward_info(parse_hash(arg(0))?).await?)
             }
-            _ => Err(anyhow::anyhow!(
-                "Unknown command: '{}'. Type 'help' for available commands.",
-                method
-            )),
-        }
+            "get_seq_commit_lane_proof" => format!(
+                "{:#?}",
+                c.get_seq_commit_lane_proof(parse_hash(arg(0))?, parse_hash(arg(1))?)
+                    .await?
+            ),
+            "get_virtual_chain_from_block_v2" => format!(
+                "{:#?}",
+                c.get_virtual_chain_from_block_v2(
+                    parse_hash(arg(0))?,
+                    Some(parse_verbosity(arg(1))?),
+                    parse_opt_u64(arg(2))?
+                )
+                .await?
+            ),
+            "get_daa_score_timestamp_estimate" => {
+                let scores = parse_u64_list(arg(0))?;
+                let timestamps = c.get_daa_score_timestamp_estimate(scores.clone()).await?;
+                scores
+                    .iter()
+                    .zip(timestamps)
+                    .map(|(score, ts)| format!("DAA score {score}: {ts} ms"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+            "get_subnetwork" => format!(
+                "{:#?}",
+                c.get_subnetwork(parse_subnetwork_id(arg(0))?).await?
+            ),
+            "get_block_template" => format!(
+                "{:#?}",
+                c.get_block_template(parse_address(arg(0))?, arg(1).as_bytes().to_vec())
+                    .await?
+            ),
+            "get_mempool_entries" => format!("{:#?}", c.get_mempool_entries(true, false).await?),
+            "get_mempool_entry" => format!(
+                "{:#?}",
+                c.get_mempool_entry(
+                    parse_hash(arg(0))?,
+                    parse_bool(arg(1))?,
+                    parse_bool(arg(2))?
+                )
+                .await?
+            ),
+            "get_mempool_entries_by_addresses" => format!(
+                "{:#?}",
+                c.get_mempool_entries_by_addresses(
+                    parse_addresses(arg(0))?,
+                    parse_bool(arg(1))?,
+                    parse_bool(arg(2))?
+                )
+                .await?
+            ),
+            "get_fee_estimate" => format!("{:#?}", c.get_fee_estimate().await?),
+            "get_fee_estimate_experimental" => {
+                format!("{:#?}", c.get_fee_estimate_experimental(true).await?)
+            }
+            "get_balance_by_address" => {
+                let sompi = c.get_balance_by_address(parse_address(arg(0))?).await?;
+                format!("Balance: {} KAS ({} sompi)", sompi_to_kas(sompi), sompi)
+            }
+            "get_balances_by_addresses" => format!(
+                "{:#?}",
+                c.get_balances_by_addresses(parse_addresses(arg(0))?)
+                    .await?
+            ),
+            "get_utxos_by_addresses" => format!(
+                "{:#?}",
+                c.get_utxos_by_addresses(parse_addresses(arg(0))?).await?
+            ),
+            "get_utxo_return_address" => format!(
+                "Return address: {}",
+                c.get_utxo_return_address(parse_hash(arg(0))?, parse_u64(arg(1))?)
+                    .await?
+            ),
+            _ => anyhow::bail!("No handler for RPC method '{}'", method),
+        };
+        Ok(truncate_response(out))
     }
 
     pub async fn fetch_mining_info(&self) -> Result<crate::rpc::types::MiningInfo> {
@@ -497,51 +562,52 @@ impl Drop for RpcManager {
     }
 }
 
+/// Responses beyond this many bytes are cut so the result viewer stays responsive.
+const MAX_RESPONSE_CHARS: usize = 1_000_000;
+
+fn truncate_response(mut s: String) -> String {
+    if s.len() <= MAX_RESPONSE_CHARS {
+        return s;
+    }
+    let total = s.len();
+    let mut cut = MAX_RESPONSE_CHARS;
+    while !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    s.truncate(cut);
+    s.push_str(&format!(
+        "\n\n… (response truncated: {total} bytes, showing first {cut})"
+    ));
+    s
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::rpc::types::RPC_METHODS;
-    use std::collections::HashSet;
+    use super::{MAX_RESPONSE_CHARS, truncate_response};
+    use crate::rpc::methods::RPC_METHODS;
 
+    /// Every method in `RPC_METHODS` must have a match arm in `execute_rpc_call`.
+    /// Checked against the source so a missing arm fails without a live node.
     #[test]
     fn all_rpc_methods_have_handler() {
-        // All methods listed in RPC_METHODS must have a match arm in execute_rpc_call.
-        // This list must be kept in sync with the match arms in execute_rpc_call.
-        let handled: HashSet<&str> = [
-            "get_server_info",
-            "get_block_dag_info",
-            "get_mempool_entries",
-            "get_coin_supply",
-            "get_fee_estimate",
-            "get_fee_estimate_experimental",
-            "get_connected_peer_info",
-            "get_peer_addresses",
-            "get_current_network",
-            "get_sink",
-            "get_sink_blue_score",
-            "get_info",
-            "get_block_count",
-            "estimate_network_hashes_per_second",
-            "get_headers",
-            "get_sync_status",
-            "get_virtual_chain",
-            "ping",
-        ]
-        .into();
-
-        for (method, _) in RPC_METHODS {
+        let src = include_str!("client.rs");
+        let body = &src[src.find("pub async fn execute_rpc_call").unwrap()
+            ..src.find("pub async fn fetch_mining_info").unwrap()];
+        for m in RPC_METHODS {
             assert!(
-                handled.contains(method),
-                "RPC method '{}' listed in RPC_METHODS but not handled in execute_rpc_call",
-                method
+                body.contains(&format!("\"{}\" =>", m.name)),
+                "RPC method '{}' has no handler in execute_rpc_call",
+                m.name
             );
         }
+    }
 
-        for method in &handled {
-            assert!(
-                RPC_METHODS.iter().any(|(name, _)| name == method),
-                "Handler '{}' exists in execute_rpc_call but not listed in RPC_METHODS",
-                method
-            );
-        }
+    #[test]
+    fn truncate_response_caps_long_output() {
+        assert_eq!(truncate_response("short".into()), "short");
+        let long = "é".repeat(MAX_RESPONSE_CHARS);
+        let out = truncate_response(long);
+        assert!(out.len() < MAX_RESPONSE_CHARS + 200);
+        assert!(out.contains("response truncated"));
     }
 }

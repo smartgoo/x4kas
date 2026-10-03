@@ -186,35 +186,6 @@ pub struct MarketData {
     pub price_change_24h_pct: f64,
 }
 
-/// Single source of truth for all RPC methods available in the explorer and command line.
-/// Each entry is (method_name, description).
-pub const RPC_METHODS: &[(&str, &str)] = &[
-    ("get_server_info", "Get server info"),
-    ("get_block_dag_info", "Get block DAG info"),
-    ("get_block_count", "Get block count"),
-    ("get_mempool_entries", "Get mempool entries"),
-    ("get_coin_supply", "Get coin supply"),
-    ("get_fee_estimate", "Get fee estimate"),
-    (
-        "get_fee_estimate_experimental",
-        "Get experimental fee estimate (verbose)",
-    ),
-    ("get_connected_peer_info", "Get connected peer info"),
-    ("get_peer_addresses", "Get known peer addresses"),
-    ("get_current_network", "Get current network type"),
-    ("get_sink", "Get sink (virtual selected parent) hash"),
-    ("get_sink_blue_score", "Get sink blue score"),
-    ("get_info", "Get general node info"),
-    ("get_sync_status", "Get sync status"),
-    ("get_virtual_chain", "Get virtual selected parent chain"),
-    ("get_headers", "Get header count"),
-    (
-        "estimate_network_hashes_per_second",
-        "Estimate network hashrate",
-    ),
-    ("ping", "Ping the node"),
-];
-
 #[cfg(test)]
 mod tests {
     use super::*;

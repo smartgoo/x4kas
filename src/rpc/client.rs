@@ -127,6 +127,11 @@ impl RpcManager {
                 client.get_fee_estimate(),
                 client.get_sink_blue_score(),
             );
+            // Header only (no transactions) of the sink, for "seconds behind tip".
+            let sink_block = match dag_info {
+                Ok(ref info) => Some(client.get_block(info.sink, false).await),
+                Err(_) => None,
+            };
 
             let mut app = state.write().await;
 
@@ -155,6 +160,11 @@ impl RpcManager {
             match sink_blue_score {
                 Ok(v) => app.node.sink_blue_score = Some(v),
                 Err(e) => errors.push(format!("sink_blue_score: {}", e)),
+            }
+            match sink_block {
+                Some(Ok(block)) => app.node.sink_timestamp_ms = Some(block.header.timestamp),
+                Some(Err(e)) => errors.push(format!("sink_block: {}", e)),
+                None => {}
             }
 
             if let Some(dag) = app.node.dag_info.clone() {

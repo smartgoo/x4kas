@@ -494,6 +494,8 @@ pub struct NodeState {
     pub dag_visualizer: DagVisualizer,
     pub dag_stats: DagStats,
     pub sink_blue_score: Option<u64>,
+    /// Header timestamp (unix ms) of the sink, the node's newest selected tip.
+    pub sink_timestamp_ms: Option<u64>,
     pub node_url: Option<String>,
     pub node_uid: Option<String>,
     pub connection_status: ConnectionStatus,
@@ -514,6 +516,7 @@ impl Default for NodeState {
             dag_visualizer: DagVisualizer::default(),
             dag_stats: DagStats::default(),
             sink_blue_score: None,
+            sink_timestamp_ms: None,
             node_url: None,
             node_uid: None,
             connection_status: ConnectionStatus::Disconnected,
@@ -596,6 +599,14 @@ impl App {
     }
 
     /// Drop all data fetched from the current node, e.g. before switching nodes.
+    /// How far the app's view lags the DAG tip: `now_ms` minus the sink's timestamp.
+    /// Clamped at zero, since block timestamps can run slightly ahead of the local clock.
+    pub fn seconds_behind_tip(&self, now_ms: u64) -> Option<f64> {
+        self.node
+            .sink_timestamp_ms
+            .map(|ts| now_ms.saturating_sub(ts) as f64 / 1000.0)
+    }
+
     pub fn clear_node_data(&mut self) {
         self.node = NodeState::default();
         self.analytics.engine = None;
@@ -679,6 +690,16 @@ mod tests {
     use super::*;
 
     // --- Connection ---
+
+    #[test]
+    fn seconds_behind_tip_from_sink_timestamp() {
+        let mut app = App::new(DaemonConfig::default());
+        assert_eq!(app.seconds_behind_tip(10_000), None);
+        app.node.sink_timestamp_ms = Some(7_500);
+        assert_eq!(app.seconds_behind_tip(10_000), Some(2.5));
+        // A sink timestamp ahead of the local clock counts as caught up.
+        assert_eq!(app.seconds_behind_tip(5_000), Some(0.0));
+    }
 
     #[test]
     fn clear_node_data_resets_fetched_state() {

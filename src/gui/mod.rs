@@ -20,7 +20,7 @@ use anyhow::Result;
 use eframe::egui::{self, Button, Event, Key, Modifiers, RichText, Stroke, ViewportCommand};
 use tokio::sync::{RwLock, oneshot};
 
-use crate::app::{App, DaemonStatus, Tab};
+use crate::app::{ActiveConnection, App, ConnectionStatus, DaemonStatus, Tab};
 use crate::cli::CliArgs;
 use crate::config::{ConnectionKind, ConnectionSettings, DaemonConfig};
 use crate::controller::{self, CommandSender, ControllerArgs, RemoteTarget, UiCommand};
@@ -330,14 +330,46 @@ fn tab_button(ui: &mut egui::Ui, number: usize, label: &str, selected: bool) -> 
     )
 }
 
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+/// One decimal under 10s (a healthy node is usually under a second behind), whole seconds above.
+fn format_seconds(secs: f64) -> String {
+    if secs < 10.0 {
+        format!("{secs:.1}")
+    } else {
+        format!("{secs:.0}")
+    }
+}
+
+/// Status bar text, e.g. "Connected to ws://127.0.0.1:17110".
+fn connection_summary(app: &App) -> String {
+    let target = match app.connection {
+        ActiveConnection::Url(ref url) => url.as_str(),
+        ActiveConnection::Resolver => "public resolver",
+        ActiveConnection::Embedded => "embedded node",
+        ActiveConnection::None => return "Not connected".to_string(),
+    };
+    match app.node.connection_status {
+        ConnectionStatus::Connected => format!("Connected to {target}"),
+        ConnectionStatus::Connecting => format!("Connecting to {target}…"),
+        ConnectionStatus::Disconnected => format!("Disconnected from {target}"),
+        ConnectionStatus::Error(_) => format!("Error connecting to {target}"),
+    }
+}
+
 /// Connection (click to change), embedded node, network, DAA score, poll latency and pause.
 fn status_bar(ui: &mut egui::Ui, app: &mut App, connection: &mut ConnectionWindow) {
     ui.horizontal(|ui| {
-        let (text, color) = theme::connection_status(&app.node.connection_status);
+        let (_, color) = theme::connection_status(&app.node.connection_status);
         if ui
             .selectable_label(
                 connection.open,
-                RichText::new(format!("● {text} · {}", app.connection.label())).color(color),
+                RichText::new(format!("● {}", connection_summary(app))).color(color),
             )
             .on_hover_text("Change connection")
             .clicked()
@@ -368,9 +400,16 @@ fn status_bar(ui: &mut egui::Ui, app: &mut App, connection: &mut ConnectionWindo
 
             if app.paused {
                 ui.label(RichText::new("PAUSED").color(theme::WARN));
-            } else if let Some(ms) = app.node.last_poll_duration_ms {
-                ui.label(format!("{ms:.0} ms"));
-                widgets::field_label(ui, "poll");
+            }
+            if let Some(secs) = app.seconds_behind_tip(now_ms()) {
+                let color = match secs {
+                    s if s >= 60.0 => theme::ERROR,
+                    s if s >= 10.0 => theme::WARN,
+                    _ => theme::TEXT,
+                };
+                let secs = format_seconds(secs);
+                ui.label(RichText::new(format!("{secs}s behind")).color(color))
+                    .on_hover_text(format!("{secs} seconds behind DAG sink"));
             }
             if let Some(ref info) = app.node.server_info {
                 widgets::divider(ui);

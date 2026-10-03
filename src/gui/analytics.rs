@@ -6,7 +6,7 @@ use egui_plot::{Bar, BarChart, GridMark, Plot};
 use super::theme;
 use super::widgets::{
     CARD_GAP, card, column_header, direct_node_placeholder, field_label, kv, kv_grid, placeholder,
-    section_title, syncing_guard,
+    section_title,
 };
 use crate::analytics::AggregatedView;
 use crate::app::{AnalyticsPanel, App, PanelState, TimeWindow, ViewMode};
@@ -17,9 +17,6 @@ use crate::tx_inspect::TransactionProtocol;
 const CHART_HEIGHT: f32 = 200.0;
 
 pub fn show(ui: &mut Ui, app: &mut App) {
-    if syncing_guard(ui, app, "Analytics") {
-        return;
-    }
     if !app.has_direct_node {
         placeholder(ui, direct_node_placeholder(app, ""));
         return;

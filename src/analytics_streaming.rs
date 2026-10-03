@@ -5,13 +5,13 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 
 use crate::app::App;
-use crate::config::DaemonConfig;
-use crate::daemon_lifecycle::PollingHandles;
+use crate::config;
+use crate::polling::PollingHandles;
 use crate::rpc::client::RpcManager;
 
 /// Where the analytics engine is persisted (`~/.tui4kas/analytics_cache.bin`).
 pub fn cache_path() -> PathBuf {
-    DaemonConfig::config_path().with_file_name("analytics_cache.bin")
+    config::data_dir().join("analytics_cache.bin")
 }
 
 /// Start the analytics VSPC V2 streaming task.

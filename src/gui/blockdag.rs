@@ -1,7 +1,7 @@
 use eframe::egui::{self, Pos2, Rect, RichText, Sense, Stroke, Ui, vec2};
 
 use super::theme;
-use super::widgets::{CARD_GAP, card, field_label, kv, kv_grid, placeholder, syncing_guard};
+use super::widgets::{CARD_GAP, card, field_label, kv, kv_grid, placeholder};
 use crate::app::{App, DagFocus, DagVisualizer};
 use crate::controller::{CommandSender, UiCommand};
 use crate::rpc::types::format_number;
@@ -12,10 +12,6 @@ const ROW_HEIGHT: f32 = 24.0;
 const BLOCK_SIZE: f32 = 18.0;
 
 pub fn show(ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
-    if syncing_guard(ui, app, "BlockDAG") {
-        return;
-    }
-
     let mut lookup: Option<String> = None;
 
     egui::ScrollArea::vertical().show(ui, |ui| {

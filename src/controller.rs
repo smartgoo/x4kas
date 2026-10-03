@@ -1,15 +1,13 @@
-//! Owns the node connection lifecycle (embedded daemon, RPC manager, polling tasks)
-//! and executes commands sent from the frontend.
+//! Owns the node connection lifecycle (RPC manager, polling tasks) and executes
+//! commands sent from the frontend.
 
 use std::sync::Arc;
 
 use tokio::sync::{RwLock, mpsc, oneshot};
 
 use crate::analytics_streaming;
-use crate::app::{ActiveConnection, App, CommandLine, ConnectionStatus, DaemonStatus};
-use crate::config::DaemonConfig;
-use crate::daemon::DaemonHandle;
-use crate::daemon_lifecycle::{self, PollingHandles, create_and_start_rpc, start_mining_polling};
+use crate::app::{ActiveConnection, App, CommandLine, ConnectionStatus};
+use crate::polling::{PollingHandles, create_and_start_rpc, start_mining_polling};
 use crate::rpc::client::RpcManager;
 use crate::rpc::methods;
 
@@ -17,26 +15,21 @@ use crate::rpc::methods;
 pub enum UiCommand {
     /// Stop whatever is running and connect to a remote node (URL or resolver).
     Connect(RemoteTarget),
-    /// Stop whatever is running (including the embedded node) and stay disconnected.
+    /// Stop whatever is running and stay disconnected.
     Disconnect,
-    StartDaemon(Box<DaemonConfig>),
-    StopDaemon,
     /// Run an RPC method with its arguments and store the result in `app.rpc_explorer`.
-    ExecuteRpc {
-        method: String,
-        args: Vec<String>,
-    },
+    ExecuteRpc { method: String, args: Vec<String> },
     /// Fetch block info and store the result in `app.dag_selection`.
     LookupBlock(String),
     /// Run a command-line command and push the result to `app.command_line`.
     RunCommandLine(String),
-    /// Tear everything down; the sender is notified once the node has stopped.
+    /// Tear everything down; the sender is notified once state has been saved.
     Shutdown(oneshot::Sender<()>),
 }
 
 pub type CommandSender = mpsc::UnboundedSender<UiCommand>;
 
-/// A node reached over the network rather than the embedded daemon.
+/// A node reached over the network: a wRPC URL or the public resolver.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RemoteTarget {
     /// wRPC URL, or `None` to let the public resolver pick a node.
@@ -53,11 +46,9 @@ pub struct ControllerArgs {
 struct Controller {
     app: Arc<RwLock<App>>,
     refresh_interval_ms: u64,
-    /// The remote node to use when the embedded node is not running.
+    /// The node to connect to, if any.
     remote: Option<RemoteTarget>,
     rpc: Option<Arc<RpcManager>>,
-    daemon: Option<DaemonHandle>,
-    log_tail: Option<tokio::task::JoinHandle<()>>,
     polling: PollingHandles,
 }
 
@@ -66,7 +57,6 @@ pub fn spawn(
     rt: &tokio::runtime::Handle,
     app: Arc<RwLock<App>>,
     args: ControllerArgs,
-    config: DaemonConfig,
 ) -> CommandSender {
     let (tx, rx) = mpsc::unbounded_channel();
     let controller = Controller {
@@ -74,24 +64,21 @@ pub fn spawn(
         refresh_interval_ms: args.refresh_interval_ms,
         remote: args.remote,
         rpc: None,
-        daemon: None,
-        log_tail: None,
         polling: PollingHandles::new(),
     };
-    rt.spawn(controller.run(config, rx));
+    rt.spawn(controller.run(rx));
     tx
 }
 
 impl Controller {
-    async fn run(mut self, config: DaemonConfig, mut rx: mpsc::UnboundedReceiver<UiCommand>) {
-        self.startup(&config).await;
+    async fn run(mut self, mut rx: mpsc::UnboundedReceiver<UiCommand>) {
+        // Connect on startup if `--url` was given; otherwise wait for the user to pick.
+        self.connect_remote().await;
 
         while let Some(cmd) = rx.recv().await {
             match cmd {
                 UiCommand::Connect(target) => self.connect(target).await,
                 UiCommand::Disconnect => self.disconnect().await,
-                UiCommand::StartDaemon(config) => self.start_daemon(&config).await,
-                UiCommand::StopDaemon => self.stop_daemon().await,
                 UiCommand::ExecuteRpc { method, args } => self.execute_rpc(method, args),
                 UiCommand::LookupBlock(hash) => self.lookup_block(hash),
                 UiCommand::RunCommandLine(cmd) => self.run_command_line(cmd),
@@ -104,18 +91,6 @@ impl Controller {
         }
         // Frontend dropped the channel without an explicit shutdown.
         self.stop_all().await;
-    }
-
-    /// Startup modes:
-    /// 1. --url provided: connect directly to that node
-    /// 2. auto_start_daemon (no --url): start integrated daemon, connect to it
-    /// 3. neither: stay disconnected until the user picks a connection
-    async fn startup(&mut self, config: &DaemonConfig) {
-        if self.remote.is_some() {
-            self.connect_remote().await;
-        } else if config.auto_start_daemon {
-            self.start_daemon(config).await;
-        }
     }
 
     async fn connect(&mut self, target: RemoteTarget) {
@@ -152,7 +127,6 @@ impl Controller {
             &target.network,
             &self.app,
             self.refresh_interval_ms,
-            false,
             &mut self.polling,
         )
         .await
@@ -177,88 +151,19 @@ impl Controller {
         }
     }
 
-    async fn start_daemon(&mut self, config: &DaemonConfig) {
-        self.stop_background_tasks().await;
-        {
-            let mut app = self.app.write().await;
-            app.clear_node_data();
-            app.connection = ActiveConnection::Embedded;
-            app.integrated_node.status = DaemonStatus::Starting;
-            app.mark_dirty();
-        }
-
-        match daemon_lifecycle::start_daemon_and_connect(
-            config,
-            &self.app,
-            self.refresh_interval_ms,
-            &mut self.polling,
-        )
-        .await
-        {
-            Ok((handle, rpc, log_handle)) => {
-                self.daemon = Some(handle);
-                self.rpc = Some(rpc);
-                self.log_tail = Some(log_handle);
-            }
-            Err(e) => {
-                // Shut down daemon if it was started but RPC failed
-                self.stop_background_tasks().await;
-                self.shutdown_daemon().await;
-                let mut app = self.app.write().await;
-                app.clear_node_data();
-                app.connection = ActiveConnection::None;
-                app.has_direct_node = false;
-                app.integrated_node.status = DaemonStatus::Error(e.to_string());
-                app.mark_dirty();
-            }
-        }
-    }
-
-    /// Stop the embedded node, then fall back to the remote node, if there is one.
-    async fn stop_daemon(&mut self) {
-        self.stop_all().await;
-        self.connect_remote().await;
-    }
-
-    /// Stop polling and the embedded node, and clear all node data.
+    /// Stop polling and clear all node data.
     async fn stop_all(&mut self) {
-        let had_daemon = self.daemon.is_some();
-        if had_daemon {
-            let mut app = self.app.write().await;
-            app.integrated_node.status = DaemonStatus::Stopping;
-            app.mark_dirty();
+        self.polling.abort_all();
+        if let Some(rpc) = self.rpc.take() {
+            let _ = rpc.disconnect().await;
         }
-        self.stop_background_tasks().await;
-        self.shutdown_daemon().await;
 
         let mut app = self.app.write().await;
         save_analytics_cache(&app);
         app.clear_node_data();
         app.connection = ActiveConnection::None;
         app.has_direct_node = false;
-        if had_daemon {
-            app.integrated_node.status = DaemonStatus::Stopped;
-            app.integrated_node.started_at = None;
-        }
         app.mark_dirty();
-    }
-
-    async fn stop_background_tasks(&mut self) {
-        self.polling.abort_all();
-        if let Some(h) = self.log_tail.take() {
-            h.abort();
-        }
-        if let Some(rpc) = self.rpc.take() {
-            let _ = rpc.disconnect().await;
-        }
-    }
-
-    /// Shut down the embedded daemon (blocks until the node finishes, so run it off the
-    /// async worker threads).
-    async fn shutdown_daemon(&mut self) {
-        if let Some(mut handle) = self.daemon.take() {
-            let _ = tokio::task::spawn_blocking(move || handle.shutdown()).await;
-        }
     }
 
     fn execute_rpc(&self, method: String, args: Vec<String>) {

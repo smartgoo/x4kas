@@ -1,7 +1,7 @@
 use eframe::egui::{self, RichText, Ui};
 
 use super::theme;
-use super::widgets::{CARD_GAP, card, field_label, kv, kv_grid, placeholder, syncing_note, yes_no};
+use super::widgets::{CARD_GAP, card, field_label, kv, kv_grid, placeholder, yes_no};
 use crate::app::App;
 use crate::format::{format_hashrate, format_usd};
 use crate::rpc::types::{format_number, sompi_to_kas};
@@ -45,9 +45,6 @@ fn node_info(ui: &mut Ui, app: &App) {
             kv(ui, "Block Count", format_number(dag.block_count));
             kv(ui, "Header Count", format_number(dag.header_count));
         }
-        if app.is_daemon_active() {
-            kv(ui, "Mode", RichText::new("Embedded node").color(theme::OK));
-        }
         if let Some(ref url) = app.node.node_url {
             kv(ui, "URL", url);
         }
@@ -58,16 +55,6 @@ fn node_info(ui: &mut Ui, app: &App) {
 }
 
 fn network_stats(ui: &mut Ui, app: &App) {
-    if app.is_node_syncing() {
-        syncing_note(ui);
-        if let Some(ref info) = app.node.server_info {
-            kv_grid(ui, "network_syncing", |ui| {
-                kv(ui, "DAA Score", format_number(info.virtual_daa_score));
-            });
-        }
-        return;
-    }
-
     let Some(ref dag) = app.node.dag_info else {
         placeholder(ui, "Waiting for data…");
         return;
@@ -135,10 +122,6 @@ fn markets(ui: &mut Ui, app: &App) {
 }
 
 fn mempool_summary(ui: &mut Ui, app: &App) {
-    if app.is_node_syncing() {
-        syncing_note(ui);
-        return;
-    }
     let Some(ref mempool) = app.node.mempool_state else {
         placeholder(ui, "Waiting for data…");
         return;

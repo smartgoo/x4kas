@@ -7,7 +7,6 @@ mod connection;
 mod dashboard;
 mod help;
 mod mempool;
-mod node;
 mod rpc_explorer;
 mod theme;
 mod widgets;
@@ -19,20 +18,20 @@ use anyhow::Result;
 use eframe::egui::{self, Button, Event, Key, Modifiers, RichText, Stroke, ViewportCommand};
 use tokio::sync::{RwLock, oneshot};
 
-use crate::app::{ActiveConnection, App, ConnectionStatus, DaemonStatus, Tab};
+use crate::app::{ActiveConnection, App, ConnectionStatus, Tab};
 use crate::cli::CliArgs;
-use crate::config::{ConnectionKind, ConnectionSettings, DaemonConfig};
+use crate::config::{ConnectionKind, ConnectionSettings};
 use crate::controller::{self, CommandSender, ControllerArgs, RemoteTarget, UiCommand};
 use crate::rpc::market;
 use crate::rpc::types::format_number;
 use connection::ConnectionWindow;
 
 /// Start background tasks on `rt` and run the GUI on the current (main) thread.
-pub fn run(rt: &tokio::runtime::Runtime, args: CliArgs, daemon_config: DaemonConfig) -> Result<()> {
-    let app = Arc::new(RwLock::new(App::new(daemon_config.clone())));
+pub fn run(rt: &tokio::runtime::Runtime, args: CliArgs) -> Result<()> {
+    let app = Arc::new(RwLock::new(App::default()));
 
-    // `--url` overrides the saved connection choice; with neither a URL nor an
-    // auto-started node, open the connection window so the user can pick one.
+    // `--url` overrides the saved connection choice; without it, open the connection
+    // window so the user can pick one.
     let mut settings = ConnectionSettings::load().unwrap_or_default();
     let remote = args.url.clone().map(|url| {
         settings.kind = ConnectionKind::Url;
@@ -43,10 +42,7 @@ pub fn run(rt: &tokio::runtime::Runtime, args: CliArgs, daemon_config: DaemonCon
             network: args.network.clone(),
         }
     });
-    let connection = ConnectionWindow::new(
-        settings,
-        remote.is_none() && !daemon_config.auto_start_daemon,
-    );
+    let connection = ConnectionWindow::new(settings, remote.is_none());
 
     // Background tasks use `tokio::spawn`, so spawn them inside the runtime context.
     // The guard is dropped before the GUI starts: blocking lock calls from the main
@@ -61,7 +57,6 @@ pub fn run(rt: &tokio::runtime::Runtime, args: CliArgs, daemon_config: DaemonCon
                 remote,
                 refresh_interval_ms: args.refresh_interval_ms,
             },
-            daemon_config,
         )
     };
 
@@ -69,7 +64,12 @@ pub fn run(rt: &tokio::runtime::Runtime, args: CliArgs, daemon_config: DaemonCon
         viewport: egui::ViewportBuilder::default()
             .with_title("tui4kas")
             .with_inner_size([1280.0, 820.0])
-            .with_min_inner_size([800.0, 500.0]),
+            .with_min_inner_size([800.0, 500.0])
+            // macOS: hide the title bar and draw under it, so the window buttons sit on
+            // the top bar. No effect on other platforms.
+            .with_fullsize_content_view(true)
+            .with_titlebar_shown(false)
+            .with_title_shown(false),
         ..Default::default()
     };
 
@@ -108,7 +108,7 @@ impl GuiApp {
         }
     }
 
-    /// Defer window close until the controller has stopped the node and saved state.
+    /// Defer window close until the controller has disconnected and saved state.
     fn handle_close(&mut self, ctx: &egui::Context) {
         if ctx.input(|i| i.viewport().close_requested()) && !self.shutdown_complete {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
@@ -150,6 +150,7 @@ impl eframe::App for GuiApp {
 
         egui::TopBottomPanel::top("top_bar")
             .frame(bar_frame())
+            .exact_height(TITLE_BAR_HEIGHT)
             .show(ctx, |ui| top_bar(ui, &mut app, &mut self.show_help));
         // Added before the palette so it stays at the very bottom, below it.
         egui::TopBottomPanel::bottom("status_bar")
@@ -161,7 +162,6 @@ impl eframe::App for GuiApp {
             Tab::Dashboard => dashboard::show(ui, &app),
             Tab::Mempool => mempool::show(ui, &mut app),
             Tab::RpcExplorer => rpc_explorer::show(ui, &mut app, &self.cmd_tx),
-            Tab::IntegratedNode => node::show(ui, &mut app, &self.cmd_tx),
             Tab::Analytics => analytics::show(ui, &mut app),
             Tab::BlockDag => blockdag::show(ui, &mut app, &self.cmd_tx),
         });
@@ -173,33 +173,21 @@ impl eframe::App for GuiApp {
             egui::Modal::new(egui::Id::new("shutdown_modal")).show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    let msg = if app.integrated_node.status == DaemonStatus::Stopping {
-                        "Stopping node…"
-                    } else {
-                        "Shutting down…"
-                    };
-                    ui.label(msg);
+                    ui.label("Shutting down…");
                 });
             });
         }
 
-        // Keep time-based values (uptime, seconds behind sink, cursor blink) ticking.
-        // Wake on the next whole second rather than 1s from now, so the blink stays
-        // even when data updates trigger frames at arbitrary times.
+        // Keep time-based values (uptime, seconds behind sink) ticking. Wake on the
+        // next whole second rather than 1s from now, so they tick evenly even when
+        // data updates trigger frames at arbitrary times.
         let to_next_second = 1.0 - ctx.input(|i| i.time).fract();
         ctx.request_repaint_after(Duration::from_secs_f64(to_next_second));
     }
 }
 
 fn handle_shortcuts(ctx: &egui::Context, app: &mut App, show_help: &mut bool) {
-    const TAB_KEYS: [Key; 6] = [
-        Key::Num1,
-        Key::Num2,
-        Key::Num3,
-        Key::Num4,
-        Key::Num5,
-        Key::Num6,
-    ];
+    const TAB_KEYS: [Key; 5] = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5];
 
     // Works even while the palette input has focus.
     if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::K)) {
@@ -264,9 +252,37 @@ fn bar_frame() -> egui::Frame {
         .inner_margin(egui::Margin::symmetric(10, 4))
 }
 
+/// Height of the macOS title bar, which the top bar replaces; the window buttons are
+/// vertically centered in it.
+const TITLE_BAR_HEIGHT: f32 = 28.0;
+/// Room left of the brand for the macOS close/minimize/zoom buttons.
+const TRAFFIC_LIGHTS_WIDTH: f32 = 76.0;
+
+/// With the native title bar hidden, dragging the top bar's background moves the
+/// window and double-clicking it zooms. Widgets added afterwards take precedence.
+fn title_bar_drag(ui: &mut egui::Ui) {
+    let response = ui.interact(
+        ui.max_rect(),
+        egui::Id::new("title_bar_drag"),
+        egui::Sense::click_and_drag(),
+    );
+    if response.drag_started_by(egui::PointerButton::Primary) {
+        ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
+    }
+    if response.double_clicked() {
+        let maximized = ui.input(|i| i.viewport().maximized.unwrap_or(false));
+        ui.ctx()
+            .send_viewport_cmd(ViewportCommand::Maximized(!maximized));
+    }
+}
+
 /// Brand prompt, tmux-style tab strip, and the palette/help buttons.
 fn top_bar(ui: &mut egui::Ui, app: &mut App, show_help: &mut bool) {
-    ui.horizontal(|ui| {
+    title_bar_drag(ui);
+    ui.horizontal_centered(|ui| {
+        if cfg!(target_os = "macos") {
+            ui.add_space(TRAFFIC_LIGHTS_WIDTH);
+        }
         brand(ui);
         ui.add_space(12.0);
 
@@ -296,20 +312,13 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App, show_help: &mut bool) {
     });
 }
 
-/// `$ tui4kas█` with a cursor that blinks on the 1s repaint tick.
+/// `$ tui4kas`
 fn brand(ui: &mut egui::Ui) {
-    let cursor_on = (ui.input(|i| i.time) as u64).is_multiple_of(2);
-    let cursor = if cursor_on {
-        theme::ACCENT_BRIGHT
-    } else {
-        egui::Color32::TRANSPARENT
-    };
     ui.spacing_mut().item_spacing.x = 0.0;
     ui.label(RichText::new("$ ").color(theme::TEXT_DIM).size(15.0));
     ui.label(RichText::new("tui").color(theme::TEXT_BRIGHT).size(15.0));
     ui.label(RichText::new("4").color(theme::ACCENT_BRIGHT).size(15.0));
     ui.label(RichText::new("kas").color(theme::TEXT_BRIGHT).size(15.0));
-    ui.label(RichText::new("█").color(cursor).size(15.0));
 }
 
 /// A tab in the strip: the shortcut number, then the name. The active tab is inverted.
@@ -351,7 +360,6 @@ fn connection_summary(app: &App) -> String {
     let target = match app.connection {
         ActiveConnection::Url(ref url) => url.as_str(),
         ActiveConnection::Resolver => "public resolver",
-        ActiveConnection::Embedded => "embedded node",
         ActiveConnection::None => return "Not connected".to_string(),
     };
     match app.node.connection_status {
@@ -362,7 +370,7 @@ fn connection_summary(app: &App) -> String {
     }
 }
 
-/// Connection (click to change), embedded node, network, DAA score, poll latency and pause.
+/// Connection (click to change), network, DAA score, poll latency and pause.
 fn status_bar(ui: &mut egui::Ui, app: &mut App, connection: &mut ConnectionWindow) {
     ui.horizontal(|ui| {
         let (_, color) = theme::connection_status(&app.node.connection_status);
@@ -375,13 +383,6 @@ fn status_bar(ui: &mut egui::Ui, app: &mut App, connection: &mut ConnectionWindo
             .clicked()
         {
             connection.toggle();
-        }
-
-        if app.integrated_node.status != DaemonStatus::Stopped {
-            widgets::divider(ui);
-            let (text, color) = theme::daemon_status(&app.integrated_node.status);
-            widgets::field_label(ui, "node");
-            ui.label(RichText::new(text).color(color));
         }
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

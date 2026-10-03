@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::analytics::{AggregatedView, AnalyticsEngine};
-use crate::config::DaemonConfig;
 use crate::rpc::hash_links::{HashLink, block_hash_links};
 use crate::rpc::types::*;
 
@@ -148,7 +147,6 @@ pub enum Tab {
     BlockDag,
     Analytics,
     RpcExplorer,
-    IntegratedNode,
 }
 
 impl Tab {
@@ -159,7 +157,6 @@ impl Tab {
             Tab::BlockDag,
             Tab::Analytics,
             Tab::RpcExplorer,
-            Tab::IntegratedNode,
         ]
     }
 
@@ -170,7 +167,6 @@ impl Tab {
             Tab::BlockDag => "3:BlockDAG",
             Tab::Analytics => "4:Analytics",
             Tab::RpcExplorer => "5:RPC Cmds",
-            Tab::IntegratedNode => "6:Node",
         }
     }
 
@@ -240,35 +236,6 @@ impl TimeWindow {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DaemonStatus {
-    Stopped,
-    Starting,
-    Running,
-    Stopping,
-    Error(String),
-}
-
-pub struct IntegratedNodeState {
-    pub config: DaemonConfig,
-    pub status: DaemonStatus,
-    pub log_lines: VecDeque<String>,
-    pub started_at: Option<std::time::Instant>,
-    pub status_message: Option<(String, bool)>, // (message, is_error)
-}
-
-impl IntegratedNodeState {
-    pub fn new(config: DaemonConfig) -> Self {
-        Self {
-            config,
-            status: DaemonStatus::Stopped,
-            log_lines: VecDeque::new(),
-            started_at: None,
-            status_message: None,
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub enum ConnectionStatus {
     Disconnected,
@@ -284,7 +251,6 @@ pub enum ActiveConnection {
     None,
     Url(String),
     Resolver,
-    Embedded,
 }
 
 impl ActiveConnection {
@@ -293,7 +259,6 @@ impl ActiveConnection {
             ActiveConnection::None => "Not connected",
             ActiveConnection::Url(url) => url,
             ActiveConnection::Resolver => "Public resolver",
-            ActiveConnection::Embedded => "Embedded node",
         }
     }
 }
@@ -637,12 +602,10 @@ pub struct App {
     pub repaint: Option<RepaintFn>,
     pub has_direct_node: bool,
     pub connection: ActiveConnection,
-
-    pub integrated_node: IntegratedNodeState,
 }
 
-impl App {
-    pub fn new(daemon_config: DaemonConfig) -> Self {
+impl Default for App {
+    fn default() -> Self {
         Self {
             active_tab: Tab::Dashboard,
             node: NodeState::default(),
@@ -657,10 +620,11 @@ impl App {
             repaint: None,
             has_direct_node: false,
             connection: ActiveConnection::None,
-            integrated_node: IntegratedNodeState::new(daemon_config),
         }
     }
+}
 
+impl App {
     /// Ask the frontend to redraw after a state change.
     pub fn mark_dirty(&mut self) {
         if let Some(ref repaint) = self.repaint {
@@ -668,7 +632,6 @@ impl App {
         }
     }
 
-    /// Drop all data fetched from the current node, e.g. before switching nodes.
     /// How far the app's view lags the DAG tip: `now_ms` minus the sink's timestamp.
     /// Clamped at zero, since block timestamps can run slightly ahead of the local clock.
     pub fn seconds_behind_tip(&self, now_ms: u64) -> Option<f64> {
@@ -677,6 +640,7 @@ impl App {
             .map(|ts| now_ms.saturating_sub(ts) as f64 / 1000.0)
     }
 
+    /// Drop all data fetched from the current node, e.g. before switching nodes.
     pub fn clear_node_data(&mut self) {
         self.node = NodeState::default();
         self.analytics.engine = None;
@@ -689,14 +653,6 @@ impl App {
         self.dag_selection.block_loading = false;
         self.rpc_explorer.set_response(None);
         self.rpc_explorer.is_loading = false;
-    }
-
-    pub fn is_daemon_active(&self) -> bool {
-        matches!(self.integrated_node.status, DaemonStatus::Running)
-    }
-
-    pub fn is_node_syncing(&self) -> bool {
-        self.is_daemon_active() && !self.node.server_info.as_ref().is_some_and(|s| s.is_synced)
     }
 
     /// Open the detail popup for the mempool entry at `index`, if it exists.
@@ -749,7 +705,7 @@ mod tests {
 
     #[test]
     fn seconds_behind_tip_from_sink_timestamp() {
-        let mut app = App::new(DaemonConfig::default());
+        let mut app = App::default();
         assert_eq!(app.seconds_behind_tip(10_000), None);
         app.node.sink_timestamp_ms = Some(7_500);
         assert_eq!(app.seconds_behind_tip(10_000), Some(2.5));
@@ -759,7 +715,7 @@ mod tests {
 
     #[test]
     fn clear_node_data_resets_fetched_state() {
-        let mut app = App::new(DaemonConfig::default());
+        let mut app = App::default();
         app.node.node_url = Some("ws://node:17110".to_string());
         app.node.last_error = Some("boom".to_string());
         app.node.connection_status = ConnectionStatus::Connected;
@@ -789,7 +745,6 @@ mod tests {
         assert_eq!(ActiveConnection::None.label(), "Not connected");
         assert_eq!(ActiveConnection::Url("ws://x:1".into()).label(), "ws://x:1");
         assert_eq!(ActiveConnection::Resolver.label(), "Public resolver");
-        assert_eq!(ActiveConnection::Embedded.label(), "Embedded node");
     }
 
     // --- Tab ---
@@ -801,19 +756,17 @@ mod tests {
         assert_eq!(Tab::BlockDag.title(), "3:BlockDAG");
         assert_eq!(Tab::Analytics.title(), "4:Analytics");
         assert_eq!(Tab::RpcExplorer.title(), "5:RPC Cmds");
-        assert_eq!(Tab::IntegratedNode.title(), "6:Node");
     }
 
     #[test]
     fn tab_labels_strip_shortcut_prefix() {
         assert_eq!(Tab::Dashboard.label(), "Dashboard");
         assert_eq!(Tab::RpcExplorer.label(), "RPC Cmds");
-        assert_eq!(Tab::IntegratedNode.label(), "Node");
     }
 
     #[test]
     fn tab_index_matches_all_order() {
-        let mut app = App::new(DaemonConfig::default());
+        let mut app = App::default();
         for (i, tab) in Tab::all().iter().enumerate() {
             app.active_tab = *tab;
             assert_eq!(app.tab_index(), i);
@@ -822,7 +775,7 @@ mod tests {
 
     #[test]
     fn next_tab_cycles_forward() {
-        let mut app = App::new(DaemonConfig::default());
+        let mut app = App::default();
         assert_eq!(app.active_tab, Tab::Dashboard);
         app.next_tab();
         assert_eq!(app.active_tab, Tab::Mempool);
@@ -833,23 +786,14 @@ mod tests {
         app.next_tab();
         assert_eq!(app.active_tab, Tab::RpcExplorer);
         app.next_tab();
-        // With daemon feature, next is IntegratedNode; without, wraps to Dashboard
-        let last = *Tab::all().last().unwrap();
-        if last == Tab::RpcExplorer {
-            assert_eq!(app.active_tab, Tab::Dashboard); // wraps
-        } else {
-            assert_eq!(app.active_tab, last);
-            app.next_tab();
-            assert_eq!(app.active_tab, Tab::Dashboard); // wraps
-        }
+        assert_eq!(app.active_tab, Tab::Dashboard); // wraps
     }
 
     #[test]
     fn prev_tab_cycles_backward() {
-        let mut app = App::new(DaemonConfig::default());
+        let mut app = App::default();
         app.prev_tab();
-        let last = *Tab::all().last().unwrap();
-        assert_eq!(app.active_tab, last); // wraps from 0
+        assert_eq!(app.active_tab, Tab::RpcExplorer); // wraps from 0
         // Navigate back a couple
         app.active_tab = Tab::Analytics;
         app.prev_tab();
@@ -1233,7 +1177,7 @@ mod tests {
 
     #[test]
     fn open_mempool_detail_formats_entry_and_ignores_out_of_range() {
-        let mut app = App::new(DaemonConfig::default());
+        let mut app = App::default();
         app.node.mempool_state = Some(MempoolState {
             entry_count: 1,
             entries: vec![MempoolEntryInfo {

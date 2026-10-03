@@ -2,17 +2,11 @@ use eframe::egui::{self, RichText, Sense, Ui};
 use egui_extras::{Column, TableBuilder};
 
 use super::theme;
-use super::widgets::{
-    CARD_GAP, card, column_header, kv, kv_grid, placeholder, syncing_guard, yes_no,
-};
+use super::widgets::{CARD_GAP, card, column_header, kv, kv_grid, placeholder, yes_no};
 use crate::app::App;
 use crate::rpc::types::{format_number, sompi_to_kas};
 
 pub fn show(ui: &mut Ui, app: &mut App) {
-    if syncing_guard(ui, app, "Mempool") {
-        return;
-    }
-
     card(ui, "Mempool Summary", |ui| summary(ui, app));
     ui.add_space(CARD_GAP);
 

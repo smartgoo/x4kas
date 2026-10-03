@@ -12,27 +12,26 @@ cargo run -- --url ws://127.0.0.1:17110   # run against a node
 
 ## Architecture
 
-egui/eframe desktop GUI for monitoring a Kaspa L1 node via wRPC, with an optional embedded kaspad. (The name is historical; the Ratatui TUI was replaced by the GUI.)
+egui/eframe desktop GUI for monitoring a Kaspa L1 node via wRPC, connecting by URL or through the public resolver. (The name is historical; the Ratatui TUI was replaced by the GUI.)
 
 ### Threading model
 
 - `main` builds a tokio multi-thread `Runtime` by hand (no `#[tokio::main]`). eframe owns the **main thread**, which must stay **outside** the runtime context: `RwLock::blocking_read/blocking_write` panic inside it. `gui::run` enters the runtime only briefly to spawn background tasks, then drops the guard.
 - **Shared state:** `Arc<tokio::sync::RwLock<App>>`. The GUI takes `blocking_write` once per frame; background tasks use `.write().await`.
 - **Repaint:** background writers call `app.mark_dirty()`, which invokes the injected `App.repaint` hook (`ctx.request_repaint()`). The GUI also schedules a 1s repaint so clocks and uptime tick. Don't busy-repaint.
-- **Commands:** the GUI never awaits. It sends `UiCommand`s (`Connect(RemoteTarget)`, `Disconnect`, `StartDaemon`, `StopDaemon`, `ExecuteRpc`, `LookupBlock`, `RunCommandLine`, `Shutdown`) over an mpsc channel to the controller task, which writes results back into `App`.
-- **Connections:** exactly one active source at a time (`App.connection: ActiveConnection`): a URL, the public resolver (`RemoteTarget { url: None }`), or the embedded node. Switching calls `Controller::stop_all` (abort polling, stop the daemon, save the analytics cache, `App::clear_node_data`). Stopping the embedded node falls back to the remembered remote target. Mining and analytics only run with a direct node (`has_direct_node`: URL or embedded), not the resolver.
+- **Commands:** the GUI never awaits. It sends `UiCommand`s (`Connect(RemoteTarget)`, `Disconnect`, `ExecuteRpc`, `LookupBlock`, `RunCommandLine`, `Shutdown`) over an mpsc channel to the controller task, which writes results back into `App`.
+- **Connections:** exactly one active source at a time (`App.connection: ActiveConnection`): a URL or the public resolver (`RemoteTarget { url: None }`). Switching calls `Controller::stop_all` (abort polling, disconnect, save the analytics cache, `App::clear_node_data`). Mining and analytics only run with a direct node (`has_direct_node`: a URL), not the resolver. There is no embedded node for now.
 - **Task tracking:** every background task (node polling via `create_and_start_rpc`, mining, analytics) is stored in `PollingHandles` so `abort_all` stops it. Never spawn an untracked task that writes node data, or it keeps writing stale data after a switch.
-- **Graceful quit:** a close request while a node is running is cancelled, `Shutdown(oneshot)` is sent, a "Stopping node…" modal is shown, and the window closes once the controller signals completion (daemon stopped, analytics cache saved).
+- **Graceful quit:** a close request is cancelled, `Shutdown(oneshot)` is sent, a "Shutting down…" modal is shown, and the window closes once the controller signals completion (disconnected, analytics cache saved).
 
 ### Module Layout
 
-- `src/main.rs`: entry point. Parses CLI, loads `DaemonConfig`, builds the runtime, calls `gui::run`.
-- `src/app.rs`: central state. `App`, `Tab` (6 tabs), `CommandLine`, `RpcExplorerState`, `DagVisualizer`, `DagSelection`, analytics state (`TimeWindow`, `ViewMode`), and `mark_dirty()`.
+- `src/main.rs`: entry point. Parses CLI, builds the runtime, calls `gui::run`.
+- `src/app.rs`: central state. `App`, `Tab` (5 tabs), `CommandLine`, `RpcExplorerState`, `DagVisualizer`, `DagSelection`, analytics state (`TimeWindow`, `ViewMode`), and `mark_dirty()`.
 - `src/cli.rs`: clap args (`--url`, `--network`, `--refresh-interval-ms`).
-- `src/controller.rs`: the `UiCommand` enum, `RemoteTarget`, and the controller task. Owns the RPC manager, daemon handle, polling and log-tail handles. Handles the startup modes (`--url`, auto-start daemon, or idle with the connection window open), connect/disconnect, daemon start/stop, command-line execution, and shutdown.
-- `src/daemon.rs`: embedded kaspad (`DaemonHandle`).
-- `src/daemon_lifecycle.rs`: RPC creation, mining polling, log tailing, start-daemon-and-connect helpers.
-- `src/config.rs`: `DaemonConfig` (`~/.tui4kas/config.toml`) and `ConnectionSettings`/`ConnectionKind`, the last connection choice (`~/.tui4kas/connection.toml`).
+- `src/controller.rs`: the `UiCommand` enum, `RemoteTarget`, and the controller task. Owns the RPC manager and polling handles. Handles startup (`--url`, or idle with the connection window open), connect/disconnect, command-line execution, and shutdown.
+- `src/polling.rs`: `PollingHandles`, RPC creation (`create_and_start_rpc`) and mining polling.
+- `src/config.rs`: `data_dir()` (`~/.tui4kas`), `valid_networks()`, and `ConnectionSettings`/`ConnectionKind`, the last connection choice (`~/.tui4kas/connection.toml`).
 - `src/analytics.rs` / `src/analytics_streaming.rs`: chain analytics (per-chain-block `Metrics` rolled into 1m/10m buckets, `AggregatedView` per window) and its VSPC v2 streaming task (cache at `~/.tui4kas/analytics_cache.bin`, versioned by `CACHE_MAGIC`; bump it when the format changes). All data comes from the connected node.
 - `src/tx_inspect.rs`: per-transaction classification, mirroring Kaspalytics: protocol detection, output script classes, covenant/introspection/ZK opcode scanning, coinbase node-version parsing.
 - `src/format.rs`: pure formatting helpers (`format_hashrate`, `format_usd`, `format_kas`, …).
@@ -47,17 +46,16 @@ egui/eframe desktop GUI for monitoring a Kaspa L1 node via wRPC, with an optiona
 - `src/gui/blockdag.rs`: BlockDAG tab (custom painter DAG visualizer, metrics, GHOSTDAG stats, tip/parent lists, Block Info window).
 - `src/gui/analytics.rs`: Analytics tab, modeled on the Kaspalytics home page. Rows: Transaction Summary (tx count, TPS, output script classes; chart of txs per bin) / Fees (node fee-rate estimate, average and total accepted fees per window), Transaction Inspection (opcodes, covenants, protocols), Mining Share by Node Version / Mining Analysis, Top Senders / Top Receivers. Panels have a time window (`AnalyticsPanel`/`PanelState`) and most a Table/Chart toggle.
 - `src/gui/rpc_explorer.rs`: RPC Cmds tab (method list, argument form, Loop toggle, read-only JSON result viewer with 🔍 links on block hashes that run `get_block`).
-- `src/gui/node.rs`: Node tab (settings form bound to a `DaemonConfig` copy, Start/Stop/Save, status, log viewer).
-- `src/gui/connection.rs`: `ConnectionWindow`, opened from the status-bar connection button. Custom URL / public resolver / embedded node, network, Connect/Disconnect.
+- `src/gui/connection.rs`: `ConnectionWindow`, opened from the status-bar connection button. Custom URL / public resolver, network, Connect/Disconnect.
 - `src/gui/command.rs`: command palette (bottom panel: input, suggestions, output).
 - `src/gui/help.rs`: help window (shortcuts).
 - `src/gui/theme.rs`: palette constants, `apply` (monospace fonts + dark visuals, installed at startup), and status → label/color mapping.
-- `src/gui/widgets.rs`: shared building blocks (`card` with the title set into its border, `kv_grid`/`kv`, `section_title`, `column_header`, `primary_button`/`danger_button`, `placeholder`, `syncing_guard`/`syncing_note`, `CARD_GAP`).
+- `src/gui/widgets.rs`: shared building blocks (`card` with the title set into its border, `kv_grid`/`kv`, `section_title`, `column_header`, `primary_button`, `placeholder`, `direct_node_placeholder`, `CARD_GAP`).
 
 ### Dependencies
 
 - `eframe` / `egui_extras` 0.33, `egui_plot` 0.34. Upgrade them in lockstep; import egui as `eframe::egui`.
-- Kaspa crates (`kaspa-rpc-core`, `kaspa-wrpc-client`, `kaspad`, …) pinned to git rev `01b532e` (rusty-kaspa v2.1.0). Bump all of them together.
+- Kaspa crates (`kaspa-rpc-core`, `kaspa-wrpc-client`) pinned to git rev `01b532e` (rusty-kaspa v2.1.0). Bump all of them together.
 - `reqwest` for CoinGecko.
 - Rust edition 2024. Let-chains are fine, and clippy prefers them over nested `if let`.
 
@@ -70,5 +68,5 @@ egui/eframe desktop GUI for monitoring a Kaspa L1 node via wRPC, with an optiona
 - All RPC types have UI-friendly wrapper structs in `rpc/types.rs`. Don't use raw kaspa types in UI code.
 - Use `theme::*` colors and `widgets::*` helpers for a consistent look; never hard-code `Color32`s in views. Labels use `.weak()`. All text is already monospace, so don't add `.monospace()`.
 - Shortcuts are ignored while a text field has focus (`ctx.wants_keyboard_input()`), except Cmd/Ctrl+K.
-- Shortcuts: `1`–`6` tabs, Ctrl+Tab / Ctrl+Shift+Tab cycle, `p` pause, `:` or Cmd/Ctrl+K palette, `?`/F1 help, Esc closes popups.
+- Shortcuts: `1`–`5` tabs, Ctrl+Tab / Ctrl+Shift+Tab cycle, `p` pause, `:` or Cmd/Ctrl+K palette, `?`/F1 help, Esc closes popups.
 - 36 read-only RPC methods (listed in `rpc/methods.rs`) are available in both the RPC Cmds tab and the command palette (`method arg1 arg2 …`; lists are comma-separated). Responses are pretty-printed JSON (`to_json`; wrap bare values in a `json!` object). To add one, add it to `RPC_METHODS` and a match arm in `RpcManager::execute_rpc_call`; a test checks every method has an arm. State-changing calls (`submit_*`, `add_peer`, `ban`/`unban`, `resolve_finality_conflict`, `shutdown`) are intentionally not exposed.

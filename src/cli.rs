@@ -4,7 +4,7 @@ use clap::Parser;
 #[command(name = "tui4kas", version, about = "Desktop monitor for Kaspa L1")]
 pub struct CliArgs {
     /// wRPC endpoint URL (e.g., ws://127.0.0.1:17110).
-    /// If omitted, choose a connection (URL, public resolver or embedded node) in the app.
+    /// If omitted, choose a connection (URL or public resolver) in the app.
     #[arg(short, long)]
     pub url: Option<String>,
 

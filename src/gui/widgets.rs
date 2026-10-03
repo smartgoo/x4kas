@@ -83,11 +83,6 @@ pub fn placeholder(ui: &mut Ui, text: &str) {
     ui.label(RichText::new(text).weak());
 }
 
-/// Inline "Node is syncing…" notice for cards that need a synced node.
-pub fn syncing_note(ui: &mut Ui) {
-    ui.label(RichText::new("Node is syncing…").color(theme::WARN));
-}
-
 pub fn yes_no(value: bool) -> &'static str {
     if value { "Yes" } else { "No" }
 }
@@ -97,36 +92,12 @@ pub fn primary_button(text: &str) -> Button<'static> {
     Button::new(RichText::new(text).color(theme::BG_DEEP)).fill(theme::ACCENT)
 }
 
-/// A destructive action, e.g. stopping the node.
-pub fn danger_button(text: &str) -> Button<'static> {
-    Button::new(RichText::new(text).color(theme::ERROR)).stroke(Stroke::new(1.0_f32, theme::ERROR))
-}
-
 /// A thin vertical divider between status bar segments.
 pub fn divider(ui: &mut Ui) {
     ui.label(RichText::new("│").color(theme::BORDER_HI));
 }
 
-/// Show a "Node is syncing…" notice for tabs that need a synced node.
-/// Returns `true` if the notice was shown (the caller should skip its content).
-pub fn syncing_guard(ui: &mut Ui, app: &App, title: &str) -> bool {
-    if !app.is_node_syncing() {
-        return false;
-    }
-    ui.vertical_centered(|ui| {
-        ui.add_space(ui.available_height() / 3.0);
-        ui.spinner();
-        ui.label(
-            RichText::new(format!(
-                "Node is syncing… {title} data will be available once synced."
-            ))
-            .color(theme::WARN),
-        );
-    });
-    true
-}
-
-/// Placeholder text for data that needs a direct node (URL or embedded), not the resolver.
+/// Placeholder text for data that needs a direct node (a URL), not the resolver.
 pub fn direct_node_placeholder<'a>(app: &App, waiting: &'a str) -> &'a str {
     match app.connection {
         _ if app.has_direct_node => waiting,

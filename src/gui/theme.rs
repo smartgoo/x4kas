@@ -8,7 +8,7 @@ use eframe::egui::{
     TextStyle, Theme, Visuals, vec2,
 };
 
-use crate::app::{ConnectionStatus, DaemonStatus};
+use crate::app::ConnectionStatus;
 
 // ── Surfaces ──
 /// Main background (central panel, cards).
@@ -151,15 +151,5 @@ pub fn connection_status(status: &ConnectionStatus) -> (&'static str, Color32) {
         ConnectionStatus::Connecting => ("Connecting…", WARN),
         ConnectionStatus::Disconnected => ("Disconnected", ERROR),
         ConnectionStatus::Error(_) => ("Error", ERROR),
-    }
-}
-
-pub fn daemon_status(status: &DaemonStatus) -> (&'static str, Color32) {
-    match status {
-        DaemonStatus::Stopped => ("Stopped", TEXT_DIM),
-        DaemonStatus::Starting => ("Starting…", WARN),
-        DaemonStatus::Running => ("Running", OK),
-        DaemonStatus::Stopping => ("Stopping…", WARN),
-        DaemonStatus::Error(_) => ("Error", ERROR),
     }
 }

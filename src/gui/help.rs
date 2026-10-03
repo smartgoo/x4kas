@@ -6,7 +6,7 @@ use super::theme;
 use super::widgets::section_title;
 
 const SHORTCUTS: &[(&str, &str)] = &[
-    ("1 – 6", "Switch tab"),
+    ("1 – 5", "Switch tab"),
     ("Ctrl+Tab / Ctrl+Shift+Tab", "Next / previous tab"),
     ("P", "Pause / resume polling"),
     (": or ⌘K / Ctrl+K", "Open command palette"),

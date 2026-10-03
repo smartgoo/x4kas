@@ -1,17 +1,16 @@
-//! Connection window: pick a custom wRPC URL, the public resolver, or the embedded node.
+//! Connection window: pick a custom wRPC URL or the public resolver.
 
 use eframe::egui::{self, Button, ComboBox, RichText, TextEdit, Ui};
 
+use super::theme;
 use super::widgets::{field_label, kv_grid, primary_button};
-use super::{node, theme};
-use crate::app::{ActiveConnection, App, ConnectionStatus, DaemonStatus, Tab};
-use crate::config::{ConnectionKind, ConnectionSettings, DaemonConfig};
+use crate::app::{ActiveConnection, App, ConnectionStatus};
+use crate::config::{self, ConnectionKind, ConnectionSettings};
 use crate::controller::{CommandSender, RemoteTarget, UiCommand};
 
-const KINDS: [(ConnectionKind, &str); 3] = [
+const KINDS: [(ConnectionKind, &str); 2] = [
     (ConnectionKind::Url, "Custom URL"),
     (ConnectionKind::Resolver, "Public resolver"),
-    (ConnectionKind::Embedded, "Embedded node"),
 ];
 
 pub struct ConnectionWindow {
@@ -63,10 +62,6 @@ impl ConnectionWindow {
         });
         ui.add_space(4.0);
 
-        let daemon_running = !matches!(
-            app.integrated_node.status,
-            DaemonStatus::Stopped | DaemonStatus::Error(_)
-        );
         match self.form.kind {
             ConnectionKind::Url => {
                 kv_grid(ui, "connection_url", |ui| {
@@ -81,7 +76,6 @@ impl ConnectionWindow {
                     network_combo(ui, &mut self.form.network);
                     ui.end_row();
                 });
-                note(ui, "Borsh wRPC ports: mainnet 17110 · testnets 17210");
             }
             ConnectionKind::Resolver => {
                 kv_grid(ui, "connection_resolver", |ui| {
@@ -95,42 +89,25 @@ impl ConnectionWindow {
                      Mining and analytics need a direct node and are disabled.",
                 );
             }
-            ConnectionKind::Embedded => {
-                note(
-                    ui,
-                    &format!(
-                        "Runs kaspad inside the app using the Node tab settings (network: {}).",
-                        app.integrated_node.config.network
-                    ),
-                );
-                if ui.link("Open Node tab").clicked() {
-                    app.active_tab = Tab::IntegratedNode;
-                    self.open = false;
-                }
-            }
         }
 
-        if daemon_running && self.form.kind != ConnectionKind::Embedded {
-            ui.label(RichText::new("Connecting will stop the embedded node.").color(theme::WARN));
-        }
         if let Some(ref err) = self.error {
             ui.label(RichText::new(err).color(theme::ERROR));
         }
         ui.add_space(8.0);
 
         ui.horizontal(|ui| {
-            let (label, can_connect) = match self.form.kind {
-                ConnectionKind::Url => ("Connect", !self.form.url.trim().is_empty()),
-                ConnectionKind::Resolver => ("Connect", true),
-                ConnectionKind::Embedded => (
-                    "▶ Start node",
-                    !daemon_running && !app.integrated_node.config.app_dir.trim().is_empty(),
-                ),
+            let can_connect = match self.form.kind {
+                ConnectionKind::Url => !self.form.url.trim().is_empty(),
+                ConnectionKind::Resolver => true,
             };
-            if ui.add_enabled(can_connect, primary_button(label)).clicked() {
-                self.connect(app, cmd_tx);
+            if ui
+                .add_enabled(can_connect, primary_button("Connect"))
+                .clicked()
+            {
+                self.connect(cmd_tx);
             }
-            let connected = app.connection != ActiveConnection::None || daemon_running;
+            let connected = app.connection != ActiveConnection::None;
             if ui
                 .add_enabled(connected, Button::new("Disconnect"))
                 .clicked()
@@ -140,7 +117,7 @@ impl ConnectionWindow {
         });
     }
 
-    fn connect(&mut self, app: &mut App, cmd_tx: &CommandSender) {
+    fn connect(&mut self, cmd_tx: &CommandSender) {
         self.form.url = self.form.url.trim().to_string();
         self.error = self
             .form
@@ -148,16 +125,11 @@ impl ConnectionWindow {
             .err()
             .map(|e| format!("Could not save connection settings: {e}"));
 
-        match self.form.kind {
-            ConnectionKind::Embedded => node::start_daemon(&mut app.integrated_node, cmd_tx),
-            kind => {
-                let target = RemoteTarget {
-                    url: (kind == ConnectionKind::Url).then(|| self.form.url.clone()),
-                    network: self.form.network.clone(),
-                };
-                let _ = cmd_tx.send(UiCommand::Connect(target));
-            }
-        }
+        let target = RemoteTarget {
+            url: (self.form.kind == ConnectionKind::Url).then(|| self.form.url.clone()),
+            network: self.form.network.clone(),
+        };
+        let _ = cmd_tx.send(UiCommand::Connect(target));
         if self.error.is_none() {
             self.open = false;
         }
@@ -180,7 +152,7 @@ fn network_combo(ui: &mut Ui, network: &mut String) {
     ComboBox::from_id_salt("connection_network")
         .selected_text(network.as_str())
         .show_ui(ui, |ui| {
-            for n in DaemonConfig::valid_networks() {
+            for n in config::valid_networks() {
                 ui.selectable_value(network, n.to_string(), *n);
             }
         });

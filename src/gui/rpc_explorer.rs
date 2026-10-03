@@ -3,19 +3,13 @@ use std::time::Instant;
 use eframe::egui::{self, Button, ComboBox, RichText, TextEdit, Ui, text::CCursor};
 
 use super::theme;
-use super::widgets::{
-    field_label, kv_grid, placeholder, primary_button, section_title, syncing_guard,
-};
+use super::widgets::{field_label, kv_grid, placeholder, primary_button, section_title};
 use crate::app::{App, RpcExplorerState};
 use crate::controller::{CommandSender, UiCommand};
 use crate::rpc::hash_links::HashLink;
 use crate::rpc::methods::{self, ParamKind, RpcMethod};
 
 pub fn show(ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
-    if syncing_guard(ui, app, "RPC Cmds") {
-        return;
-    }
-
     let list_width = method_list_width(ui);
     egui::SidePanel::left("rpc_methods")
         .resizable(true)

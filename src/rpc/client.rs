@@ -106,10 +106,19 @@ impl RpcManager {
     async fn poll_once(client: &KaspaRpcClient, state: &Arc<RwLock<App>>) {
         let start = std::time::Instant::now();
 
-        // Check if daemon is active and not yet synced — only poll server_info.
-        // Write lock is acquired once for server_info + is_node_syncing() check,
-        // then dropped before the parallel RPC calls to avoid blocking the UI.
-        let server_info = client.get_server_info().await;
+        let (server_info, dag_info, mempool, supply, fee_estimate, sink_blue_score) = tokio::join!(
+            client.get_server_info(),
+            client.get_block_dag_info(),
+            client.get_mempool_entries(true, false),
+            client.get_coin_supply(),
+            client.get_fee_estimate(),
+            client.get_sink_blue_score(),
+        );
+        // Header only (no transactions) of the sink, for "seconds behind tip".
+        let sink_block = match dag_info {
+            Ok(ref info) => Some(client.get_block(info.sink, false).await),
+            Err(_) => None,
+        };
 
         let mut app = state.write().await;
         let mut errors: Vec<String> = Vec::new();
@@ -119,90 +128,57 @@ impl RpcManager {
             Err(e) => errors.push(format!("server_info: {}", e)),
         }
 
-        let is_daemon_syncing = app.is_node_syncing();
-
-        // Release lock before making remaining RPC calls
-        drop(app);
-
-        if !is_daemon_syncing {
-            let (dag_info, mempool, supply, fee_estimate, sink_blue_score) = tokio::join!(
-                client.get_block_dag_info(),
-                client.get_mempool_entries(true, false),
-                client.get_coin_supply(),
-                client.get_fee_estimate(),
-                client.get_sink_blue_score(),
-            );
-            // Header only (no transactions) of the sink, for "seconds behind tip".
-            let sink_block = match dag_info {
-                Ok(ref info) => Some(client.get_block(info.sink, false).await),
-                Err(_) => None,
-            };
-
-            let mut app = state.write().await;
-
-            match dag_info {
-                Ok(v) => {
-                    let info: crate::rpc::types::DagInfo = v.into();
-                    app.node
-                        .dag_visualizer
-                        .update(&info.tip_hashes, &info.virtual_parent_hashes);
-                    app.node.dag_info = Some(info);
-                }
-                Err(e) => errors.push(format!("dag_info: {}", e)),
+        match dag_info {
+            Ok(v) => {
+                let info: crate::rpc::types::DagInfo = v.into();
+                app.node
+                    .dag_visualizer
+                    .update(&info.tip_hashes, &info.virtual_parent_hashes);
+                app.node.dag_info = Some(info);
             }
-            match mempool {
-                Ok(v) => app.node.mempool_state = Some(v.into()),
-                Err(e) => errors.push(format!("mempool: {}", e)),
-            }
-            match supply {
-                Ok(v) => app.node.coin_supply = Some(v.into()),
-                Err(e) => errors.push(format!("coin_supply: {}", e)),
-            }
-            match fee_estimate {
-                Ok(v) => app.node.fee_estimate = Some(v.into()),
-                Err(e) => errors.push(format!("fee_estimate: {}", e)),
-            }
-            match sink_blue_score {
-                Ok(v) => app.node.sink_blue_score = Some(v),
-                Err(e) => errors.push(format!("sink_blue_score: {}", e)),
-            }
-            match sink_block {
-                Some(Ok(block)) => app.node.sink_timestamp_ms = Some(block.header.timestamp),
-                Some(Err(e)) => errors.push(format!("sink_block: {}", e)),
-                None => {}
-            }
-
-            if let Some(dag) = app.node.dag_info.clone() {
-                let blue = app.node.sink_blue_score;
-                app.node.dag_stats.update(&dag, blue);
-            }
-
-            app.node.node_url = client.url();
-            if let Some(desc) = client.node_descriptor() {
-                app.node.node_uid = Some(desc.uid.clone());
-            }
-
-            let poll_duration_ms = start.elapsed().as_secs_f64() * 1000.0;
-            app.node.last_refresh = Some(std::time::Instant::now());
-            app.node.last_poll_duration_ms = Some(poll_duration_ms);
-            app.node.last_error = if errors.is_empty() {
-                None
-            } else {
-                Some(errors.join("; "))
-            };
-            app.mark_dirty();
-        } else {
-            let mut app = state.write().await;
-            let poll_duration_ms = start.elapsed().as_secs_f64() * 1000.0;
-            app.node.last_refresh = Some(std::time::Instant::now());
-            app.node.last_poll_duration_ms = Some(poll_duration_ms);
-            app.node.last_error = if errors.is_empty() {
-                None
-            } else {
-                Some(errors.join("; "))
-            };
-            app.mark_dirty();
+            Err(e) => errors.push(format!("dag_info: {}", e)),
         }
+        match mempool {
+            Ok(v) => app.node.mempool_state = Some(v.into()),
+            Err(e) => errors.push(format!("mempool: {}", e)),
+        }
+        match supply {
+            Ok(v) => app.node.coin_supply = Some(v.into()),
+            Err(e) => errors.push(format!("coin_supply: {}", e)),
+        }
+        match fee_estimate {
+            Ok(v) => app.node.fee_estimate = Some(v.into()),
+            Err(e) => errors.push(format!("fee_estimate: {}", e)),
+        }
+        match sink_blue_score {
+            Ok(v) => app.node.sink_blue_score = Some(v),
+            Err(e) => errors.push(format!("sink_blue_score: {}", e)),
+        }
+        match sink_block {
+            Some(Ok(block)) => app.node.sink_timestamp_ms = Some(block.header.timestamp),
+            Some(Err(e)) => errors.push(format!("sink_block: {}", e)),
+            None => {}
+        }
+
+        if let Some(dag) = app.node.dag_info.clone() {
+            let blue = app.node.sink_blue_score;
+            app.node.dag_stats.update(&dag, blue);
+        }
+
+        app.node.node_url = client.url();
+        if let Some(desc) = client.node_descriptor() {
+            app.node.node_uid = Some(desc.uid.clone());
+        }
+
+        let poll_duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+        app.node.last_refresh = Some(std::time::Instant::now());
+        app.node.last_poll_duration_ms = Some(poll_duration_ms);
+        app.node.last_error = if errors.is_empty() {
+            None
+        } else {
+            Some(errors.join("; "))
+        };
+        app.mark_dirty();
     }
 
     /// Run a read-only RPC method from the RPC Cmds tab or command palette. Missing or

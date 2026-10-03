@@ -140,8 +140,13 @@ fn current(ui: &mut Ui, app: &App) {
     let (text, color) = theme::connection_status(&app.node.connection_status);
     ui.horizontal(|ui| {
         ui.label(RichText::new("●").color(color));
-        ui.label(RichText::new(text).color(color));
-        ui.label(RichText::new(app.connection.label()).weak());
+        // With no target, "Not connected" says it all; otherwise status + target.
+        if app.connection == ActiveConnection::None {
+            ui.label(RichText::new(app.connection.label()).color(color));
+        } else {
+            ui.label(RichText::new(text).color(color));
+            ui.label(RichText::new(app.connection.label()).weak());
+        }
     });
     if let ConnectionStatus::Error(ref e) = app.node.connection_status {
         ui.label(RichText::new(e).color(theme::ERROR));

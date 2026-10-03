@@ -176,9 +176,7 @@ fn method_list(ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
             continue;
         };
         let selected = i == app.rpc_explorer.selected_method;
-        let response = ui
-            .selectable_label(selected, method_label(method))
-            .on_hover_text(format!("{}\n\n{}", method.description, method.usage()));
+        let response = ui.selectable_label(selected, method_label(method));
         if response.clicked() {
             if !selected {
                 app.rpc_explorer.select(i);

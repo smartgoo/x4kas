@@ -4,7 +4,6 @@ use super::theme;
 use super::widgets::{CARD_GAP, card, field_label, kv, kv_grid, placeholder, syncing_guard};
 use crate::app::{App, DagFocus, DagVisualizer};
 use crate::controller::{CommandSender, UiCommand};
-use crate::format::truncate_hash;
 use crate::rpc::types::format_number;
 
 const CANVAS_HEIGHT: f32 = 170.0;
@@ -164,7 +163,7 @@ fn metrics(ui: &mut Ui, app: &App) {
 
 fn hash_kv(ui: &mut Ui, label: &str, hash: &str) {
     field_label(ui, label);
-    ui.label(truncate_hash(hash)).on_hover_text(hash);
+    ui.label(hash);
     ui.end_row();
 }
 

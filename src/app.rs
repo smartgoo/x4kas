@@ -146,7 +146,6 @@ pub enum Tab {
     Dashboard,
     Mempool,
     BlockDag,
-    Mining,
     Analytics,
     RpcExplorer,
     IntegratedNode,
@@ -158,7 +157,6 @@ impl Tab {
             Tab::Dashboard,
             Tab::Mempool,
             Tab::BlockDag,
-            Tab::Mining,
             Tab::Analytics,
             Tab::RpcExplorer,
             Tab::IntegratedNode,
@@ -170,10 +168,9 @@ impl Tab {
             Tab::Dashboard => "1:Dashboard",
             Tab::Mempool => "2:Mempool",
             Tab::BlockDag => "3:BlockDAG",
-            Tab::Mining => "4:Mining",
-            Tab::Analytics => "5:Analytics",
-            Tab::RpcExplorer => "6:RPC Cmds",
-            Tab::IntegratedNode => "7:Node",
+            Tab::Analytics => "4:Analytics",
+            Tab::RpcExplorer => "5:RPC Cmds",
+            Tab::IntegratedNode => "6:Node",
         }
     }
 
@@ -743,10 +740,9 @@ mod tests {
         assert_eq!(Tab::Dashboard.title(), "1:Dashboard");
         assert_eq!(Tab::Mempool.title(), "2:Mempool");
         assert_eq!(Tab::BlockDag.title(), "3:BlockDAG");
-        assert_eq!(Tab::Mining.title(), "4:Mining");
-        assert_eq!(Tab::Analytics.title(), "5:Analytics");
-        assert_eq!(Tab::RpcExplorer.title(), "6:RPC Cmds");
-        assert_eq!(Tab::IntegratedNode.title(), "7:Node");
+        assert_eq!(Tab::Analytics.title(), "4:Analytics");
+        assert_eq!(Tab::RpcExplorer.title(), "5:RPC Cmds");
+        assert_eq!(Tab::IntegratedNode.title(), "6:Node");
     }
 
     #[test]
@@ -774,8 +770,6 @@ mod tests {
         app.next_tab();
         assert_eq!(app.active_tab, Tab::BlockDag);
         app.next_tab();
-        assert_eq!(app.active_tab, Tab::Mining);
-        app.next_tab();
         assert_eq!(app.active_tab, Tab::Analytics);
         app.next_tab();
         assert_eq!(app.active_tab, Tab::RpcExplorer);
@@ -799,8 +793,6 @@ mod tests {
         assert_eq!(app.active_tab, last); // wraps from 0
         // Navigate back a couple
         app.active_tab = Tab::Analytics;
-        app.prev_tab();
-        assert_eq!(app.active_tab, Tab::Mining);
         app.prev_tab();
         assert_eq!(app.active_tab, Tab::BlockDag);
     }

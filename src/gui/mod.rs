@@ -7,7 +7,6 @@ mod connection;
 mod dashboard;
 mod help;
 mod mempool;
-mod mining;
 mod node;
 mod rpc_explorer;
 mod theme;
@@ -161,7 +160,6 @@ impl eframe::App for GuiApp {
         egui::CentralPanel::default().show(ctx, |ui| match app.active_tab {
             Tab::Dashboard => dashboard::show(ui, &app),
             Tab::Mempool => mempool::show(ui, &mut app),
-            Tab::Mining => mining::show(ui, &app),
             Tab::RpcExplorer => rpc_explorer::show(ui, &mut app, &self.cmd_tx),
             Tab::IntegratedNode => node::show(ui, &mut app, &self.cmd_tx),
             Tab::Analytics => analytics::show(ui, &mut app),
@@ -194,14 +192,13 @@ impl eframe::App for GuiApp {
 }
 
 fn handle_shortcuts(ctx: &egui::Context, app: &mut App, show_help: &mut bool) {
-    const TAB_KEYS: [Key; 7] = [
+    const TAB_KEYS: [Key; 6] = [
         Key::Num1,
         Key::Num2,
         Key::Num3,
         Key::Num4,
         Key::Num5,
         Key::Num6,
-        Key::Num7,
     ];
 
     // Works even while the palette input has focus.

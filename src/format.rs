@@ -30,17 +30,6 @@ pub fn format_usd(value: f64) -> String {
     }
 }
 
-pub fn truncate_hash(hash: &str) -> String {
-    let char_count = hash.chars().count();
-    if char_count > 24 {
-        let prefix: String = hash.chars().take(12).collect();
-        let suffix: String = hash.chars().skip(char_count - 12).collect();
-        format!("{}...{}", prefix, suffix)
-    } else {
-        hash.to_string()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,42 +110,5 @@ mod tests {
     #[test]
     fn format_hashrate_small() {
         assert_eq!(format_hashrate(500.0), "500.00 H/s");
-    }
-
-    // --- truncate_hash ---
-
-    #[test]
-    fn truncate_hash_short() {
-        assert_eq!(truncate_hash("abcdef"), "abcdef");
-    }
-
-    #[test]
-    fn truncate_hash_exactly_24() {
-        let hash = "a".repeat(24);
-        assert_eq!(truncate_hash(&hash), hash);
-    }
-
-    #[test]
-    fn truncate_hash_long() {
-        let hash = "abcdefghijklmnopqrstuvwxyz0123456789";
-        let result = truncate_hash(hash);
-        // first 12 + "..." + last 12
-        assert_eq!(result, "abcdefghijkl...yz0123456789");
-        assert_eq!(result.len(), 27);
-    }
-
-    #[test]
-    fn truncate_hash_empty() {
-        assert_eq!(truncate_hash(""), "");
-    }
-
-    #[test]
-    fn truncate_hash_realistic() {
-        let hash = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
-        let result = truncate_hash(hash);
-        assert_eq!(result.len(), 27); // 12 + 3 + 12
-        assert!(result.starts_with("abcdef123456"));
-        assert!(result.ends_with("ef1234567890"));
-        assert!(result.contains("..."));
     }
 }

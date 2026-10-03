@@ -126,14 +126,8 @@ pub fn start_analytics_streaming(
                         let mut reorg_msg = None;
                         for hash in &removed {
                             if !eng.remove_block(hash) {
-                                let short = if hash.len() > 16 {
-                                    format!("{}…", &hash[..16])
-                                } else {
-                                    hash.clone()
-                                };
                                 reorg_msg = Some(format!(
-                                    "Reorg detected affecting finalized block {}. Analytics may be slightly inaccurate.",
-                                    short
+                                    "Reorg detected affecting finalized block {hash}. Analytics may be slightly inaccurate.",
                                 ));
                             }
                         }

@@ -27,14 +27,14 @@ egui/eframe desktop GUI for monitoring a Kaspa L1 node via wRPC, with an optiona
 ### Module Layout
 
 - `src/main.rs`: entry point. Parses CLI, loads `DaemonConfig`, builds the runtime, calls `gui::run`.
-- `src/app.rs`: central state. `App`, `Tab` (7 tabs), `CommandLine`, `RpcExplorerState`, `DagVisualizer`, `DagSelection`, analytics state (`TimeWindow`, `ViewMode`), and `mark_dirty()`.
+- `src/app.rs`: central state. `App`, `Tab` (6 tabs), `CommandLine`, `RpcExplorerState`, `DagVisualizer`, `DagSelection`, analytics state (`TimeWindow`, `ViewMode`), and `mark_dirty()`.
 - `src/cli.rs`: clap args (`--url`, `--network`, `--refresh-interval-ms`).
 - `src/controller.rs`: the `UiCommand` enum, `RemoteTarget`, and the controller task. Owns the RPC manager, daemon handle, polling and log-tail handles. Handles the startup modes (`--url`, auto-start daemon, or idle with the connection window open), connect/disconnect, daemon start/stop, command-line execution, and shutdown.
 - `src/daemon.rs`: embedded kaspad (`DaemonHandle`).
 - `src/daemon_lifecycle.rs`: RPC creation, mining polling, log tailing, start-daemon-and-connect helpers.
 - `src/config.rs`: `DaemonConfig` (`~/.tui4kas/config.toml`) and `ConnectionSettings`/`ConnectionKind`, the last connection choice (`~/.tui4kas/connection.toml`).
 - `src/analytics.rs` / `src/analytics_streaming.rs`: chain analytics aggregation and its streaming task (cache at `~/.tui4kas/analytics_cache.bin`).
-- `src/format.rs`: pure formatting helpers (`format_hashrate`, `format_usd`, `truncate_hash`, …).
+- `src/format.rs`: pure formatting helpers (`format_hashrate`, `format_usd`, …).
 - `src/rpc/client.rs`: `RpcManager`. Connect, background polling, RPC execution, mining/analytics fetches, block lookup.
 - `src/rpc/market.rs`: CoinGecko market polling (every 60s).
 - `src/rpc/methods.rs`: `RPC_METHODS` catalog (name, description, typed params with defaults), `resolve_args`, and argument parsers.
@@ -42,10 +42,9 @@ egui/eframe desktop GUI for monitoring a Kaspa L1 node via wRPC, with an optiona
 - `src/rpc/types.rs`: UI-friendly structs with `From` impls for kaspa RPC types.
 - `src/gui/mod.rs`: `GuiApp` (`eframe::App`). Frame loop, top bar (brand, tab strip, palette/help buttons), bottom status bar (connection, node, network, DAA, seconds behind the DAG tip, pause), keyboard shortcuts, quit handling.
 - `src/gui/dashboard.rs`: Dashboard tab (node info + block counts, markets, network stats + hashrate + supply, mempool & fees cards).
-- `src/gui/mining.rs`: Mining tab (hashrate, unique miners, top miners).
 - `src/gui/mempool.rs`: Mempool tab (`egui_extras` table, click a row for the detail window).
 - `src/gui/blockdag.rs`: BlockDAG tab (custom painter DAG visualizer, metrics, GHOSTDAG stats, tip/parent lists, Block Info window).
-- `src/gui/analytics.rs`: Analytics tab (5 panels with a Table/Chart toggle and time window; `egui_plot` charts).
+- `src/gui/analytics.rs`: Analytics tab. Rows: Tx Summary / Protocol Activity / Fee Analysis, Top Senders / Top Receivers (each with a Table/Chart toggle and time window; `egui_plot` charts), then Mining Analysis (hashrate, unique miners, top miners).
 - `src/gui/rpc_explorer.rs`: RPC Cmds tab (method list, argument form, Loop toggle, read-only JSON result viewer with 🔍 links on block hashes that run `get_block`).
 - `src/gui/node.rs`: Node tab (settings form bound to a `DaemonConfig` copy, Start/Stop/Save, status, log viewer).
 - `src/gui/connection.rs`: `ConnectionWindow`, opened from the status-bar connection button. Custom URL / public resolver / embedded node, network, Connect/Disconnect.
@@ -70,5 +69,5 @@ egui/eframe desktop GUI for monitoring a Kaspa L1 node via wRPC, with an optiona
 - All RPC types have UI-friendly wrapper structs in `rpc/types.rs`. Don't use raw kaspa types in UI code.
 - Use `theme::*` colors and `widgets::*` helpers for a consistent look; never hard-code `Color32`s in views. Labels use `.weak()`. All text is already monospace, so don't add `.monospace()`.
 - Shortcuts are ignored while a text field has focus (`ctx.wants_keyboard_input()`), except Cmd/Ctrl+K.
-- Shortcuts: `1`–`7` tabs, Ctrl+Tab / Ctrl+Shift+Tab cycle, `p` pause, `:` or Cmd/Ctrl+K palette, `?`/F1 help, Esc closes popups.
+- Shortcuts: `1`–`6` tabs, Ctrl+Tab / Ctrl+Shift+Tab cycle, `p` pause, `:` or Cmd/Ctrl+K palette, `?`/F1 help, Esc closes popups.
 - 36 read-only RPC methods (listed in `rpc/methods.rs`) are available in both the RPC Cmds tab and the command palette (`method arg1 arg2 …`; lists are comma-separated). Responses are pretty-printed JSON (`to_json`; wrap bare values in a `json!` object). To add one, add it to `RPC_METHODS` and a match arm in `RpcManager::execute_rpc_call`; a test checks every method has an arm. State-changing calls (`submit_*`, `add_peer`, `ban`/`unban`, `resolve_finality_conflict`, `shutdown`) are intentionally not exposed.

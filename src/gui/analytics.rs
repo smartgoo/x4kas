@@ -5,16 +5,18 @@ use egui_plot::{Bar, BarChart, GridMark, Line, Plot, PlotPoints};
 
 use super::theme;
 use super::widgets::{
-    CARD_GAP, card, column_header, direct_node_placeholder, kv, kv_grid, placeholder, syncing_guard,
+    CARD_GAP, card, column_header, direct_node_placeholder, field_label, kv, kv_grid, placeholder,
+    syncing_guard,
 };
 use crate::analytics::AggregatedView;
 use crate::app::{App, TimeWindow, ViewMode};
+use crate::format::format_hashrate;
 use crate::rpc::types::format_number;
 
 const PANELS: [&str; 5] = [
     "Fee Analysis",
     "Tx Summary",
-    "Protocols",
+    "Protocol Activity",
     "Top Senders",
     "Top Receivers",
 ];
@@ -31,18 +33,20 @@ pub fn show(ui: &mut Ui, app: &mut App) {
 
     banners(ui, app);
 
+    // Panel indices follow `PANELS`.
     egui::ScrollArea::vertical().show(ui, |ui| {
-        ui.columns(2, |cols| {
-            panel(&mut cols[0], app, 0);
-            cols[0].add_space(CARD_GAP);
-            panel(&mut cols[0], app, 2);
-
-            panel(&mut cols[1], app, 1);
-            cols[1].add_space(CARD_GAP);
-            panel(&mut cols[1], app, 3);
+        ui.columns(3, |cols| {
+            panel(&mut cols[0], app, 1);
+            panel(&mut cols[1], app, 2);
+            panel(&mut cols[2], app, 0);
         });
         ui.add_space(CARD_GAP);
-        panel(ui, app, 4);
+        ui.columns(2, |cols| {
+            panel(&mut cols[0], app, 3);
+            panel(&mut cols[1], app, 4);
+        });
+        ui.add_space(CARD_GAP);
+        card(ui, "Mining Analysis", |ui| mining_analysis(ui, app));
     });
 }
 
@@ -293,7 +297,8 @@ fn address_chart(ui: &mut Ui, id: &str, entries: &[(String, usize)], kind: &str)
         return;
     }
     let top: Vec<_> = entries.iter().take(10).collect();
-    let labels = top.iter().map(|(a, _)| short_address(a)).collect();
+    // Full addresses don't fit under the bars: label by rank and list them below.
+    let labels = (1..=top.len()).map(|rank| format!("#{rank}")).collect();
     let bars = top
         .iter()
         .enumerate()
@@ -304,6 +309,18 @@ fn address_chart(ui: &mut Ui, id: &str, entries: &[(String, usize)], kind: &str)
         })
         .collect();
     bar_chart(ui, id, bars, labels);
+
+    ui.add_space(4.0);
+    egui::Grid::new((id, "legend"))
+        .num_columns(2)
+        .spacing([12.0, 2.0])
+        .show(ui, |ui| {
+            for (rank, (addr, _)) in top.iter().enumerate() {
+                ui.label(RichText::new(format!("#{}", rank + 1)).weak());
+                ui.label(addr.as_str());
+                ui.end_row();
+            }
+        });
 }
 
 fn bar_chart(ui: &mut Ui, id: &str, bars: Vec<Bar>, labels: Vec<String>) {
@@ -325,14 +342,37 @@ fn bar_chart(ui: &mut Ui, id: &str, bars: Vec<Bar>, labels: Vec<String>) {
         });
 }
 
-/// Shorten `kaspa:qr0abc…xyz` style addresses for axis labels.
-fn short_address(addr: &str) -> String {
-    let addr = addr.strip_prefix("kaspa:").unwrap_or(addr);
-    let n = addr.chars().count();
-    if n <= 12 {
-        return addr.to_string();
+// ── Mining ──
+
+fn mining_analysis(ui: &mut Ui, app: &App) {
+    let Some(ref mining) = app.node.mining_info else {
+        placeholder(ui, direct_node_placeholder(app, "Collecting mining data…"));
+        return;
+    };
+    kv_grid(ui, "mining_info", |ui| {
+        kv(
+            ui,
+            "Hashrate",
+            RichText::new(format_hashrate(mining.hashrate)).color(theme::ACCENT_BRIGHT),
+        );
+        kv(
+            ui,
+            "Unique Miners",
+            format!(
+                "{} (last {} blocks)",
+                mining.unique_miners, mining.blocks_analyzed
+            ),
+        );
+    });
+    if !mining.top_miners.is_empty() {
+        ui.add_space(6.0);
+        field_label(ui, "Top Miners");
+        kv_grid(ui, "top_miners", |ui| {
+            for (addr, count) in &mining.top_miners {
+                ui.label(addr);
+                ui.label(format!("{count} blocks"));
+                ui.end_row();
+            }
+        });
     }
-    let head: String = addr.chars().take(6).collect();
-    let tail: String = addr.chars().skip(n - 4).collect();
-    format!("{head}…{tail}")
 }

@@ -53,7 +53,7 @@ async fn fetch_market_data(client: &reqwest::Client) -> Result<MarketData, reqwe
         price_btc: kaspa.btc.unwrap_or(0.0),
         market_cap: kaspa.usd_market_cap.unwrap_or(0.0),
         volume_24h: kaspa.usd_24h_vol.unwrap_or(0.0),
-        price_change_24h_pct: kaspa.usd_24h_change.unwrap_or(0.0),
+        price_change_24h_pct: kaspa.usd_24h_change,
     })
 }
 

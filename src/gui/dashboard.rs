@@ -112,19 +112,20 @@ fn markets(ui: &mut Ui, app: &App) {
         placeholder(ui, "Fetching market data…");
         return;
     };
-    let change = market.price_change_24h_pct;
-    let (change_text, change_color) = if change >= 0.0 {
-        (format!("+{change:.2}%"), theme::OK)
-    } else {
-        (format!("{change:.2}%"), theme::ERROR)
-    };
     kv_grid(ui, "markets", |ui| {
         field_label(ui, "Price (USD)");
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new(format!("${:.6}", market.price_usd)).color(theme::ACCENT_BRIGHT),
             );
-            ui.label(RichText::new(change_text).color(change_color));
+            if let Some(change) = market.price_change_24h_pct {
+                let color = if change >= 0.0 {
+                    theme::OK
+                } else {
+                    theme::ERROR
+                };
+                ui.label(RichText::new(format!("(24h {change:+.2}%)")).color(color));
+            }
         });
         ui.end_row();
         kv(ui, "Price (BTC)", format!("{:.10}", market.price_btc));

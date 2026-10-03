@@ -190,7 +190,7 @@ pub struct MarketData {
     pub price_btc: f64,
     pub market_cap: f64,
     pub volume_24h: f64,
-    pub price_change_24h_pct: f64,
+    pub price_change_24h_pct: Option<f64>,
 }
 
 #[cfg(test)]

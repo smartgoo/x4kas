@@ -185,8 +185,11 @@ impl eframe::App for GuiApp {
             });
         }
 
-        // Keep time-based values (uptime, "last refresh") ticking.
-        ctx.request_repaint_after(Duration::from_secs(1));
+        // Keep time-based values (uptime, seconds behind sink, cursor blink) ticking.
+        // Wake on the next whole second rather than 1s from now, so the blink stays
+        // even when data updates trigger frames at arbitrary times.
+        let to_next_second = 1.0 - ctx.input(|i| i.time).fract();
+        ctx.request_repaint_after(Duration::from_secs_f64(to_next_second));
     }
 }
 

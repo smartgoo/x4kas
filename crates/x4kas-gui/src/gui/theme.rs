@@ -8,7 +8,7 @@ use eframe::egui::{
     TextStyle, Theme, Visuals, vec2,
 };
 
-use crate::app::ConnectionStatus;
+use x4kas_core::app::ConnectionStatus;
 
 // ── Surfaces ──
 /// Main background (central panel, cards).

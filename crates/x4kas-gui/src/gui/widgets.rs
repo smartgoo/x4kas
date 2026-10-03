@@ -5,9 +5,9 @@ use eframe::egui::{
 };
 
 use super::theme;
-use crate::app::{ActiveConnection, App};
-use crate::format::{explorer_address_url, kaspa_stream_address_url, shorten_middle};
-use crate::rpc::hash_links::HashLink;
+use x4kas_core::app::{ActiveConnection, App};
+use x4kas_core::format::{explorer_address_url, kaspa_stream_address_url, shorten_middle};
+use x4kas_core::rpc::hash_links::HashLink;
 
 /// Vertical space between stacked cards.
 pub const CARD_GAP: f32 = 4.0;

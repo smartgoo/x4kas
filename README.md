@@ -1,6 +1,6 @@
 # x4kas - Kaspa Node Monitor
 
-A native desktop app for monitoring Kaspa L1 nodes via wRPC, connecting to a node by URL or through the public resolver.
+A native desktop app for monitoring Kaspa L1 nodes via wRPC, connecting to a node by URL or through the public resolver, plus a command-line tool (`x4kas-cli`) for scripts and AI agents.
 
 Built with [egui/eframe](https://github.com/emilk/egui) and [rusty-kaspa](https://github.com/kaspanet/rusty-kaspa). (The name comes from its origins as a terminal UI.)
 
@@ -24,16 +24,20 @@ Built with [egui/eframe](https://github.com/emilk/egui) and [rusty-kaspa](https:
 
 Build from source (Rust 1.91+; on Linux also OpenSSL headers, e.g. `libssl-dev` and `pkg-config`):
 
+Two binaries are built: `x4kas` (the desktop GUI) and `x4kas-cli` (headless; it doesn't link any GUI libraries, so it also runs on servers without a display).
+
 ```bash
-cargo install --git https://github.com/smartgoo/x4kas
+cargo install --git https://github.com/smartgoo/x4kas x4kas-gui x4kas-cli
 # or, from a clone
+cargo install --path crates/x4kas-gui    # installs `x4kas`
+cargo install --path crates/x4kas-cli    # installs `x4kas-cli`
+# or just build both into target/release/
 cargo build --release
-./target/release/x4kas
 ```
 
 ## Usage
 
-### CLI Options
+### GUI Options
 
 | Flag | Description | Default |
 |------|-------------|---------|
@@ -61,27 +65,37 @@ x4kas --url ws://127.0.0.1:17210 --network testnet-10 --refresh-interval-ms 2000
 x4kas
 ```
 
-### RPC Commands
+### CLI
 
-Every method in the **RPC Cmds** tab can also be run from the command line. It connects, prints the JSON response to stdout and exits, with a nonzero exit code on error. Without `--url` it goes through the public resolver.
+`x4kas-cli` runs one command, prints the result to stdout and exits, with a nonzero exit code on error. Without `--url` it goes through the public resolver.
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `-u, --url <URL>` | wRPC endpoint URL | public resolver |
+| `-n, --network <NET>` | Network: `mainnet`, `testnet-10`, `testnet-11` | `mainnet` |
+| `-t, --timeout <SECS>` | Connect timeout | `20` |
+
+Flags can go before or after the command.
+
+#### RPC
+
+Every method in the GUI's **RPC Cmds** tab is available as `x4kas-cli rpc <method>`, and prints the JSON response in full (the GUI cuts responses at 1 MB).
 
 ```bash
-x4kas rpc --help                      # list all methods
-x4kas rpc get_block --help            # a method's arguments and defaults
-x4kas rpc get_block_dag_info --url ws://127.0.0.1:17110
-x4kas rpc get_block <hash> false      # optional arguments are positional
-x4kas rpc get_balances_by_addresses kaspa:qa… kaspa:qb…   # lists: separate words or commas
-x4kas rpc get_sink -n testnet-10 -u ws://127.0.0.1:17210 -t 5   # -t: connect timeout (s), default 20
+x4kas-cli rpc --help                      # list all methods
+x4kas-cli rpc get_block --help            # a method's arguments and defaults
+x4kas-cli rpc get_block_dag_info --url ws://127.0.0.1:17110
+x4kas-cli rpc get_block <hash> false      # optional arguments are positional
+x4kas-cli rpc get_balances_by_addresses kaspa:qa… kaspa:qb…   # lists: separate words or commas
+x4kas-cli rpc get_sink -n testnet-10 -u ws://127.0.0.1:17210 -t 5
 ```
-
-Responses are never truncated (the GUI cuts them at 1 MB).
 
 ### Network Access
 
 Besides the node you connect to, x4kas contacts:
 
 - the CoinGecko API every 60s for market data ([data provided by CoinGecko](https://www.coingecko.com/en/api))
-- the public Kaspa resolver, only when you choose it (or run `x4kas rpc` without `--url`)
+- the public Kaspa resolver, only when you choose it (or run `x4kas-cli` without `--url`)
 
 ### Files
 
@@ -106,41 +120,45 @@ Click into the terminal to type; app shortcuts are off until you click elsewhere
 ## Architecture
 
 ```
-src/
-  main.rs               Entry point: CLI, tokio runtime, GUI launch
-  app.rs                Shared App state (Arc<RwLock<App>>), tabs
-  controller.rs         UiCommand handling: connections, RPC calls, shutdown
-  cli.rs                CLI argument parsing (clap)
-  config.rs             Saved connection choice (~/.x4kas/connection.toml)
-  polling.rs            RPC creation and background polling tasks
-  analytics.rs          Chain analytics aggregation
-  analytics_streaming.rs Analytics streaming task
-  format.rs             Formatting helpers
-  tx_inspect.rs         Per-transaction classification (scripts, opcodes, protocols)
-  rpc/
-    client.rs           RpcManager (connect, poll, execute)
-    market.rs           CoinGecko market data
-    methods.rs          RPC method catalog and argument parsing
-    hash_links.rs       Finds block hashes in RPC responses for linking
-    types.rs            UI-friendly RPC type wrappers
-  gui/
-    mod.rs              GuiApp: frame loop, top bar, shortcuts, quit
-    dashboard.rs  mempool.rs  blockdag.rs  analytics.rs  rpc_explorer.rs
-    connection.rs       Connection window (URL / resolver)
-    terminal.rs         Integrated terminal pane
-    help.rs             Help window
-    theme.rs  widgets.rs
+crates/
+  x4kas-core/src/       Shared library (no GUI): everything below the frontends
+    app.rs                Shared App state (Arc<RwLock<App>>), tabs
+    controller.rs         UiCommand handling: connections, RPC calls, shutdown
+    config.rs             Saved connection choice (~/.x4kas/connection.toml)
+    polling.rs            RPC creation and background polling tasks
+    analytics.rs          Chain analytics aggregation
+    analytics_streaming.rs Analytics streaming task
+    format.rs             Formatting helpers
+    tx_inspect.rs         Per-transaction classification (scripts, opcodes, protocols)
+    rpc/
+      client.rs           RpcManager (connect, poll, execute)
+      market.rs           CoinGecko market data
+      methods.rs          RPC method catalog and argument parsing
+      hash_links.rs       Finds block hashes in RPC responses for linking
+      types.rs            UI-friendly RPC type wrappers
+  x4kas-gui/src/        `x4kas` binary
+    main.rs               Entry point: args, tokio runtime, GUI launch
+    gui/
+      mod.rs              GuiApp: frame loop, top bar, shortcuts, quit
+      dashboard.rs  mempool.rs  blockdag.rs  analytics.rs  rpc_explorer.rs
+      connection.rs       Connection window (URL / resolver)
+      terminal.rs         Integrated terminal pane
+      help.rs             Help window
+      theme.rs  widgets.rs
+  x4kas-cli/src/        `x4kas-cli` binary
+    main.rs               Entry point: global args, command dispatch
+    rpc.rs                `rpc <method>` subcommands generated from the method catalog
 vendor/egui_term/       Terminal widget (alacritty_terminal), vendored with small patches
 ```
 
-The GUI runs on the main thread and never blocks on network I/O. It sends commands to a controller task on a tokio runtime, and background tasks update the shared state and request a repaint.
+The GUI and CLI are thin frontends over `x4kas-core`. The GUI runs on the main thread and never blocks on network I/O. It sends commands to a controller task on a tokio runtime, and background tasks update the shared state and request a repaint.
 
 ## Contributing
 
 Issues and pull requests are welcome. Before opening a PR, run:
 
 ```bash
-cargo fmt
+cargo fmt --all
 cargo clippy --all-targets -- -D warnings
 cargo test
 ```

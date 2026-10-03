@@ -4,9 +4,9 @@ use eframe::egui::{self, Button, ComboBox, RichText, TextEdit, Ui};
 
 use super::theme;
 use super::widgets::{field_label, json_view, kv_grid, placeholder, primary_button, section_title};
-use crate::app::{App, RpcExplorerState};
-use crate::controller::{CommandSender, UiCommand};
-use crate::rpc::methods::{self, ParamKind, RpcMethod};
+use x4kas_core::app::{App, RpcExplorerState};
+use x4kas_core::controller::{CommandSender, UiCommand};
+use x4kas_core::rpc::methods::{self, ParamKind, RpcMethod};
 
 pub fn show(ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
     let list_width = method_list_width(ui);

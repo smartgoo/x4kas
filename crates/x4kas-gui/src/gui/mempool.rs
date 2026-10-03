@@ -6,9 +6,9 @@ use super::widgets::{
     CARD_GAP, card, copy_value, kv, kv_grid, kv_with, modal_window, placeholder, section_title,
     yes_no,
 };
-use crate::app::App;
-use crate::format::{format_kas, format_number};
-use crate::rpc::types::MempoolEntryInfo;
+use x4kas_core::app::App;
+use x4kas_core::format::{format_kas, format_number};
+use x4kas_core::rpc::types::MempoolEntryInfo;
 
 pub fn show(ui: &mut Ui, app: &mut App) {
     card(ui, "Mempool Summary", |ui| summary(ui, app));

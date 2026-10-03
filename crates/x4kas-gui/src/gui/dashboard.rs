@@ -2,8 +2,8 @@ use eframe::egui::{self, RichText, Ui};
 
 use super::theme;
 use super::widgets::{CARD_GAP, card, kv, kv_grid, kv_with, or_dash, placeholder, yes_no};
-use crate::app::App;
-use crate::format::{format_hashrate, format_kas, format_number, format_usd};
+use x4kas_core::app::App;
+use x4kas_core::format::{format_hashrate, format_kas, format_number, format_usd};
 
 pub fn show(ui: &mut Ui, app: &App) {
     egui::ScrollArea::vertical().show(ui, |ui| {

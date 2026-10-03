@@ -1,15 +1,20 @@
-[package]
-name = "x4kas"
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+# Vendored with local patches; a path dependency of x4kas-gui, not linted or formatted here.
+exclude = ["vendor/egui_term"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.91"
 license = "MIT"
-description = "Desktop GUI for monitoring Kaspa L1 nodes over wRPC"
 repository = "https://github.com/smartgoo/x4kas"
 readme = "README.md"
 publish = false
 
-[dependencies]
+[workspace.dependencies]
+x4kas-core = { path = "crates/x4kas-core" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 kaspa-rpc-core = { git = "https://github.com/kaspanet/rusty-kaspa.git", rev = "01b532e" }
@@ -28,4 +33,3 @@ eframe = "0.33"
 egui_extras = "0.33"
 # Integrated terminal widget, vendored with patches (see vendor/egui_term/Cargo.toml).
 egui_term = { path = "vendor/egui_term" }
-

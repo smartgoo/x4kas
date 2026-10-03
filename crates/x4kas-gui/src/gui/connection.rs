@@ -4,9 +4,9 @@ use eframe::egui::{self, Button, ComboBox, RichText, TextEdit, Ui};
 
 use super::theme;
 use super::widgets::{field_label, kv_grid, modal_window, placeholder, primary_button};
-use crate::app::{ActiveConnection, App, ConnectionStatus};
-use crate::config::{self, ConnectionKind, ConnectionSettings};
-use crate::controller::{CommandSender, RemoteTarget, UiCommand};
+use x4kas_core::app::{ActiveConnection, App, ConnectionStatus};
+use x4kas_core::config::{self, ConnectionKind, ConnectionSettings};
+use x4kas_core::controller::{CommandSender, RemoteTarget, UiCommand};
 
 const KINDS: [(ConnectionKind, &str); 2] = [
     (ConnectionKind::Url, "Custom URL"),

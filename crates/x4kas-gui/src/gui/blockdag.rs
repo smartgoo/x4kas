@@ -10,8 +10,10 @@ use super::widgets::{
     CARD_GAP, block_hash, card, copy_value, is_testnet, json_view, kv, kv_grid, kv_with,
     modal_window, or_dash, placeholder, request_block,
 };
-use crate::app::{App, DAG_MAX_DAA_SCORES, DagBlock, DagVisualizer};
-use crate::format::{explorer_block_url, format_number, kaspa_stream_block_url, shorten_middle};
+use x4kas_core::app::{App, DAG_MAX_DAA_SCORES, DagBlock, DagVisualizer};
+use x4kas_core::format::{
+    explorer_block_url, format_number, kaspa_stream_block_url, shorten_middle,
+};
 
 // The visualizer mirrors the one on the Kaspalytics home page: a band of the newest DAA
 // scores, one column each, blocks spread evenly down their column and joined to their

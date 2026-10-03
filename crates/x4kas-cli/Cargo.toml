@@ -1,0 +1,20 @@
+[package]
+name = "x4kas-cli"
+description = "Command-line access to Kaspa L1 nodes over wRPC"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "x4kas-cli"
+path = "src/main.rs"
+
+[dependencies]
+x4kas-core.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true

@@ -1,41 +1,35 @@
-pub mod rpc;
+mod gui;
 
-use clap::{Parser, Subcommand};
-
-use crate::cli::rpc::RpcCall;
+use anyhow::Result;
+use clap::Parser;
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "x4kas", version, about = "Desktop monitor for Kaspa L1")]
-pub struct CliArgs {
+pub struct Args {
     /// wRPC endpoint URL (e.g., ws://127.0.0.1:17110).
-    /// If omitted, the GUI lets you choose a connection and CLI commands use the public resolver.
-    #[arg(short, long, global = true)]
+    /// If omitted, choose a connection (URL or public resolver) in the app.
+    #[arg(short, long)]
     pub url: Option<String>,
 
     /// Network: mainnet, testnet-10, testnet-11
-    #[arg(short, long, default_value = "mainnet", global = true)]
+    #[arg(short, long, default_value = "mainnet")]
     pub network: String,
 
     /// Auto-refresh interval in milliseconds
     #[arg(short = 'r', long, default_value = "1000")]
     pub refresh_interval_ms: u64,
-
-    /// Run a command and exit instead of opening the GUI.
-    #[command(subcommand)]
-    pub command: Option<Command>,
 }
 
-#[derive(Subcommand, Debug, Clone)]
-pub enum Command {
-    /// Run a read-only RPC method (the RPC Cmds tab) and print its JSON response
-    Rpc {
-        /// Connect timeout in seconds
-        #[arg(short, long, default_value = "20", global = true)]
-        timeout: u64,
+fn main() -> Result<()> {
+    let args = Args::parse();
 
-        #[command(subcommand)]
-        call: RpcCall,
-    },
+    // Built manually (not #[tokio::main]) so the GUI can own the main thread, which
+    // must stay outside the runtime context for `RwLock::blocking_*` to work.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+
+    gui::run(&rt, args)
 }
 
 #[cfg(test)]
@@ -43,17 +37,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cli_defaults() {
-        let args = CliArgs::parse_from(["x4kas"]);
+    fn args_defaults() {
+        let args = Args::parse_from(["x4kas"]);
         assert_eq!(args.url, None);
         assert_eq!(args.network, "mainnet");
         assert_eq!(args.refresh_interval_ms, 1000);
-        assert!(args.command.is_none());
     }
 
     #[test]
-    fn cli_custom_values() {
-        let args = CliArgs::parse_from([
+    fn args_custom_values() {
+        let args = Args::parse_from([
             "x4kas",
             "--url",
             "ws://127.0.0.1:17110",
@@ -68,8 +61,8 @@ mod tests {
     }
 
     #[test]
-    fn cli_short_flags() {
-        let args = CliArgs::parse_from([
+    fn args_short_flags() {
+        let args = Args::parse_from([
             "x4kas",
             "-u",
             "ws://localhost:17110",

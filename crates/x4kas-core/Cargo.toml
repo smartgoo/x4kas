@@ -1,0 +1,24 @@
+[package]
+name = "x4kas-core"
+description = "Kaspa node RPC, app state and chain analytics shared by the x4kas GUI and CLI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+kaspa-rpc-core.workspace = true
+kaspa-wrpc-client.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+toml.workspace = true
+dirs.workspace = true
+bincode.workspace = true
+futures.workspace = true
+async-channel.workspace = true
+indexmap.workspace = true

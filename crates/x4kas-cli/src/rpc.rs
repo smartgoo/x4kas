@@ -1,4 +1,4 @@
-//! `x4kas rpc <method> [args…]`: run one of the read-only RPC methods from the RPC Cmds
+//! `x4kas-cli rpc <method> [args…]`: run one of the read-only RPC methods from the RPC Cmds
 //! tab and print its JSON response. Subcommands are generated from `RPC_METHODS`, so the
 //! CLI and the GUI always expose the same methods with the same parameters and defaults.
 
@@ -10,9 +10,9 @@ use clap::{Arg, ArgAction, ArgMatches, Command, FromArgMatches, Subcommand};
 use tokio::sync::RwLock;
 use tokio::time::Instant;
 
-use crate::app::App;
-use crate::rpc::client::RpcManager;
-use crate::rpc::methods::{self, ParamKind, RPC_METHODS, RpcMethod, RpcParam};
+use x4kas_core::app::App;
+use x4kas_core::rpc::client::RpcManager;
+use x4kas_core::rpc::methods::{self, ParamKind, RPC_METHODS, RpcMethod, RpcParam};
 
 /// A parsed `rpc` subcommand: the method name and its arguments as entered (lists
 /// joined with commas), ready for `RpcManager::rpc_json`.
@@ -146,17 +146,16 @@ async fn connect(url: Option<&str>, network: &str, timeout: Duration) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::{CliArgs, Command as CliCommand};
+    use crate::{Args, Command as CliCommand};
     use clap::Parser;
 
     const HASH: &str = "0000000000000000000000000000000000000000000000000000000000000001";
     const ADDR: &str = "kaspa:qpauqsvk7yf9unexwmxsnmg547mhyga37csh0kj53q6xxgl24ydxjsgzthw5j";
 
     fn parse(argv: &[&str]) -> Result<RpcCall, clap::Error> {
-        let args = CliArgs::try_parse_from(std::iter::once("x4kas").chain(argv.iter().copied()))?;
+        let args = Args::try_parse_from(std::iter::once("x4kas-cli").chain(argv.iter().copied()))?;
         match args.command {
-            Some(CliCommand::Rpc { call, .. }) => Ok(call),
-            None => panic!("no rpc command parsed"),
+            CliCommand::Rpc { call } => Ok(call),
         }
     }
 
@@ -169,7 +168,7 @@ mod tests {
 
     #[test]
     fn every_gui_method_is_a_cli_subcommand() {
-        let cmd = <CliArgs as clap::CommandFactory>::command();
+        let cmd = <Args as clap::CommandFactory>::command();
         let rpc = cmd.find_subcommand("rpc").unwrap();
         for m in RPC_METHODS {
             let sub = rpc
@@ -178,11 +177,6 @@ mod tests {
             assert_eq!(sub.get_arguments().count(), m.params.len(), "{}", m.name);
         }
         assert_eq!(rpc.get_subcommands().count(), RPC_METHODS.len());
-    }
-
-    #[test]
-    fn cli_definition_is_valid() {
-        <CliArgs as clap::CommandFactory>::command().debug_assert();
     }
 
     #[test]
@@ -232,8 +226,8 @@ mod tests {
 
     #[test]
     fn connection_flags_work_after_the_method() {
-        let args = CliArgs::try_parse_from([
-            "x4kas",
+        let args = Args::try_parse_from([
+            "x4kas-cli",
             "rpc",
             "get_info",
             "--url",

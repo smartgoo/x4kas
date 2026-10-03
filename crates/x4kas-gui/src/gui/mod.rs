@@ -18,19 +18,19 @@ use anyhow::Result;
 use eframe::egui::{self, Button, Event, Key, Modifiers, RichText, Stroke, ViewportCommand};
 use tokio::sync::{RwLock, oneshot};
 
-use crate::analytics_streaming;
-use crate::app::{ActiveConnection, AnalyticsPhase, App, ConnectionStatus, StartPoint, Tab};
-use crate::cli::CliArgs;
-use crate::config::{ConnectionKind, ConnectionSettings};
-use crate::controller::{self, CommandSender, ControllerArgs, RemoteTarget, UiCommand};
-use crate::format::{format_duration, format_number, now_ms};
-use crate::rpc::market;
+use crate::Args;
 use connection::ConnectionWindow;
 use terminal::TerminalPane;
 use widgets::kv;
+use x4kas_core::analytics_streaming;
+use x4kas_core::app::{ActiveConnection, AnalyticsPhase, App, ConnectionStatus, StartPoint, Tab};
+use x4kas_core::config::{ConnectionKind, ConnectionSettings};
+use x4kas_core::controller::{self, CommandSender, ControllerArgs, RemoteTarget, UiCommand};
+use x4kas_core::format::{format_duration, format_number, now_ms};
+use x4kas_core::rpc::market;
 
 /// Start background tasks on `rt` and run the GUI on the current (main) thread.
-pub fn run(rt: &tokio::runtime::Runtime, args: CliArgs) -> Result<()> {
+pub fn run(rt: &tokio::runtime::Runtime, args: Args) -> Result<()> {
     let app = Arc::new(RwLock::new(App::default()));
 
     // `--url` overrides the saved connection choice; without it, open the connection

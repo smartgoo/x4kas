@@ -6,10 +6,10 @@ use super::widgets::{
     CARD_GAP, address, card, card_with_header, direct_node_placeholder, fit_label, kv, kv_grid,
     or_dash, placeholder, section_title,
 };
-use crate::analytics::AggregatedView;
-use crate::app::{AnalyticsPanel, AnalyticsPhase, App, TimeWindow};
-use crate::format::{format_hashrate, format_kas, format_number};
-use crate::tx_inspect::TransactionProtocol;
+use x4kas_core::analytics::AggregatedView;
+use x4kas_core::app::{AnalyticsPanel, AnalyticsPhase, App, TimeWindow};
+use x4kas_core::format::{format_hashrate, format_kas, format_number};
+use x4kas_core::tx_inspect::TransactionProtocol;
 
 /// Tables taller than this scroll.
 const TABLE_MAX_HEIGHT: f32 = 200.0;

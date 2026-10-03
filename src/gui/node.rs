@@ -56,7 +56,7 @@ fn settings(ui: &mut Ui, state: &mut IntegratedNodeState, cmd_tx: &CommandSender
         let color = if is_error { theme::ERROR } else { theme::OK };
         ui.label(RichText::new(msg).color(color));
     }
-    ui.add_space(6.0);
+    ui.add_space(4.0);
 
     let mut changed = false;
     egui::ScrollArea::vertical().show(ui, |ui| {
@@ -169,7 +169,7 @@ fn section(ui: &mut Ui, title: &str, add_rows: impl FnOnce(&mut Ui)) {
         .show(ui, |ui| {
             egui::Grid::new(title)
                 .num_columns(2)
-                .spacing([24.0, 6.0])
+                .spacing([24.0, 2.0])
                 .min_col_width(140.0)
                 .show(ui, add_rows);
         });

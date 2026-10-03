@@ -32,7 +32,7 @@ pub fn show(ui: &mut Ui, app: &mut App) {
         .column(Column::remainder().at_least(200.0))
         .column(Column::auto().at_least(140.0))
         .column(Column::auto().at_least(70.0))
-        .header(22.0, |mut header| {
+        .header(18.0, |mut header| {
             header.col(|ui| {
                 column_header(ui, "Transaction ID");
             });
@@ -44,7 +44,7 @@ pub fn show(ui: &mut Ui, app: &mut App) {
             });
         })
         .body(|body| {
-            body.rows(20.0, mempool.entries.len(), |mut row| {
+            body.rows(16.0, mempool.entries.len(), |mut row| {
                 let i = row.index();
                 let entry = &mempool.entries[i];
                 row.set_selected(i == app.mempool_selected);

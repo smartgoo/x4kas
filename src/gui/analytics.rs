@@ -77,7 +77,7 @@ fn banners(ui: &mut Ui, app: &mut App) {
                     )),
             );
         });
-        ui.add_space(4.0);
+        ui.add_space(2.0);
     }
 
     let mut dismiss = false;
@@ -90,7 +90,7 @@ fn banners(ui: &mut Ui, app: &mut App) {
             );
             dismiss = ui.button("Dismiss").clicked();
         });
-        ui.add_space(4.0);
+        ui.add_space(2.0);
     }
     if dismiss {
         app.analytics.reorg_notification = None;
@@ -111,7 +111,7 @@ fn controls(ui: &mut Ui, app: &mut App, panel: AnalyticsPanel, chart: bool) -> P
             }
         }
     });
-    ui.add_space(4.0);
+    ui.add_space(2.0);
     *state
 }
 
@@ -155,7 +155,7 @@ fn tx_summary(ui: &mut Ui, app: &mut App) {
         );
         kv(ui, "Chain Blocks", count(t.chain_blocks));
     });
-    ui.add_space(6.0);
+    ui.add_space(4.0);
     section_title(ui, "Output Script Classes");
     let c = &t.script_classes;
     kv_grid(ui, "script_classes", |ui| {
@@ -164,7 +164,7 @@ fn tx_summary(ui: &mut Ui, app: &mut App) {
         kv(ui, "P2SH", count(c.script_hash));
         kv(ui, "Non-standard", count(c.nonstandard));
     });
-    ui.add_space(4.0);
+    ui.add_space(2.0);
     ui.label(
         RichText::new("Excludes coinbase. Script classes count outputs.")
             .weak()
@@ -255,7 +255,7 @@ fn fees(ui: &mut Ui, app: &App) {
         None => placeholder(ui, "Waiting for fee estimate…"),
     }
 
-    ui.add_space(6.0);
+    ui.add_space(4.0);
     section_title(ui, "Accepted Fees (KAS)");
     if app.analytics.cached_views.is_none() {
         placeholder(ui, "Collecting data…");
@@ -264,7 +264,8 @@ fn fees(ui: &mut Ui, app: &App) {
     egui::Grid::new("fee_windows")
         .num_columns(4)
         .striped(true)
-        .spacing([20.0, 4.0])
+        .spacing([20.0, 1.0])
+        .min_row_height(theme::ROW_HEIGHT)
         .show(ui, |ui| {
             for header in ["Prior", "Average", "Total", "Txs"] {
                 column_header(ui, header);
@@ -286,7 +287,7 @@ fn fees(ui: &mut Ui, app: &App) {
                 ui.end_row();
             }
         });
-    ui.add_space(4.0);
+    ui.add_space(2.0);
     ui.label(
         RichText::new("Fee = inputs − outputs. Average is per transaction.")
             .weak()
@@ -368,7 +369,8 @@ fn node_versions(ui: &mut Ui, app: &mut App) {
                 egui::Grid::new("node_versions")
                     .num_columns(3)
                     .striped(true)
-                    .spacing([24.0, 4.0])
+                    .spacing([24.0, 1.0])
+                    .min_row_height(theme::ROW_HEIGHT)
                     .show(ui, |ui| {
                         for header in ["Version", "Blocks", "Share"] {
                             column_header(ui, header);
@@ -383,7 +385,7 @@ fn node_versions(ui: &mut Ui, app: &mut App) {
                     });
             });
     }
-    ui.add_space(4.0);
+    ui.add_space(2.0);
     ui.label(
         RichText::new(format!(
             "From {} accepted coinbase transactions.",
@@ -424,7 +426,8 @@ fn address_table(ui: &mut Ui, id: &str, entries: &[(String, u64)]) {
             egui::Grid::new(id)
                 .num_columns(2)
                 .striped(true)
-                .spacing([24.0, 4.0])
+                .spacing([24.0, 1.0])
+                .min_row_height(theme::ROW_HEIGHT)
                 .show(ui, |ui| {
                     column_header(ui, "Address");
                     column_header(ui, "Txs");
@@ -449,10 +452,11 @@ fn address_chart(ui: &mut Ui, id: &str, entries: &[(String, u64)]) {
         .collect();
     bar_chart(ui, id, bars, labels, "");
 
-    ui.add_space(4.0);
+    ui.add_space(2.0);
     egui::Grid::new((id, "legend"))
         .num_columns(2)
-        .spacing([12.0, 2.0])
+        .spacing([12.0, 1.0])
+        .min_row_height(theme::ROW_HEIGHT)
         .show(ui, |ui| {
             for (rank, (addr, _)) in top.iter().enumerate() {
                 ui.label(RichText::new(format!("#{}", rank + 1)).weak());
@@ -513,7 +517,7 @@ fn mining_analysis(ui: &mut Ui, app: &App) {
         );
     });
     if !mining.top_miners.is_empty() {
-        ui.add_space(6.0);
+        ui.add_space(4.0);
         field_label(ui, "Top Miners");
         kv_grid(ui, "top_miners", |ui| {
             for (addr, count) in &mining.top_miners {

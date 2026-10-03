@@ -6,7 +6,7 @@ use super::theme;
 use crate::app::{ActiveConnection, App};
 
 /// Vertical space between stacked cards.
-pub const CARD_GAP: f32 = 6.0;
+pub const CARD_GAP: f32 = 4.0;
 
 /// A bordered pane with its title set into the top border, like a TUI block:
 /// `┌─ Title ───────┐`.
@@ -24,10 +24,10 @@ pub fn card(ui: &mut Ui, title: &str, add_contents: impl FnOnce(&mut Ui)) {
         .stroke(Stroke::new(1.0_f32, theme::BORDER_HI))
         .corner_radius(3)
         .inner_margin(Margin {
-            left: 12,
-            right: 12,
-            top: 14,
-            bottom: 10,
+            left: 10,
+            right: 10,
+            top: 11,
+            bottom: 6,
         })
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -61,7 +61,8 @@ pub fn column_header(ui: &mut Ui, text: &str) {
 pub fn kv_grid(ui: &mut Ui, id: &str, add_rows: impl FnOnce(&mut Ui)) {
     egui::Grid::new(id)
         .num_columns(2)
-        .spacing([16.0, 4.0])
+        .spacing([16.0, 1.0])
+        .min_row_height(theme::ROW_HEIGHT)
         .show(ui, add_rows);
 }
 

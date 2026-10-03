@@ -51,7 +51,8 @@ fn section(ui: &mut egui::Ui, title: &str, rows: &[(&str, &str)]) {
     section_title(ui, title);
     egui::Grid::new(title)
         .num_columns(2)
-        .spacing([24.0, 4.0])
+        .spacing([24.0, 1.0])
+        .min_row_height(theme::ROW_HEIGHT)
         .show(ui, |ui| {
             for (keys, action) in rows {
                 ui.label(RichText::new(*keys).color(theme::ACCENT_BRIGHT));

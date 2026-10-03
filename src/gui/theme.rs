@@ -46,8 +46,10 @@ pub const SLATE: Color32 = Color32::from_rgb(0x5a, 0x7d, 0x94);
 /// Categorical colors for chart series.
 pub const SERIES: [Color32; 6] = [ACCENT, INFO, WARN, PURPLE, OK, ERROR];
 
-pub const FONT_SIZE: f32 = 13.0;
-pub const SMALL_FONT_SIZE: f32 = 11.0;
+pub const FONT_SIZE: f32 = 12.0;
+pub const SMALL_FONT_SIZE: f32 = 10.0;
+/// Minimum height of a read-only grid row (egui defaults to the button height).
+pub const ROW_HEIGHT: f32 = 14.0;
 
 /// Install fonts and visuals. The app is always dark, whatever the system theme.
 pub fn apply(ctx: &egui::Context) {
@@ -61,7 +63,7 @@ pub fn apply(ctx: &egui::Context) {
     ctx.style_mut_of(Theme::Dark, |style| {
         let mono = |size| FontId::new(size, FontFamily::Monospace);
         style.text_styles = [
-            (TextStyle::Heading, mono(16.0)),
+            (TextStyle::Heading, mono(14.0)),
             (TextStyle::Body, mono(FONT_SIZE)),
             (TextStyle::Monospace, mono(FONT_SIZE)),
             (TextStyle::Button, mono(FONT_SIZE)),
@@ -70,10 +72,10 @@ pub fn apply(ctx: &egui::Context) {
         .into();
 
         let spacing = &mut style.spacing;
-        spacing.item_spacing = vec2(8.0, 5.0);
-        spacing.button_padding = vec2(8.0, 3.0);
-        spacing.interact_size.y = 22.0;
-        spacing.window_margin = Margin::same(12);
+        spacing.item_spacing = vec2(8.0, 3.0);
+        spacing.button_padding = vec2(6.0, 1.0);
+        spacing.interact_size.y = 18.0;
+        spacing.window_margin = Margin::same(10);
         spacing.menu_margin = Margin::same(6);
 
         style.visuals = visuals();

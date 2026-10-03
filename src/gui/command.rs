@@ -135,7 +135,7 @@ fn output(ui: &mut Ui, cl: &CommandLine) {
                     ui.visuals().text_color()
                 };
                 ui.label(RichText::new(&entry.result).color(color));
-                ui.add_space(6.0);
+                ui.add_space(4.0);
             }
         });
 }

@@ -24,7 +24,7 @@ pub fn show(ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
         .show_inside(ui, |ui| {
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
             section_title(ui, "RPC Methods");
-            ui.add_space(4.0);
+            ui.add_space(2.0);
             egui::ScrollArea::vertical().show(ui, |ui| method_list(ui, app, cmd_tx));
         });
 
@@ -38,7 +38,7 @@ pub fn show(ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
                 .size(15.0),
         );
         ui.label(RichText::new(method.description).weak());
-        ui.add_space(4.0);
+        ui.add_space(2.0);
         let submitted = if method.params.is_empty() {
             false
         } else {
@@ -244,7 +244,7 @@ fn arg_form(ui: &mut Ui, app: &mut App, method: &'static RpcMethod) -> bool {
             ui.end_row();
         }
     });
-    ui.add_space(4.0);
+    ui.add_space(2.0);
     submitted
 }
 

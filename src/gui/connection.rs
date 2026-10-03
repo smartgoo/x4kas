@@ -53,7 +53,7 @@ impl ConnectionWindow {
 
     fn contents(&mut self, ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
         current(ui, app);
-        ui.add_space(4.0);
+        ui.add_space(2.0);
         ui.separator();
 
         ui.horizontal(|ui| {
@@ -61,7 +61,7 @@ impl ConnectionWindow {
                 ui.selectable_value(&mut self.form.kind, kind, label);
             }
         });
-        ui.add_space(6.0);
+        ui.add_space(4.0);
 
         let daemon_running = !matches!(
             app.integrated_node.status,

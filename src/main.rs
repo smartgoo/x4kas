@@ -6,13 +6,9 @@ mod config;
 mod controller;
 mod daemon;
 mod daemon_lifecycle;
-mod event;
 mod format;
 mod gui;
-mod keys;
 mod rpc;
-mod tui;
-mod ui;
 
 use anyhow::Result;
 use clap::Parser;
@@ -31,10 +27,6 @@ fn main() -> Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-
-    if args.tui {
-        return rt.block_on(tui::run(args, daemon_config));
-    }
 
     gui::run(&rt, args, daemon_config)
 }

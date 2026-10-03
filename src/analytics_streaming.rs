@@ -74,12 +74,9 @@ pub fn start_analytics_streaming(
         let mut synced = false;
 
         loop {
-            // Check if paused or should quit
+            // Check if paused
             {
                 let app_guard = app.read().await;
-                if app_guard.should_quit {
-                    break;
-                }
                 if app_guard.paused {
                     drop(app_guard);
                     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -196,9 +193,5 @@ pub fn start_analytics_streaming(
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
-
-        // Persist state on exit
-        let eng = engine.read().await;
-        let _ = eng.save(&cache_path);
     }));
 }

@@ -190,13 +190,6 @@ pub enum ViewMode {
 }
 
 impl ViewMode {
-    pub fn toggle(&mut self) {
-        *self = match self {
-            Self::Table => Self::Chart,
-            Self::Chart => Self::Table,
-        };
-    }
-
     pub fn label(&self) -> &'static str {
         match self {
             Self::Table => "Table",
@@ -214,14 +207,6 @@ pub enum TimeWindow {
 }
 
 impl TimeWindow {
-    pub fn cycle(&mut self) {
-        *self = match self {
-            Self::OneMin => Self::OneHour,
-            Self::OneHour => Self::TwentyFourHour,
-            Self::TwentyFourHour => Self::OneMin,
-        };
-    }
-
     pub fn label(&self) -> &'static str {
         match self {
             Self::OneMin => "1m",
@@ -243,12 +228,7 @@ pub enum DaemonStatus {
 pub struct IntegratedNodeState {
     pub config: DaemonConfig,
     pub status: DaemonStatus,
-    pub selected_field: usize,
-    pub editing: bool,
-    pub edit_buffer: String,
     pub log_lines: VecDeque<String>,
-    pub log_scroll: usize,
-    pub log_auto_scroll: bool,
     pub started_at: Option<std::time::Instant>,
     pub status_message: Option<(String, bool)>, // (message, is_error)
 }
@@ -258,19 +238,10 @@ impl IntegratedNodeState {
         Self {
             config,
             status: DaemonStatus::Stopped,
-            selected_field: 0,
-            editing: false,
-            edit_buffer: String::new(),
             log_lines: VecDeque::new(),
-            log_scroll: 0,
-            log_auto_scroll: true,
             started_at: None,
             status_message: None,
         }
-    }
-
-    pub fn is_running(&self) -> bool {
-        matches!(self.status, DaemonStatus::Running | DaemonStatus::Starting)
     }
 }
 
@@ -287,7 +258,6 @@ pub struct RpcExplorerState {
     pub available_methods: Vec<&'static str>,
     pub last_response: Option<String>,
     pub is_loading: bool,
-    pub scroll_offset: usize,
 }
 
 impl Default for RpcExplorerState {
@@ -300,21 +270,18 @@ impl Default for RpcExplorerState {
                 .collect(),
             last_response: None,
             is_loading: false,
-            scroll_offset: 0,
         }
     }
 }
 
+/// Command palette state. Results are pushed here by the controller.
 #[derive(Default)]
 pub struct CommandLine {
     pub active: bool,
     pub input: String,
-    pub cursor_pos: usize,
     pub output: VecDeque<CommandOutput>,
-    pub output_scroll: usize,
     pub history: VecDeque<String>,
     pub history_index: Option<usize>,
-    pub show_output: bool,
 }
 
 pub struct CommandOutput {
@@ -324,74 +291,16 @@ pub struct CommandOutput {
 }
 
 impl CommandLine {
-    pub fn activate(&mut self) {
+    pub fn open(&mut self) {
         self.active = true;
         self.input.clear();
-        self.cursor_pos = 0;
         self.history_index = None;
     }
 
-    pub fn deactivate(&mut self) {
+    pub fn close(&mut self) {
         self.active = false;
         self.input.clear();
-        self.cursor_pos = 0;
         self.history_index = None;
-    }
-
-    pub fn insert_char(&mut self, c: char) {
-        self.input.insert(self.cursor_pos, c);
-        self.cursor_pos += c.len_utf8();
-    }
-
-    pub fn delete_char(&mut self) {
-        if self.cursor_pos < self.input.len() {
-            let next = self.next_char_boundary();
-            self.input.drain(self.cursor_pos..next);
-        }
-    }
-
-    pub fn backspace(&mut self) {
-        if self.cursor_pos > 0 {
-            let prev = self.prev_char_boundary();
-            self.input.drain(prev..self.cursor_pos);
-            self.cursor_pos = prev;
-        }
-    }
-
-    pub fn move_left(&mut self) {
-        if self.cursor_pos > 0 {
-            self.cursor_pos = self.prev_char_boundary();
-        }
-    }
-
-    pub fn move_right(&mut self) {
-        if self.cursor_pos < self.input.len() {
-            self.cursor_pos = self.next_char_boundary();
-        }
-    }
-
-    fn prev_char_boundary(&self) -> usize {
-        let mut pos = self.cursor_pos - 1;
-        while pos > 0 && !self.input.is_char_boundary(pos) {
-            pos -= 1;
-        }
-        pos
-    }
-
-    fn next_char_boundary(&self) -> usize {
-        let mut pos = self.cursor_pos + 1;
-        while pos < self.input.len() && !self.input.is_char_boundary(pos) {
-            pos += 1;
-        }
-        pos
-    }
-
-    pub fn move_home(&mut self) {
-        self.cursor_pos = 0;
-    }
-
-    pub fn move_end(&mut self) {
-        self.cursor_pos = self.input.len();
     }
 
     pub fn history_up(&mut self) {
@@ -409,7 +318,6 @@ impl CommandLine {
         }
         if let Some(i) = self.history_index {
             self.input = self.history[i].clone();
-            self.cursor_pos = self.input.len();
         }
     }
 
@@ -418,12 +326,10 @@ impl CommandLine {
             Some(i) if i < self.history.len() - 1 => {
                 self.history_index = Some(i + 1);
                 self.input = self.history[i + 1].clone();
-                self.cursor_pos = self.input.len();
             }
             Some(_) => {
                 self.history_index = None;
                 self.input.clear();
-                self.cursor_pos = 0;
             }
             None => {}
         }
@@ -440,7 +346,6 @@ impl CommandLine {
         }
         self.history_index = None;
         self.input.clear();
-        self.cursor_pos = 0;
         Some(cmd)
     }
 
@@ -453,8 +358,15 @@ impl CommandLine {
         if self.output.len() > 50 {
             self.output.pop_front();
         }
-        self.output_scroll = 0;
-        self.show_output = true;
+    }
+
+    /// Commands whose name starts with the first word of `input` (all commands if empty).
+    pub fn suggestions(&self) -> Vec<(&'static str, &'static str)> {
+        let prefix = self.input.trim().split(' ').next().unwrap_or_default();
+        Self::available_commands()
+            .into_iter()
+            .filter(|(name, _)| name.starts_with(prefix))
+            .collect()
     }
 
     pub fn available_commands() -> Vec<(&'static str, &'static str)> {
@@ -510,7 +422,6 @@ impl Default for NodeState {
 #[derive(Default)]
 pub struct AnalyticsState {
     pub engine: Option<Arc<tokio::sync::RwLock<AnalyticsEngine>>>,
-    pub focus: usize,
     pub view_modes: [ViewMode; 5],
     pub time_windows: [TimeWindow; 5],
     pub sync_progress: Option<(u64, u64)>,
@@ -531,7 +442,6 @@ pub type RepaintFn = Arc<dyn Fn() + Send + Sync>;
 
 pub struct App {
     pub active_tab: Tab,
-    pub should_quit: bool,
 
     pub node: NodeState,
     pub analytics: AnalyticsState,
@@ -545,9 +455,6 @@ pub struct App {
     pub mempool_detail: Option<String>,
 
     pub paused: bool,
-    pub show_help: bool,
-    pub quit_confirm: bool,
-    pub dirty: bool,
     /// Called by `mark_dirty()` so a frontend can wake up and redraw.
     pub repaint: Option<RepaintFn>,
     pub has_direct_node: bool,
@@ -559,7 +466,6 @@ impl App {
     pub fn new(daemon_config: DaemonConfig) -> Self {
         Self {
             active_tab: Tab::Dashboard,
-            should_quit: false,
             node: NodeState::default(),
             analytics: AnalyticsState::default(),
             dag_selection: DagSelection::default(),
@@ -569,18 +475,14 @@ impl App {
             mempool_selected: 0,
             mempool_detail: None,
             paused: false,
-            show_help: false,
-            quit_confirm: false,
-            dirty: true,
             repaint: None,
             has_direct_node: false,
             integrated_node: IntegratedNodeState::new(daemon_config),
         }
     }
 
-    /// Flag state as changed and ask the frontend to redraw.
+    /// Ask the frontend to redraw after a state change.
     pub fn mark_dirty(&mut self) {
-        self.dirty = true;
         if let Some(ref repaint) = self.repaint {
             repaint();
         }
@@ -723,146 +625,6 @@ mod tests {
         assert_eq!(app.active_tab, Tab::BlockDag);
     }
 
-    // --- CommandLine: editing ---
-
-    #[test]
-    fn insert_char_ascii() {
-        let mut cl = CommandLine::default();
-        cl.insert_char('a');
-        cl.insert_char('b');
-        assert_eq!(cl.input, "ab");
-        assert_eq!(cl.cursor_pos, 2);
-    }
-
-    #[test]
-    fn insert_char_utf8_emoji() {
-        let mut cl = CommandLine::default();
-        cl.insert_char('🦀');
-        assert_eq!(cl.input, "🦀");
-        assert_eq!(cl.cursor_pos, 4); // 🦀 is 4 bytes
-        cl.insert_char('!');
-        assert_eq!(cl.input, "🦀!");
-    }
-
-    #[test]
-    fn insert_char_mid_string() {
-        let mut cl = CommandLine::default();
-        cl.input = "ac".to_string();
-        cl.cursor_pos = 1;
-        cl.insert_char('b');
-        assert_eq!(cl.input, "abc");
-        assert_eq!(cl.cursor_pos, 2);
-    }
-
-    #[test]
-    fn delete_char_at_cursor() {
-        let mut cl = CommandLine::default();
-        cl.input = "abc".to_string();
-        cl.cursor_pos = 1;
-        cl.delete_char();
-        assert_eq!(cl.input, "ac");
-        assert_eq!(cl.cursor_pos, 1);
-    }
-
-    #[test]
-    fn delete_char_at_end_noop() {
-        let mut cl = CommandLine::default();
-        cl.input = "abc".to_string();
-        cl.cursor_pos = 3;
-        cl.delete_char();
-        assert_eq!(cl.input, "abc");
-    }
-
-    #[test]
-    fn delete_char_empty_noop() {
-        let mut cl = CommandLine::default();
-        cl.delete_char();
-        assert_eq!(cl.input, "");
-    }
-
-    #[test]
-    fn backspace_removes_previous() {
-        let mut cl = CommandLine::default();
-        cl.input = "abc".to_string();
-        cl.cursor_pos = 2;
-        cl.backspace();
-        assert_eq!(cl.input, "ac");
-        assert_eq!(cl.cursor_pos, 1);
-    }
-
-    #[test]
-    fn backspace_at_start_noop() {
-        let mut cl = CommandLine::default();
-        cl.input = "abc".to_string();
-        cl.cursor_pos = 0;
-        cl.backspace();
-        assert_eq!(cl.input, "abc");
-        assert_eq!(cl.cursor_pos, 0);
-    }
-
-    #[test]
-    fn backspace_utf8() {
-        let mut cl = CommandLine::default();
-        cl.input = "a🦀b".to_string();
-        cl.cursor_pos = 5; // after 🦀
-        cl.backspace();
-        assert_eq!(cl.input, "ab");
-        assert_eq!(cl.cursor_pos, 1);
-    }
-
-    // --- CommandLine: cursor movement ---
-
-    #[test]
-    fn move_left_right() {
-        let mut cl = CommandLine::default();
-        cl.input = "abc".to_string();
-        cl.cursor_pos = 2;
-        cl.move_left();
-        assert_eq!(cl.cursor_pos, 1);
-        cl.move_right();
-        assert_eq!(cl.cursor_pos, 2);
-    }
-
-    #[test]
-    fn move_left_at_start_noop() {
-        let mut cl = CommandLine::default();
-        cl.input = "abc".to_string();
-        cl.cursor_pos = 0;
-        cl.move_left();
-        assert_eq!(cl.cursor_pos, 0);
-    }
-
-    #[test]
-    fn move_right_at_end_noop() {
-        let mut cl = CommandLine::default();
-        cl.input = "abc".to_string();
-        cl.cursor_pos = 3;
-        cl.move_right();
-        assert_eq!(cl.cursor_pos, 3);
-    }
-
-    #[test]
-    fn move_left_right_utf8() {
-        let mut cl = CommandLine::default();
-        cl.input = "a🦀b".to_string();
-        cl.cursor_pos = 5; // after 🦀
-        cl.move_left();
-        assert_eq!(cl.cursor_pos, 1); // before 🦀
-        cl.move_right();
-        assert_eq!(cl.cursor_pos, 5); // after 🦀
-    }
-
-    #[test]
-    fn move_home_end() {
-        let mut cl = CommandLine::default();
-        cl.input = "hello".to_string();
-        cl.cursor_pos = 3;
-        cl.move_home();
-        assert_eq!(cl.cursor_pos, 0);
-        cl.move_end();
-        assert_eq!(cl.cursor_pos, 5);
-    }
-
     // --- CommandLine: history ---
 
     #[test]
@@ -924,7 +686,6 @@ mod tests {
         let cmd = cl.submit();
         assert_eq!(cmd, Some("ping".to_string()));
         assert_eq!(cl.input, "");
-        assert_eq!(cl.cursor_pos, 0);
         assert_eq!(cl.history_index, None);
     }
 
@@ -961,45 +722,40 @@ mod tests {
     }
 
     #[test]
-    fn push_output_resets_scroll() {
-        let mut cl = CommandLine::default();
-        cl.output_scroll = 10;
-        cl.push_output("test".to_string(), "result".to_string(), false);
-        assert_eq!(cl.output_scroll, 0);
-        assert!(cl.show_output);
-    }
-
-    #[test]
     fn push_output_tracks_errors() {
         let mut cl = CommandLine::default();
         cl.push_output("bad".to_string(), "fail".to_string(), true);
         assert!(cl.output.front().unwrap().is_error);
     }
 
-    // --- CommandLine: activate/deactivate ---
+    // --- CommandLine: open/close/suggestions ---
 
     #[test]
-    fn activate_clears_state() {
+    fn open_and_close_clear_state() {
         let mut cl = CommandLine::default();
         cl.input = "leftover".to_string();
-        cl.cursor_pos = 5;
         cl.history_index = Some(2);
-        cl.activate();
+        cl.open();
         assert!(cl.active);
         assert_eq!(cl.input, "");
-        assert_eq!(cl.cursor_pos, 0);
         assert_eq!(cl.history_index, None);
+
+        cl.input = "something".to_string();
+        cl.close();
+        assert!(!cl.active);
+        assert_eq!(cl.input, "");
     }
 
     #[test]
-    fn deactivate_clears_state() {
+    fn suggestions_filter_by_prefix() {
         let mut cl = CommandLine::default();
-        cl.active = true;
-        cl.input = "something".to_string();
-        cl.deactivate();
-        assert!(!cl.active);
-        assert_eq!(cl.input, "");
-        assert_eq!(cl.cursor_pos, 0);
+        assert_eq!(cl.suggestions().len(), CommandLine::available_commands().len());
+        cl.input = "cl".to_string();
+        assert_eq!(cl.suggestions(), vec![("clear", "Clear command output")]);
+        cl.input = "get_".to_string();
+        assert!(cl.suggestions().iter().all(|(n, _)| n.starts_with("get_")));
+        cl.input = "nope".to_string();
+        assert!(cl.suggestions().is_empty());
     }
 
     // --- RpcExplorerState ---

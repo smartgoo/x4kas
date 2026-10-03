@@ -15,10 +15,6 @@ pub struct CliArgs {
     /// Auto-refresh interval in milliseconds
     #[arg(short = 'r', long, default_value = "1000")]
     pub refresh_interval_ms: u64,
-
-    /// Run the legacy terminal UI instead of the GUI
-    #[arg(long)]
-    pub tui: bool,
 }
 
 #[cfg(test)]
@@ -31,7 +27,6 @@ mod tests {
         assert_eq!(args.url, None);
         assert_eq!(args.network, "mainnet");
         assert_eq!(args.refresh_interval_ms, 1000);
-        assert!(!args.tui);
     }
 
     #[test]

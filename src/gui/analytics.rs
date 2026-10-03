@@ -100,8 +100,9 @@ fn panel(ui: &mut Ui, app: &mut App, i: usize) {
             }
             ui.separator();
             let mode = &mut app.analytics.view_modes[i];
-            ui.selectable_value(mode, ViewMode::Table, "Table");
-            ui.selectable_value(mode, ViewMode::Chart, "Chart");
+            for m in [ViewMode::Table, ViewMode::Chart] {
+                ui.selectable_value(mode, m, m.label());
+            }
         });
         ui.add_space(4.0);
 

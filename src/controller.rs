@@ -231,7 +231,7 @@ impl Controller {
         self.stop_background_tasks().await;
         self.shutdown_daemon().await;
 
-        // Persist analytics cache (best-effort — analytics streaming also saves on exit)
+        // Persist analytics cache (best-effort; the streaming task is aborted, not stopped)
         let app = self.app.read().await;
         if let Some(ref engine) = app.analytics.engine
             && let Ok(eng) = engine.try_read()
@@ -292,14 +292,13 @@ impl Controller {
                         help_text.push_str(&format!("  {:<28} {}\n", name, desc));
                     }
                     help_text.push_str(
-                        "\nPress ':' to open command line, Esc to close, Up/Down for history",
+                        "\nOpen with ':' or Ctrl+K · Tab completes · Up/Down for history · Esc closes",
                     );
                     (help_text, false)
                 }
                 "clear" => {
                     let mut app = app.write().await;
                     app.command_line.output.clear();
-                    app.command_line.show_output = false;
                     app.mark_dirty();
                     return;
                 }

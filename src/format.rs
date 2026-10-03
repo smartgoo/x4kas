@@ -41,22 +41,6 @@ pub fn truncate_hash(hash: &str) -> String {
     }
 }
 
-pub fn opt_str(val: &Option<String>) -> &str {
-    val.as_deref().unwrap_or("—")
-}
-
-pub fn opt_usize(val: &Option<usize>) -> String {
-    val.map_or("—".to_string(), |v| v.to_string())
-}
-
-pub fn opt_f64(val: &Option<f64>) -> String {
-    val.map_or("—".to_string(), |v| format!("{:.1}", v))
-}
-
-pub fn bool_str(v: bool) -> String {
-    if v { "Yes" } else { "No" }.to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,14 +160,4 @@ mod tests {
         assert!(result.contains("..."));
     }
 
-    // --- optional / bool display ---
-
-    #[test]
-    fn opt_helpers_show_dash_for_none() {
-        assert_eq!(opt_str(&None), "—");
-        assert_eq!(opt_usize(&None), "—");
-        assert_eq!(opt_f64(&None), "—");
-        assert_eq!(opt_f64(&Some(1.25)), "1.2");
-        assert_eq!(bool_str(true), "Yes");
-    }
 }

@@ -141,33 +141,6 @@ impl DaemonConfig {
         &["default", "hdd"]
     }
 
-    pub fn cycle_network(&mut self) {
-        let networks = Self::valid_networks();
-        let idx = networks
-            .iter()
-            .position(|n| *n == self.network)
-            .unwrap_or(0);
-        self.network = networks[(idx + 1) % networks.len()].to_string();
-    }
-
-    pub fn cycle_log_level(&mut self) {
-        let levels = Self::valid_log_levels();
-        let idx = levels
-            .iter()
-            .position(|l| *l == self.log_level)
-            .unwrap_or(3);
-        self.log_level = levels[(idx + 1) % levels.len()].to_string();
-    }
-
-    pub fn cycle_rocksdb_preset(&mut self) {
-        let presets = Self::valid_rocksdb_presets();
-        let idx = presets
-            .iter()
-            .position(|p| *p == self.rocksdb_preset)
-            .unwrap_or(0);
-        self.rocksdb_preset = presets[(idx + 1) % presets.len()].to_string();
-    }
-
     /// Parse comma-separated peer strings into Vec of trimmed non-empty strings
     pub fn parse_peers(s: &str) -> Vec<String> {
         s.split(',')
@@ -250,38 +223,6 @@ mod tests {
         assert_eq!(deserialized.rocksdb_cache_size, Some(512));
         assert_eq!(deserialized.rpc_max_clients, 256);
         assert!(deserialized.perf_metrics);
-    }
-
-    #[test]
-    fn cycle_network() {
-        let mut config = DaemonConfig::default();
-        assert_eq!(config.network, "mainnet");
-        config.cycle_network();
-        assert_eq!(config.network, "testnet-10");
-        config.cycle_network();
-        assert_eq!(config.network, "testnet-11");
-        config.cycle_network();
-        assert_eq!(config.network, "mainnet");
-    }
-
-    #[test]
-    fn cycle_log_level() {
-        let mut config = DaemonConfig::default();
-        assert_eq!(config.log_level, "WARN");
-        config.cycle_log_level();
-        assert_eq!(config.log_level, "ERROR");
-        config.cycle_log_level();
-        assert_eq!(config.log_level, "TRACE");
-    }
-
-    #[test]
-    fn cycle_rocksdb_preset() {
-        let mut config = DaemonConfig::default();
-        assert_eq!(config.rocksdb_preset, "default");
-        config.cycle_rocksdb_preset();
-        assert_eq!(config.rocksdb_preset, "hdd");
-        config.cycle_rocksdb_preset();
-        assert_eq!(config.rocksdb_preset, "default");
     }
 
     #[test]

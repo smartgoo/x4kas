@@ -158,11 +158,6 @@ pub fn start_log_tailing(config: &DaemonConfig, app: Arc<RwLock<App>>) -> tokio:
                 while app_guard.integrated_node.log_lines.len() > 1000 {
                     app_guard.integrated_node.log_lines.pop_front();
                 }
-                // Auto-scroll to bottom if enabled
-                if app_guard.integrated_node.log_auto_scroll {
-                    let total = app_guard.integrated_node.log_lines.len();
-                    app_guard.integrated_node.log_scroll = total;
-                }
                 app_guard.mark_dirty();
             }
         }

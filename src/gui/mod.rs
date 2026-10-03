@@ -150,6 +150,12 @@ impl eframe::App for GuiApp {
         let mut app = app_state.blocking_write();
 
         handle_shortcuts(ctx, &mut app, &mut self.show_help);
+        let testnet = app
+            .node
+            .server_info
+            .as_ref()
+            .is_some_and(|s| s.network_id.contains("testnet"));
+        widgets::set_testnet(ctx, testnet);
 
         egui::TopBottomPanel::top("top_bar")
             .frame(bar_frame())
@@ -166,8 +172,18 @@ impl eframe::App for GuiApp {
             Tab::Mempool => mempool::show(ui, &mut app),
             Tab::RpcExplorer => rpc_explorer::show(ui, &mut app, &self.cmd_tx),
             Tab::Analytics => analytics::show(ui, &mut app),
-            Tab::BlockDag => blockdag::show(ui, &mut app, &self.cmd_tx),
+            Tab::BlockDag => blockdag::show(ui, &mut app),
         });
+
+        // A click on any block hash (or a BlockDAG block) opens Block Info here, whatever
+        // the tab.
+        if let Some(hash) = widgets::take_block_request(ctx) {
+            app.dag_selection.block_hash = Some(hash.clone());
+            app.dag_selection.block_detail = None;
+            app.dag_selection.block_loading = true;
+            let _ = self.cmd_tx.send(UiCommand::LookupBlock(hash));
+        }
+        blockdag::block_window(ctx, &mut app);
 
         self.connection.show(ctx, &mut app, &self.cmd_tx);
         help::show(ctx, &mut self.show_help);

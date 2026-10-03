@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -6,50 +6,72 @@ use crate::analytics::{AggregatedView, AnalyticsEngine};
 use crate::rpc::hash_links::{HashLink, block_hash_links};
 use crate::rpc::types::*;
 
-#[derive(Debug, Clone)]
-pub struct DagVisualizerBlock {
-    pub hash_full: String,
-    pub is_selected_parent: bool,
+/// A block from the node's `BlockAdded` stream, as the DAG visualizer needs it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DagBlock {
+    pub hash: String,
+    pub daa_score: u64,
+    /// Direct (level 0) parents.
+    pub parents: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
-pub struct DagVisualizerColumn {
-    pub blocks: Vec<DagVisualizerBlock>,
-}
+/// How many of the newest DAA scores the visualizer keeps.
+pub const DAG_MAX_DAA_SCORES: usize = 100;
 
+/// Recent blocks grouped by DAA score (one column per score), for the DAG visualizer.
 #[derive(Debug, Clone, Default)]
 pub struct DagVisualizer {
-    pub columns: VecDeque<DagVisualizerColumn>,
+    /// Blocks per DAA score in arrival order, oldest score first.
+    pub columns: BTreeMap<u64, Vec<DagBlock>>,
+    hashes: HashSet<String>,
 }
 
 impl DagVisualizer {
-    pub fn update(&mut self, tip_hashes: &[String], virtual_parents: &[String]) {
-        let parent_set: HashSet<&str> = virtual_parents.iter().map(|s| s.as_str()).collect();
-        let blocks: Vec<DagVisualizerBlock> = tip_hashes
-            .iter()
-            .map(|h| DagVisualizerBlock {
-                hash_full: h.clone(),
-                is_selected_parent: parent_set.contains(h.as_str()),
-            })
-            .collect();
-
-        if !blocks.is_empty() {
-            // Only add if tips changed from last column (compare full hashes)
-            let should_add = self.columns.back().is_none_or(|last| {
-                let last_hashes: Vec<&str> =
-                    last.blocks.iter().map(|b| b.hash_full.as_str()).collect();
-                let new_hashes: Vec<&str> = blocks.iter().map(|b| b.hash_full.as_str()).collect();
-                last_hashes != new_hashes
-            });
-
-            if should_add {
-                self.columns.push_back(DagVisualizerColumn { blocks });
-                // Keep last 30 columns
-                if self.columns.len() > 30 {
-                    self.columns.pop_front();
+    /// Add a block. Returns false for a duplicate, or a block older than every kept
+    /// score once the window is full.
+    pub fn add(&mut self, block: DagBlock) -> bool {
+        if self.hashes.contains(&block.hash) {
+            return false;
+        }
+        if self.columns.len() >= DAG_MAX_DAA_SCORES
+            && !self.columns.contains_key(&block.daa_score)
+            && self
+                .columns
+                .first_key_value()
+                .is_some_and(|(&oldest, _)| block.daa_score < oldest)
+        {
+            return false;
+        }
+        self.hashes.insert(block.hash.clone());
+        self.columns.entry(block.daa_score).or_default().push(block);
+        while self.columns.len() > DAG_MAX_DAA_SCORES {
+            if let Some((_, dropped)) = self.columns.pop_first() {
+                for b in dropped {
+                    self.hashes.remove(&b.hash);
                 }
             }
         }
+        true
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.hashes.is_empty()
+    }
+
+    pub fn blocks(&self) -> impl Iterator<Item = &DagBlock> {
+        self.columns.values().flatten()
+    }
+
+    /// Blocks no other kept block names as a parent: the DAG tips, as far as we can see.
+    pub fn tips(&self) -> HashSet<&str> {
+        let referenced: HashSet<&str> = self
+            .blocks()
+            .flat_map(|b| b.parents.iter().map(String::as_str))
+            .collect();
+        self.blocks()
+            .map(|b| b.hash.as_str())
+            .filter(|h| !referenced.contains(h))
+            .collect()
     }
 }
 
@@ -131,13 +153,6 @@ impl DagStats {
         let last = self.samples.back()?;
         Some(last.header_count.saturating_sub(last.block_count))
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum DagFocus {
-    #[default]
-    Tips,
-    Parents,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -665,9 +680,8 @@ impl AnalyticsState {
 
 #[derive(Default)]
 pub struct DagSelection {
-    pub focus: DagFocus,
-    pub tip_selected: usize,
-    pub parent_selected: usize,
+    /// The block shown (or loading) in the Block Info window.
+    pub block_hash: Option<String>,
     pub block_detail: Option<String>,
     pub block_loading: bool,
 }
@@ -685,7 +699,8 @@ pub struct App {
     pub rpc_explorer: RpcExplorerState,
     pub command_line: CommandLine,
 
-    pub mempool_selected: usize,
+    /// Transaction ID shown in the Transaction Detail window, highlighted in the table.
+    pub mempool_open_tx: Option<String>,
     pub mempool_detail: Option<String>,
 
     pub paused: bool,
@@ -705,7 +720,7 @@ impl Default for App {
             market_data: None,
             rpc_explorer: RpcExplorerState::default(),
             command_line: CommandLine::default(),
-            mempool_selected: 0,
+            mempool_open_tx: None,
             mempool_detail: None,
             paused: false,
             repaint: None,
@@ -738,7 +753,7 @@ impl App {
         self.analytics.status = AnalyticsStatus::default();
         self.analytics.cached_views = None;
         self.analytics.reorg_notification = None;
-        self.mempool_selected = 0;
+        self.mempool_open_tx = None;
         self.mempool_detail = None;
         self.dag_selection.block_detail = None;
         self.dag_selection.block_loading = false;
@@ -756,6 +771,7 @@ impl App {
         else {
             return;
         };
+        self.mempool_open_tx = Some(entry.transaction_id.clone());
         self.mempool_detail = Some(format!(
             "Transaction ID: {}\nFee: {:.8} KAS ({} sompi)\nOrphan: {}",
             entry.transaction_id,
@@ -810,7 +826,7 @@ mod tests {
         app.node.node_url = Some("ws://node:17110".to_string());
         app.node.last_error = Some("boom".to_string());
         app.node.connection_status = ConnectionStatus::Connected;
-        app.mempool_selected = 3;
+        app.mempool_open_tx = Some("tx".to_string());
         app.mempool_detail = Some("tx".to_string());
         app.dag_selection.block_loading = true;
         app.rpc_explorer.last_response = Some("resp".to_string());
@@ -824,7 +840,7 @@ mod tests {
             app.node.connection_status,
             ConnectionStatus::Disconnected
         ));
-        assert_eq!(app.mempool_selected, 0);
+        assert_eq!(app.mempool_open_tx, None);
         assert_eq!(app.mempool_detail, None);
         assert!(!app.dag_selection.block_loading);
         assert_eq!(app.rpc_explorer.last_response, None);
@@ -1119,42 +1135,62 @@ mod tests {
 
     // --- DagVisualizer ---
 
-    #[test]
-    fn dag_visualizer_starts_empty() {
-        let vis = DagVisualizer::default();
-        assert!(vis.columns.is_empty());
+    fn dag_block(hash: &str, daa_score: u64, parents: &[&str]) -> DagBlock {
+        DagBlock {
+            hash: hash.to_string(),
+            daa_score,
+            parents: parents.iter().map(|p| p.to_string()).collect(),
+        }
     }
 
     #[test]
-    fn dag_visualizer_adds_column() {
+    fn dag_visualizer_starts_empty() {
+        let vis = DagVisualizer::default();
+        assert!(vis.is_empty());
+        assert!(vis.tips().is_empty());
+    }
+
+    #[test]
+    fn dag_visualizer_groups_by_daa_score() {
         let mut vis = DagVisualizer::default();
-        let tips = vec!["abc123".to_string(), "def456".to_string()];
-        let parents = vec!["abc123".to_string()];
-        vis.update(&tips, &parents);
-        assert_eq!(vis.columns.len(), 1);
-        assert_eq!(vis.columns[0].blocks.len(), 2);
-        assert!(vis.columns[0].blocks[0].is_selected_parent);
-        assert!(!vis.columns[0].blocks[1].is_selected_parent);
+        assert!(vis.add(dag_block("a", 10, &[])));
+        assert!(vis.add(dag_block("b", 11, &["a"])));
+        assert!(vis.add(dag_block("c", 11, &["a"])));
+        assert_eq!(vis.blocks().count(), 3);
+        assert_eq!(vis.columns.len(), 2);
+        assert_eq!(vis.columns[&11].len(), 2);
     }
 
     #[test]
     fn dag_visualizer_skips_duplicate() {
         let mut vis = DagVisualizer::default();
-        let tips = vec!["abc12345".to_string()];
-        let parents = vec![];
-        vis.update(&tips, &parents);
-        vis.update(&tips, &parents);
-        assert_eq!(vis.columns.len(), 1);
+        assert!(vis.add(dag_block("a", 10, &[])));
+        assert!(!vis.add(dag_block("a", 10, &[])));
+        assert_eq!(vis.blocks().count(), 1);
     }
 
     #[test]
-    fn dag_visualizer_caps_at_30() {
+    fn dag_visualizer_keeps_newest_daa_scores() {
         let mut vis = DagVisualizer::default();
-        for i in 0..35 {
-            let tips = vec![format!("hash{:04}", i)];
-            vis.update(&tips, &[]);
+        for i in 0..(DAG_MAX_DAA_SCORES as u64 + 5) {
+            vis.add(dag_block(&format!("h{i}"), i, &[]));
         }
-        assert_eq!(vis.columns.len(), 30);
+        assert_eq!(vis.columns.len(), DAG_MAX_DAA_SCORES);
+        assert_eq!(vis.blocks().count(), DAG_MAX_DAA_SCORES);
+        assert_eq!(*vis.columns.first_key_value().unwrap().0, 5);
+        // A late block older than the window is dropped, even one evicted earlier.
+        assert!(!vis.add(dag_block("late", 2, &[])));
+        assert!(!vis.add(dag_block("h0", 0, &[])));
+    }
+
+    #[test]
+    fn dag_visualizer_tips_are_unreferenced_blocks() {
+        let mut vis = DagVisualizer::default();
+        vis.add(dag_block("a", 10, &[]));
+        vis.add(dag_block("b", 11, &["a"]));
+        vis.add(dag_block("c", 11, &["a"]));
+        vis.add(dag_block("d", 12, &["b"]));
+        assert_eq!(vis.tips(), HashSet::from(["c", "d"]));
     }
 
     // --- DagStats ---
@@ -1343,8 +1379,10 @@ mod tests {
 
         app.open_mempool_detail(5);
         assert!(app.mempool_detail.is_none());
+        assert!(app.mempool_open_tx.is_none());
 
         app.open_mempool_detail(0);
+        assert_eq!(app.mempool_open_tx.as_deref(), Some("abc123"));
         let detail = app.mempool_detail.as_deref().unwrap();
         assert!(detail.contains("Transaction ID: abc123"));
         assert!(detail.contains("1.50000000 KAS (150000000 sompi)"));

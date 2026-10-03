@@ -40,8 +40,15 @@ pub const WARN: Color32 = Color32::from_rgb(0xf0, 0xb5, 0x4a);
 pub const ERROR: Color32 = Color32::from_rgb(0xff, 0x6b, 0x6b);
 pub const INFO: Color32 = Color32::from_rgb(0x6c, 0xb6, 0xff);
 pub const PURPLE: Color32 = Color32::from_rgb(0xc4, 0x9b, 0xff);
-/// Secondary data marks, e.g. non-selected-parent DAG tips.
-pub const SLATE: Color32 = Color32::from_rgb(0x5a, 0x7d, 0x94);
+
+// ── DAG visualizer ──
+pub const DAG_BLOCK: Color32 = TEXT_BRIGHT;
+/// Blocks no other block references yet.
+pub const DAG_TIP: Color32 = ACCENT_BRIGHT;
+pub const DAG_HOVER: Color32 = OK;
+/// Parents of the hovered block, and the edges to them.
+pub const DAG_PARENT: Color32 = WARN;
+pub const DAG_EDGE: Color32 = TEXT_DIM;
 
 /// Categorical colors for chart series.
 pub const SERIES: [Color32; 6] = [ACCENT, INFO, WARN, PURPLE, OK, ERROR];

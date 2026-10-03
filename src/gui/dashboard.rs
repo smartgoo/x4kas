@@ -1,7 +1,7 @@
 use eframe::egui::{self, RichText, Ui};
 
 use super::theme;
-use super::widgets::{CARD_GAP, card, field_label, kv, kv_grid, placeholder, yes_no};
+use super::widgets::{CARD_GAP, card, kv, kv_grid, kv_with, placeholder, yes_no};
 use crate::app::App;
 use crate::format::{format_hashrate, format_usd};
 use crate::rpc::types::{format_number, sompi_to_kas};
@@ -100,11 +100,8 @@ fn markets(ui: &mut Ui, app: &App) {
         return;
     };
     kv_grid(ui, "markets", |ui| {
-        field_label(ui, "Price (USD)");
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(format!("${:.6}", market.price_usd)).color(theme::ACCENT_BRIGHT),
-            );
+        kv_with(ui, "Price (USD)", |ui| {
+            // Right to left: the change first, so it ends up after the price.
             if let Some(change) = market.price_change_24h_pct {
                 let color = if change >= 0.0 {
                     theme::OK
@@ -113,8 +110,10 @@ fn markets(ui: &mut Ui, app: &App) {
                 };
                 ui.label(RichText::new(format!("(24h {change:+.2}%)")).color(color));
             }
+            ui.label(
+                RichText::new(format!("${:.6}", market.price_usd)).color(theme::ACCENT_BRIGHT),
+            );
         });
-        ui.end_row();
         kv(ui, "Price (BTC)", format!("{:.10}", market.price_btc));
         kv(ui, "Market Cap", format_usd(market.market_cap));
         kv(ui, "24h Volume", format_usd(market.volume_24h));

@@ -1,12 +1,13 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use eframe::egui::{self, RichText, Ui};
+use egui_extras::{Column, TableBuilder};
 use egui_plot::{Bar, BarChart, GridMark, Plot};
 
 use super::theme;
 use super::widgets::{
-    CARD_GAP, card, column_header, direct_node_placeholder, field_label, kv, kv_grid, placeholder,
-    section_title,
+    CARD_GAP, address, card, card_with_header, column_header, direct_node_placeholder, fit_label,
+    kv, kv_grid, placeholder, section_title,
 };
 use crate::analytics::AggregatedView;
 use crate::app::{AnalyticsPanel, AnalyticsPhase, App, PanelState, TimeWindow, ViewMode};
@@ -15,6 +16,9 @@ use crate::rpc::types::format_number;
 use crate::tx_inspect::TransactionProtocol;
 
 const CHART_HEIGHT: f32 = 200.0;
+/// Charts are temporarily hidden: no Table/Chart toggle, every panel shows its table.
+/// Set to true to bring them back.
+const CHARTS_ENABLED: bool = false;
 
 pub fn show(ui: &mut Ui, app: &mut App) {
     if !app.has_direct_node {
@@ -26,32 +30,81 @@ pub fn show(ui: &mut Ui, app: &mut App) {
 
     egui::ScrollArea::vertical().show(ui, |ui| {
         ui.columns(2, |cols| {
-            card(&mut cols[0], "Transaction Summary", |ui| {
-                tx_summary(ui, app)
-            });
+            panel_card(
+                &mut cols[0],
+                app,
+                "Transaction Summary",
+                AnalyticsPanel::TxSummary,
+                tx_summary,
+            );
             card(&mut cols[1], "Fees", |ui| fees(ui, app));
         });
         ui.add_space(CARD_GAP);
-        card(ui, "Transaction Inspection", |ui| inspection(ui, app));
+        panel_card(
+            ui,
+            app,
+            "Transaction Inspection",
+            AnalyticsPanel::Inspection,
+            inspection,
+        );
         ui.add_space(CARD_GAP);
         ui.columns(2, |cols| {
-            card(&mut cols[0], "Mining Share by Node Version", |ui| {
-                node_versions(ui, app)
-            });
+            panel_card(
+                &mut cols[0],
+                app,
+                "Mining Share by Node Version",
+                AnalyticsPanel::NodeVersions,
+                node_versions,
+            );
             card(&mut cols[1], "Mining Analysis", |ui| {
                 mining_analysis(ui, app)
             });
         });
         ui.add_space(CARD_GAP);
         ui.columns(2, |cols| {
-            card(&mut cols[0], "Top Senders", |ui| {
-                addresses(ui, app, AnalyticsPanel::TopSenders)
-            });
-            card(&mut cols[1], "Top Receivers", |ui| {
-                addresses(ui, app, AnalyticsPanel::TopReceivers)
-            });
+            panel_card(
+                &mut cols[0],
+                app,
+                "Top Senders",
+                AnalyticsPanel::TopSenders,
+                |ui, app| addresses(ui, app, AnalyticsPanel::TopSenders),
+            );
+            panel_card(
+                &mut cols[1],
+                app,
+                "Top Receivers",
+                AnalyticsPanel::TopReceivers,
+                |ui, app| addresses(ui, app, AnalyticsPanel::TopReceivers),
+            );
         });
     });
+}
+
+/// A card for an analytics panel, with its time window dropdown after the title.
+fn panel_card(
+    ui: &mut Ui,
+    app: &mut App,
+    title: &str,
+    panel: AnalyticsPanel,
+    add_contents: impl FnOnce(&mut Ui, &mut App),
+) {
+    card_with_header(
+        ui,
+        title,
+        app,
+        |ui, app| {
+            let window = &mut app.analytics.panel(panel).window;
+            egui::ComboBox::from_id_salt(("time_window", format!("{panel:?}")))
+                .selected_text(window.label())
+                .width(0.0)
+                .show_ui(ui, |ui| {
+                    for w in TimeWindow::ALL {
+                        ui.selectable_value(window, w, w.label());
+                    }
+                });
+        },
+        add_contents,
+    );
 }
 
 fn banners(ui: &mut Ui, app: &mut App) {
@@ -97,21 +150,21 @@ fn banners(ui: &mut Ui, app: &mut App) {
     }
 }
 
-/// Window selector (and Table/Chart toggle if `chart`) for a panel; returns its state.
+/// The panel's state, after the Table/Chart toggle if `chart` (the time window is in the
+/// card header, see [`panel_card`]).
 fn controls(ui: &mut Ui, app: &mut App, panel: AnalyticsPanel, chart: bool) -> PanelState {
     let state = app.analytics.panel(panel);
-    ui.horizontal(|ui| {
-        for w in TimeWindow::ALL {
-            ui.selectable_value(&mut state.window, w, w.label());
-        }
-        if chart {
-            ui.separator();
+    if chart && CHARTS_ENABLED {
+        ui.horizontal(|ui| {
             for m in [ViewMode::Table, ViewMode::Chart] {
                 ui.selectable_value(&mut state.mode, m, m.label());
             }
-        }
-    });
-    ui.add_space(2.0);
+        });
+        ui.add_space(2.0);
+    }
+    if !CHARTS_ENABLED {
+        state.mode = ViewMode::Table;
+    }
     *state
 }
 
@@ -164,12 +217,6 @@ fn tx_summary(ui: &mut Ui, app: &mut App) {
         kv(ui, "P2SH", count(c.script_hash));
         kv(ui, "Non-standard", count(c.nonstandard));
     });
-    ui.add_space(2.0);
-    ui.label(
-        RichText::new("Excludes coinbase. Script classes count outputs.")
-            .weak()
-            .small(),
-    );
 }
 
 /// Bars of transactions per bin, x in minutes relative to now.
@@ -256,42 +303,35 @@ fn fees(ui: &mut Ui, app: &App) {
     }
 
     ui.add_space(4.0);
-    section_title(ui, "Accepted Fees (KAS)");
     if app.analytics.cached_views.is_none() {
         placeholder(ui, "Collecting data…");
         return;
     }
-    egui::Grid::new("fee_windows")
-        .num_columns(4)
-        .striped(true)
-        .spacing([20.0, 1.0])
-        .min_row_height(theme::ROW_HEIGHT)
-        .show(ui, |ui| {
-            for header in ["Prior", "Average", "Total", "Txs"] {
-                column_header(ui, header);
-            }
-            ui.end_row();
-            for w in TimeWindow::ALL {
-                let Some(view) = app.analytics.view(w) else {
-                    continue;
-                };
-                let t = &view.totals;
-                ui.label(RichText::new(w.label()).weak());
-                ui.label(view.avg_fee().map_or("—".into(), |f| format_kas(f, 6)));
-                ui.label(if t.fee_tx_count > 0 {
+    let rows = TimeWindow::ALL
+        .into_iter()
+        .filter_map(|w| {
+            let view = app.analytics.view(w)?;
+            let t = &view.totals;
+            Some([
+                format!("Prior {}", w.label()),
+                view.avg_fee().map_or("—".into(), |f| format_kas(f, 6)),
+                if t.fee_tx_count > 0 {
                     format_kas(t.total_fees as f64, 3)
                 } else {
                     "—".into()
-                });
-                ui.label(count(t.fee_tx_count));
-                ui.end_row();
-            }
-        });
-    ui.add_space(2.0);
-    ui.label(
-        RichText::new("Fee = inputs − outputs. Average is per transaction.")
-            .weak()
-            .small(),
+                },
+                count(t.fee_tx_count),
+            ])
+        })
+        .collect();
+    wide_table(
+        ui,
+        "fee_windows",
+        ["Accepted Fees (KAS)", "Average", "Total", "Txs"],
+        rows,
+        |ui, w| {
+            ui.label(RichText::new(w).weak());
+        },
     );
 }
 
@@ -362,28 +402,20 @@ fn node_versions(ui: &mut Ui, app: &mut App) {
             .collect();
         bar_chart(ui, "node_versions_chart", bars, labels, "%");
     } else {
-        egui::ScrollArea::vertical()
-            .id_salt("node_versions")
-            .max_height(CHART_HEIGHT)
-            .show(ui, |ui| {
-                egui::Grid::new("node_versions")
-                    .num_columns(3)
-                    .striped(true)
-                    .spacing([24.0, 1.0])
-                    .min_row_height(theme::ROW_HEIGHT)
-                    .show(ui, |ui| {
-                        for header in ["Version", "Blocks", "Share"] {
-                            column_header(ui, header);
-                        }
-                        ui.end_row();
-                        for (v, n) in &view.node_versions {
-                            ui.label(name(v));
-                            ui.label(count(*n));
-                            ui.label(format!("{:.2}%", share(*n)));
-                            ui.end_row();
-                        }
-                    });
-            });
+        let rows = view
+            .node_versions
+            .iter()
+            .map(|(v, n)| [name(v), count(*n), format!("{:.2}%", share(*n))])
+            .collect();
+        wide_table(
+            ui,
+            "node_versions",
+            ["Version", "Blocks", "Share"],
+            rows,
+            |ui, v| {
+                fit_label(ui, v);
+            },
+        );
     }
     ui.add_space(2.0);
     ui.label(
@@ -419,26 +451,89 @@ fn addresses(ui: &mut Ui, app: &mut App, panel: AnalyticsPanel) {
 }
 
 fn address_table(ui: &mut Ui, id: &str, entries: &[(String, u64)]) {
-    egui::ScrollArea::vertical()
-        .id_salt(id)
-        .max_height(CHART_HEIGHT)
-        .show(ui, |ui| {
-            egui::Grid::new(id)
-                .num_columns(2)
-                .striped(true)
-                .spacing([24.0, 1.0])
-                .min_row_height(theme::ROW_HEIGHT)
-                .show(ui, |ui| {
-                    column_header(ui, "Address");
-                    column_header(ui, "Txs");
-                    ui.end_row();
-                    for (addr, n) in entries {
-                        ui.label(addr);
-                        ui.label(count(*n));
-                        ui.end_row();
+    let rows = entries
+        .iter()
+        .map(|(addr, n)| [addr.clone(), count(*n)])
+        .collect();
+    wide_table(ui, id, ["Address", "Txs"], rows, address);
+}
+
+/// Full-width table: the first column takes the remaining width and is drawn by
+/// `first_cell`, which fits it to that width (e.g. [`fit_label`], [`address`]). The other
+/// columns are right-aligned, so values sit against the right edge of the card.
+fn wide_table<const N: usize>(
+    ui: &mut Ui,
+    id: &str,
+    headers: [&str; N],
+    rows: Vec<[String; N]>,
+    first_cell: fn(&mut Ui, &str),
+) {
+    ui.push_id(id, |ui| {
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+        // Room for the padding of clickable cells such as [`address`].
+        let row_height = theme::ROW_HEIGHT + 2.0 * ui.spacing().button_padding.y;
+        // Exact widths, recomputed every frame: a `Column::remainder` never shrinks below
+        // what its content used last frame, so a fitted first column would only ever grow
+        // and never shorten its values when the window narrows. All text is monospace, so
+        // the other columns are sized by their longest cell.
+        let font = egui::TextStyle::Body.resolve(ui.style());
+        let glyph = ui.fonts_mut(|f| f.glyph_width(&font, '0'));
+        let spacing = ui.spacing().item_spacing.x;
+        let widths: Vec<f32> = (1..N)
+            .map(|i| {
+                let chars = rows
+                    .iter()
+                    .map(|r| r[i].chars().count())
+                    .chain([headers[i].chars().count()])
+                    .max()
+                    .unwrap_or(0);
+                (chars as f32 * glyph).max(60.0)
+            })
+            .collect();
+        let rest: f32 = widths.iter().map(|w| w + spacing).sum();
+        let first = (ui.available_width() - rest).max(0.0);
+        let mut table = TableBuilder::new(ui)
+            .striped(true)
+            .max_scroll_height(CHART_HEIGHT)
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .column(Column::exact(first));
+        for w in widths {
+            table = table.column(Column::exact(w));
+        }
+        table
+            .header(theme::ROW_HEIGHT, |mut header| {
+                for (i, h) in headers.into_iter().enumerate() {
+                    header.col(|ui| {
+                        right_after_first(ui, i, |ui| column_header(ui, h));
+                    });
+                }
+            })
+            .body(|body| {
+                body.rows(row_height, rows.len(), |mut row| {
+                    for (i, cell) in rows[row.index()].iter().enumerate() {
+                        row.col(|ui| {
+                            if i == 0 {
+                                first_cell(ui, cell);
+                            } else {
+                                right_after_first(ui, i, |ui| {
+                                    ui.label(cell);
+                                });
+                            }
+                        });
                     }
                 });
-        });
+            });
+    });
+}
+
+/// Cells after the first are pinned to the right edge of their column, so values line up
+/// with the right edge of the card.
+fn right_after_first(ui: &mut Ui, column: usize, add: impl FnOnce(&mut Ui)) {
+    if column == 0 {
+        add(ui);
+    } else {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), add);
+    }
 }
 
 fn address_chart(ui: &mut Ui, id: &str, entries: &[(String, u64)]) {
@@ -453,17 +548,14 @@ fn address_chart(ui: &mut Ui, id: &str, entries: &[(String, u64)]) {
     bar_chart(ui, id, bars, labels, "");
 
     ui.add_space(2.0);
-    egui::Grid::new((id, "legend"))
-        .num_columns(2)
-        .spacing([12.0, 1.0])
-        .min_row_height(theme::ROW_HEIGHT)
-        .show(ui, |ui| {
-            for (rank, (addr, _)) in top.iter().enumerate() {
-                ui.label(RichText::new(format!("#{}", rank + 1)).weak());
-                ui.label(addr.as_str());
-                ui.end_row();
-            }
+    // Rows rather than a grid so each address is fitted to the card width.
+    for (rank, (addr, _)) in top.iter().enumerate() {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 12.0;
+            ui.label(RichText::new(format!("#{:<2}", rank + 1)).weak());
+            address(ui, addr);
         });
+    }
 }
 
 /// Bars at x = 0, 1, … labelled with `labels`; hover shows name and value + `unit`.
@@ -518,13 +610,11 @@ fn mining_analysis(ui: &mut Ui, app: &App) {
     });
     if !mining.top_miners.is_empty() {
         ui.add_space(4.0);
-        field_label(ui, "Top Miners");
-        kv_grid(ui, "top_miners", |ui| {
-            for (addr, count) in &mining.top_miners {
-                ui.label(addr);
-                ui.label(format!("{count} blocks"));
-                ui.end_row();
-            }
-        });
+        let rows = mining
+            .top_miners
+            .iter()
+            .map(|(addr, n)| [addr.clone(), count(*n as u64)])
+            .collect();
+        wide_table(ui, "top_miners", ["Top Miners", "Blocks"], rows, address);
     }
 }

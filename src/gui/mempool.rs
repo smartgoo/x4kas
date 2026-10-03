@@ -41,7 +41,8 @@ pub fn show(ui: &mut Ui, app: &mut App) {
             body.rows(16.0, mempool.entries.len(), |mut row| {
                 let i = row.index();
                 let entry = &mempool.entries[i];
-                row.set_selected(i == app.mempool_selected);
+                // Only the transaction open in the detail window is highlighted.
+                row.set_selected(app.mempool_open_tx.as_ref() == Some(&entry.transaction_id));
                 row.col(|ui| {
                     ui.label(&entry.transaction_id);
                 });
@@ -63,7 +64,6 @@ pub fn show(ui: &mut Ui, app: &mut App) {
         });
 
     if let Some(i) = clicked {
-        app.mempool_selected = i;
         app.open_mempool_detail(i);
     }
 
@@ -110,6 +110,7 @@ fn detail_window(ctx: &egui::Context, app: &mut App) {
             );
         });
     if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        app.mempool_open_tx = None;
         app.mempool_detail = None;
     }
 }

@@ -58,10 +58,97 @@ pub fn format_duration(d: std::time::Duration) -> String {
     }
 }
 
+/// `s` unchanged if it has at most `max_chars` characters, otherwise its start and end
+/// joined by `...` in `max_chars` characters, e.g. `kaspa:qzv6...3gujgy`.
+pub fn shorten_middle(s: &str, max_chars: usize) -> String {
+    let len = s.chars().count();
+    if len <= max_chars {
+        return s.to_string();
+    }
+    let keep = max_chars.saturating_sub(3);
+    let (head, tail) = (keep.div_ceil(2), keep / 2);
+    let start: String = s.chars().take(head).collect();
+    let end: String = s.chars().skip(len - tail).collect();
+    format!("{start}...{end}")
+}
+
+/// The address page on Kaspa Explorer: the testnet-10 explorer for `kaspatest:` addresses.
+pub fn explorer_address_url(addr: &str) -> String {
+    let host = if addr.starts_with("kaspatest:") {
+        "explorer-tn10.kaspa.org"
+    } else {
+        "explorer.kaspa.org"
+    };
+    format!("https://{host}/addresses/{addr}")
+}
+
+/// The address page on Kaspa Stream (mainnet).
+pub fn kaspa_stream_address_url(addr: &str) -> String {
+    format!("https://kaspa.stream/addresses/{addr}")
+}
+
+/// The block page on Kaspa Explorer, on the testnet-10 explorer if `testnet`.
+pub fn explorer_block_url(hash: &str, testnet: bool) -> String {
+    let host = if testnet {
+        "explorer-tn10.kaspa.org"
+    } else {
+        "explorer.kaspa.org"
+    };
+    format!("https://{host}/blocks/{hash}")
+}
+
+/// The block page on Kaspa Stream (mainnet).
+pub fn kaspa_stream_block_url(hash: &str) -> String {
+    format!("https://kaspa.stream/blocks/{hash}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::rpc::types::format_number;
+
+    #[test]
+    fn explorer_urls_by_network() {
+        assert_eq!(
+            explorer_address_url("kaspa:qabc"),
+            "https://explorer.kaspa.org/addresses/kaspa:qabc"
+        );
+        assert_eq!(
+            explorer_address_url("kaspatest:qabc"),
+            "https://explorer-tn10.kaspa.org/addresses/kaspatest:qabc"
+        );
+        assert_eq!(
+            kaspa_stream_address_url("kaspa:qabc"),
+            "https://kaspa.stream/addresses/kaspa:qabc"
+        );
+        assert_eq!(
+            explorer_block_url("ab12", false),
+            "https://explorer.kaspa.org/blocks/ab12"
+        );
+        assert_eq!(
+            explorer_block_url("ab12", true),
+            "https://explorer-tn10.kaspa.org/blocks/ab12"
+        );
+        assert_eq!(
+            kaspa_stream_block_url("ab12"),
+            "https://kaspa.stream/blocks/ab12"
+        );
+    }
+
+    #[test]
+    fn shorten_middle_keeps_text_that_fits() {
+        assert_eq!(shorten_middle("kaspa:abc", 9), "kaspa:abc");
+        assert_eq!(shorten_middle("kaspa:abc", 20), "kaspa:abc");
+    }
+
+    #[test]
+    fn shorten_middle_keeps_start_and_end() {
+        let addr = "kaspa:qzv6abcdefghijklmnop3gujgy";
+        let short = shorten_middle(addr, 19);
+        assert_eq!(short, "kaspa:qz...op3gujgy");
+        assert!(short.chars().count() <= 19);
+        assert_eq!(shorten_middle(addr, 3), "...");
+    }
 
     #[test]
     fn format_duration_uses_two_largest_units() {

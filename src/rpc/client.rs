@@ -5,7 +5,8 @@ use anyhow::Result;
 use futures::stream::{self, StreamExt};
 use kaspa_rpc_core::api::rpc::RpcApi;
 use kaspa_rpc_core::{
-    GetVirtualChainFromBlockV2Response, RpcDataVerbosityLevel, RpcHash, RpcOptionalTransaction,
+    GetVirtualChainFromBlockV2Response, RpcDataVerbosityLevel, RpcHash, RpcHeader,
+    RpcOptionalTransaction,
 };
 use kaspa_wrpc_client::prelude::*;
 use serde::Serialize;
@@ -14,12 +15,12 @@ use std::str::FromStr;
 use tokio::sync::RwLock;
 
 use crate::analytics::{BlockSummary, Metrics};
-use crate::app::{App, ConnectionStatus};
+use crate::app::{App, ConnectionStatus, DagBlock, Tab};
 use crate::rpc::methods::{
     self, parse_address, parse_addresses, parse_bool, parse_hash, parse_opt_u64,
     parse_subnetwork_id, parse_u64, parse_u64_list, parse_verbosity,
 };
-use crate::rpc::types::{shorten_address, sompi_to_kas};
+use crate::rpc::types::sompi_to_kas;
 use crate::tx_inspect::{
     OpcodeUsage, ScriptClass, coinbase_node_version, detect_protocol, output_script_opcodes,
     redeem_script_opcodes, script_class,
@@ -130,11 +131,7 @@ impl RpcManager {
 
         match dag_info {
             Ok(v) => {
-                let info: crate::rpc::types::DagInfo = v.into();
-                app.node
-                    .dag_visualizer
-                    .update(&info.tip_hashes, &info.virtual_parent_hashes);
-                app.node.dag_info = Some(info);
+                app.node.dag_info = Some(v.into());
             }
             Err(e) => errors.push(format!("dag_info: {}", e)),
         }
@@ -179,6 +176,68 @@ impl RpcManager {
             Some(errors.join("; "))
         };
         app.mark_dirty();
+    }
+
+    /// Feed the DAG visualizer from the node's `BlockAdded` notifications until the
+    /// surrounding task is aborted. The node drops subscriptions with the connection (and
+    /// the client rebuilds its notifier), so subscribe again on every connect.
+    pub async fn stream_blocks(&self) {
+        let ctl = self.client.rpc_ctl().multiplexer().channel();
+        let (sender, receiver) = async_channel::unbounded();
+        if self.client.is_connected() {
+            self.subscribe_blocks(&sender).await;
+        }
+        loop {
+            tokio::select! {
+                state = ctl.receiver.recv() => match state {
+                    Ok(RpcState::Connected) => self.subscribe_blocks(&sender).await,
+                    Ok(RpcState::Disconnected) => {}
+                    Err(_) => return,
+                },
+                notification = receiver.recv() => match notification {
+                    Ok(Notification::BlockAdded(n)) => self.record_block(&n.block.header).await,
+                    Ok(_) => {}
+                    Err(_) => return,
+                },
+            }
+        }
+    }
+
+    async fn subscribe_blocks(&self, sender: &async_channel::Sender<Notification>) {
+        let id = self.client.register_new_listener(ChannelConnection::new(
+            "x4kas-dag",
+            sender.clone(),
+            ChannelType::Persistent,
+        ));
+        if let Err(e) = self
+            .client
+            .start_notify(id, Scope::BlockAdded(BlockAddedScope {}))
+            .await
+        {
+            self.app_state.write().await.node.last_error = Some(format!("block_added: {e}"));
+        }
+    }
+
+    async fn record_block(&self, header: &RpcHeader) {
+        let mut app = self.app_state.write().await;
+        // Skip IBD's flood of old blocks, and keep the view frozen while paused.
+        let synced = app.node.server_info.as_ref().is_some_and(|s| s.is_synced);
+        if app.paused || !synced {
+            return;
+        }
+        let block = DagBlock {
+            hash: header.hash.to_string(),
+            daa_score: header.daa_score,
+            parents: header
+                .direct_parents()
+                .iter()
+                .map(|h| h.to_string())
+                .collect(),
+        };
+        // Only the BlockDAG tab shows these, so don't wake the GUI ten times a second elsewhere.
+        if app.node.dag_visualizer.add(block) && app.active_tab == Tab::BlockDag {
+            app.mark_dirty();
+        }
     }
 
     /// Run a read-only RPC method from the RPC Cmds tab or command palette. Missing or
@@ -378,8 +437,7 @@ impl RpcManager {
                     && let Some(ref verbose) = output.verbose_data
                 {
                     let addr = verbose.script_public_key_address.to_string();
-                    let short_addr = crate::rpc::types::shorten_address(&addr, 10, 6);
-                    *miner_counts.entry(short_addr).or_insert(0) += 1;
+                    *miner_counts.entry(addr).or_insert(0) += 1;
                 }
             }
         }
@@ -495,8 +553,7 @@ fn record_transaction(metrics: &mut Metrics, tx: &RpcOptionalTransaction) {
             .as_ref()
             .and_then(|uvd| uvd.script_public_key_address.as_ref())
         {
-            let short = shorten_address(&addr.to_string(), 10, 6);
-            *metrics.senders.entry(short).or_insert(0) += 1;
+            *metrics.senders.entry(addr.to_string()).or_insert(0) += 1;
         }
         if utxo.covenant_id.is_some() {
             covenant_spent += 1;
@@ -525,8 +582,7 @@ fn record_transaction(metrics: &mut Metrics, tx: &RpcOptionalTransaction) {
             .as_ref()
             .and_then(|vd| vd.script_public_key_address.as_ref())
         {
-            let short = shorten_address(&addr.to_string(), 10, 6);
-            *metrics.receivers.entry(short).or_insert(0) += 1;
+            *metrics.receivers.entry(addr.to_string()).or_insert(0) += 1;
         }
     }
 

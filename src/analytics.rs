@@ -178,9 +178,10 @@ const MAX_MINUTE_BUCKETS: usize = 60;
 const MAX_TEN_MINUTE_BUCKETS: usize = 144;
 const MAX_ADDRESSES_PER_BUCKET: usize = 100;
 const TOP_ADDRESSES: usize = 20;
-/// Written before the engine in the cache file; bump when the format changes so
+/// Written before the engine in the cache file; bump when the format or the meaning of
+/// its data changes (e.g. full instead of shortened addresses) so
 /// an old cache is discarded instead of misread.
-const CACHE_MAGIC: u64 = 0x7475_6934_6b61_7302;
+const CACHE_MAGIC: u64 = 0x7475_6934_6b61_7303;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnalyticsEngine {

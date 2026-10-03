@@ -165,17 +165,6 @@ pub fn format_number(n: u64) -> String {
     result.chars().rev().collect()
 }
 
-pub fn shorten_address(addr: &str, prefix_len: usize, suffix_len: usize) -> String {
-    let char_count = addr.chars().count();
-    if char_count > prefix_len + suffix_len + 3 {
-        let prefix: String = addr.chars().take(prefix_len).collect();
-        let suffix: String = addr.chars().skip(char_count - suffix_len).collect();
-        format!("{}...{}", prefix, suffix)
-    } else {
-        addr.to_string()
-    }
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct MiningInfo {
     pub hashrate: f64,
@@ -399,21 +388,5 @@ mod tests {
     #[test]
     fn format_number_millions() {
         assert_eq!(format_number(1_000_000), "1,000,000");
-    }
-
-    // --- shorten_address ---
-
-    #[test]
-    fn shorten_address_short() {
-        assert_eq!(shorten_address("abcdef", 10, 6), "abcdef");
-    }
-
-    #[test]
-    fn shorten_address_long() {
-        let addr = "kaspa:abcdefghijklmnopqrstuvwxyz0123456789";
-        let result = shorten_address(addr, 10, 6);
-        assert!(result.contains("..."));
-        assert!(result.starts_with("kaspa:abcd"));
-        assert!(result.ends_with("456789"));
     }
 }

@@ -35,7 +35,7 @@ egui/eframe desktop GUI for monitoring a Kaspa L1 node via wRPC, connecting by U
 - `src/analytics.rs` / `src/analytics_streaming.rs`: chain analytics (per-chain-block `Metrics` rolled into 1m/10m buckets, `AggregatedView` per window) and its VSPC v2 streaming task (cache at `~/.x4kas/analytics_cache.bin`, versioned by `CACHE_MAGIC`; bump it when the format changes). The task reports its progress in `app.analytics.status` (`AnalyticsStatus`/`AnalyticsPhase`), waits for a connected, synced node, and retries failed requests instead of exiting. All data comes from the connected node.
 - `src/tx_inspect.rs`: per-transaction classification, mirroring Kaspalytics: protocol detection, output script classes, covenant/introspection/ZK opcode scanning, coinbase node-version parsing.
 - `src/format.rs`: pure formatting helpers (`format_hashrate`, `format_usd`, `format_kas`, …).
-- `src/rpc/client.rs`: `RpcManager`. Connect, background polling, RPC execution, mining/analytics fetches, block lookup.
+- `src/rpc/client.rs`: `RpcManager`. Connect, background polling, the `BlockAdded` stream that feeds the DAG visualizer (`stream_blocks`, joined with polling in the `handles.node` task, resubscribing on every connect), RPC execution, mining/analytics fetches, block lookup.
 - `src/rpc/market.rs`: CoinGecko market polling (every 60s).
 - `src/rpc/methods.rs`: `RPC_METHODS` catalog (name, description, typed params with defaults), `resolve_args`, and argument parsers.
 - `src/rpc/hash_links.rs`: finds block hashes (by field name) in JSON responses so the result viewer can link them to `get_block`.
@@ -43,14 +43,14 @@ egui/eframe desktop GUI for monitoring a Kaspa L1 node via wRPC, connecting by U
 - `src/gui/mod.rs`: `GuiApp` (`eframe::App`). Frame loop, top bar (brand, tab strip, palette/help buttons), bottom status bar (connection, node sync and analytics indicators with details on hover, network, DAA score colored by lag behind the DAG tip, pause), keyboard shortcuts, quit handling.
 - `src/gui/dashboard.rs`: Dashboard tab (node info + block counts, markets, network stats + hashrate + supply, mempool & fees cards).
 - `src/gui/mempool.rs`: Mempool tab (`egui_extras` table, click a row for the detail window).
-- `src/gui/blockdag.rs`: BlockDAG tab (custom painter DAG visualizer, metrics, GHOSTDAG stats, tip/parent lists, Block Info window).
-- `src/gui/analytics.rs`: Analytics tab, modeled on the Kaspalytics home page. Rows: Transaction Summary (tx count, TPS, output script classes; chart of txs per bin) / Fees (node fee-rate estimate, average and total accepted fees per window), Transaction Inspection (opcodes, covenants, protocols), Mining Share by Node Version / Mining Analysis, Top Senders / Top Receivers. Panels have a time window (`AnalyticsPanel`/`PanelState`) and most a Table/Chart toggle.
+- `src/gui/blockdag.rs`: BlockDAG tab (DAG visualizer modeled on the Kaspalytics home page: newest DAA scores as columns, parent edges, tips highlighted, hovering pauses it, then hover/click blocks; animation state in egui memory, metrics, GHOSTDAG stats, tip/parent lists, Block Info window).
+- `src/gui/analytics.rs`: Analytics tab, modeled on the Kaspalytics home page. Rows: Transaction Summary (tx count, TPS, output script classes; chart of txs per bin) / Fees (node fee-rate estimate, average and total accepted fees per window), Transaction Inspection (opcodes, covenants, protocols), Mining Share by Node Version / Mining Analysis, Top Senders / Top Receivers. Panels have a time window dropdown in the card header (`panel_card`, `AnalyticsPanel`/`PanelState`) and most a Table/Chart toggle, currently hidden by `CHARTS_ENABLED = false` (tables only).
 - `src/gui/rpc_explorer.rs`: RPC Cmds tab (method list, argument form, Loop toggle, read-only JSON result viewer with 🔍 links on block hashes that run `get_block`).
 - `src/gui/connection.rs`: `ConnectionWindow`, opened from the status-bar connection button. Custom URL / public resolver, network, Connect/Disconnect.
 - `src/gui/command.rs`: command palette (bottom panel: input, suggestions, output).
 - `src/gui/help.rs`: help window (shortcuts).
 - `src/gui/theme.rs`: palette constants, `apply` (monospace fonts + dark visuals, installed at startup), and status → label/color mapping.
-- `src/gui/widgets.rs`: shared building blocks (`card` with the title set into its border, `kv_grid`/`kv`, `section_title`, `column_header`, `primary_button`, `status_chip`, `placeholder`, `direct_node_placeholder`, `CARD_GAP`).
+- `src/gui/widgets.rs`: shared building blocks (`card` with the title set into its border and `card_with_header` for widgets after the title, `kv_grid`/`kv`, `section_title`, `column_header`, `primary_button`, `status_chip`, `placeholder`, `direct_node_placeholder`, `CARD_GAP`, `fit_label`, and `address`/`block_hash`: fitted value, copy icon and hover highlight; a click on an address opens an explorer menu, on a block hash the Block Info window; `copy_value` for plain text with a copy icon).
 
 ### Dependencies
 
@@ -66,6 +66,7 @@ egui/eframe desktop GUI for monitoring a Kaspa L1 node via wRPC, connecting by U
 - Background code that mutates `App` must call `app.mark_dirty()` so the GUI repaints.
 - GUI-only view state (popups open, help visible) lives in `GuiApp` or egui memory, not `App`, unless tests need it.
 - All RPC types have UI-friendly wrapper structs in `rpc/types.rs`. Don't use raw kaspa types in UI code.
+- Show every Kaspa address with `widgets::address` and every block hash with `widgets::block_hash`, never a plain label. A block hash click calls `widgets::request_block`; the frame loop in `gui/mod.rs` sends `LookupBlock` and draws the Block Info window (`blockdag::block_window`, with the hash and explorer links) on any tab.
 - Use `theme::*` colors and `widgets::*` helpers for a consistent look; never hard-code `Color32`s in views. Labels use `.weak()`. All text is already monospace, so don't add `.monospace()`.
 - Shortcuts are ignored while a text field has focus (`ctx.wants_keyboard_input()`), except Cmd/Ctrl+K.
 - Shortcuts: `1`–`5` tabs, Ctrl+Tab / Ctrl+Shift+Tab cycle, `p` pause, `:` or Cmd/Ctrl+K palette, `?`/F1 help, Esc closes popups.

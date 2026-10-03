@@ -74,7 +74,8 @@ pub fn start_mining_polling(
     handles.analytics = None;
 }
 
-/// Create an RPC manager, then connect and poll in a task tracked by `handles.node`.
+/// Create an RPC manager, then connect, poll and stream blocks in a task tracked by
+/// `handles.node`.
 /// `url: None` connects through the public node resolver.
 pub async fn create_and_start_rpc(
     url: Option<String>,
@@ -90,10 +91,14 @@ pub async fn create_and_start_rpc(
     let interval = refresh_interval_ms;
     let app_clone = app.clone();
     handles.node = Some(tokio::spawn(async move {
-        let _ = rpc_for_connect.connect().await;
-        rpc_for_connect
-            .poll_forever(Duration::from_millis(interval), app_clone)
-            .await;
+        // The block stream goes first so it is listening before the first connect.
+        let poll = async {
+            let _ = rpc_for_connect.connect().await;
+            rpc_for_connect
+                .poll_forever(Duration::from_millis(interval), app_clone)
+                .await;
+        };
+        tokio::join!(rpc_for_connect.stream_blocks(), poll);
     }));
 
     Ok(rpc)

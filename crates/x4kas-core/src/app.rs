@@ -158,9 +158,9 @@ impl DagStats {
 pub enum Tab {
     #[default]
     Dashboard,
-    Mempool,
-    BlockDag,
     Analytics,
+    BlockDag,
+    Mempool,
     RpcExplorer,
 }
 
@@ -168,9 +168,9 @@ impl Tab {
     pub fn all() -> &'static [Tab] {
         &[
             Tab::Dashboard,
-            Tab::Mempool,
-            Tab::BlockDag,
             Tab::Analytics,
+            Tab::BlockDag,
+            Tab::Mempool,
             Tab::RpcExplorer,
         ]
     }
@@ -179,9 +179,9 @@ impl Tab {
     pub fn label(&self) -> &'static str {
         match self {
             Tab::Dashboard => "Dashboard",
-            Tab::Mempool => "Mempool",
-            Tab::BlockDag => "BlockDAG",
             Tab::Analytics => "Analytics",
+            Tab::BlockDag => "BlockDAG",
+            Tab::Mempool => "Mempool",
             Tab::RpcExplorer => "RPC Cmds",
         }
     }
@@ -765,7 +765,7 @@ mod tests {
         let labels: Vec<_> = Tab::all().iter().map(Tab::label).collect();
         assert_eq!(
             labels,
-            ["Dashboard", "Mempool", "BlockDAG", "Analytics", "RPC Cmds"]
+            ["Dashboard", "Analytics", "BlockDAG", "Mempool", "RPC Cmds"]
         );
     }
 
@@ -783,11 +783,11 @@ mod tests {
         let mut app = App::default();
         assert_eq!(app.active_tab, Tab::Dashboard);
         app.next_tab();
-        assert_eq!(app.active_tab, Tab::Mempool);
+        assert_eq!(app.active_tab, Tab::Analytics);
         app.next_tab();
         assert_eq!(app.active_tab, Tab::BlockDag);
         app.next_tab();
-        assert_eq!(app.active_tab, Tab::Analytics);
+        assert_eq!(app.active_tab, Tab::Mempool);
         app.next_tab();
         assert_eq!(app.active_tab, Tab::RpcExplorer);
         app.next_tab();
@@ -800,7 +800,7 @@ mod tests {
         app.prev_tab();
         assert_eq!(app.active_tab, Tab::RpcExplorer); // wraps from 0
         // Navigate back a couple
-        app.active_tab = Tab::Analytics;
+        app.active_tab = Tab::Mempool;
         app.prev_tab();
         assert_eq!(app.active_tab, Tab::BlockDag);
     }

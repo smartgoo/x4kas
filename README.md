@@ -9,9 +9,9 @@ Built with [egui/eframe](https://github.com/emilk/egui) and [rusty-kaspa](https:
 ## Features
 
 - **Dashboard**: node info, network stats and coin supply, market data (CoinGecko), mempool and fee estimates
-- **Mempool**: live transaction table; click a row for details
-- **BlockDAG**: interactive DAG visualizer, DAG metrics, GHOSTDAG stats, tip and virtual-parent hashes; click any block for full block info
 - **Analytics** (direct node only): transaction summary, fees, transaction inspection (opcodes, covenants, protocols), mining share by node version, mining analysis, top senders and receivers, each over a 1m / 1h / 24h window
+- **BlockDAG**: interactive DAG visualizer, DAG metrics, GHOSTDAG stats, tip and virtual-parent hashes; click any block for full block info
+- **Mempool**: live transaction table; click a row for details
 - **RPC Cmds**: run any of 36 read-only RPC methods (with argument forms for those that take a hash, address or number) and inspect formatted responses
 - **Connection switcher**: connect to a node by URL or through the public resolver, from inside the app
 - **Integrated terminal**: your login shell in a bottom pane (`` Ctrl+` ``), a full PTY terminal

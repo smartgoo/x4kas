@@ -522,6 +522,8 @@ pub struct DagSelection {
     pub block_loading: bool,
 }
 
+pub type RepaintFn = Arc<dyn Fn() + Send + Sync>;
+
 pub struct App {
     pub active_tab: Tab,
     pub should_quit: bool,
@@ -541,6 +543,8 @@ pub struct App {
     pub show_help: bool,
     pub quit_confirm: bool,
     pub dirty: bool,
+    /// Called by `mark_dirty()` so a frontend can wake up and redraw.
+    pub repaint: Option<RepaintFn>,
     pub has_direct_node: bool,
 
     pub integrated_node: IntegratedNodeState,
@@ -563,8 +567,17 @@ impl App {
             show_help: false,
             quit_confirm: false,
             dirty: true,
+            repaint: None,
             has_direct_node: false,
             integrated_node: IntegratedNodeState::new(daemon_config),
+        }
+    }
+
+    /// Flag state as changed and ask the frontend to redraw.
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+        if let Some(ref repaint) = self.repaint {
+            repaint();
         }
     }
 

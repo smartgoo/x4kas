@@ -181,7 +181,7 @@ pub fn start_analytics_streaming(
                             app_guard.analytics.reorg_notification = Some(msg);
                         }
                         app_guard.analytics.cached_views = Some(cached_views);
-                        app_guard.dirty = true;
+                        app_guard.mark_dirty();
                     }
                 }
                 Err(_) => {

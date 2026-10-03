@@ -173,7 +173,7 @@ impl RpcManager {
             } else {
                 Some(errors.join("; "))
             };
-            app.dirty = true;
+            app.mark_dirty();
         } else {
             let mut app = state.write().await;
             let poll_duration_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -184,7 +184,7 @@ impl RpcManager {
             } else {
                 Some(errors.join("; "))
             };
-            app.dirty = true;
+            app.mark_dirty();
         }
     }
 
@@ -343,7 +343,7 @@ impl RpcManager {
 
         let unique_miners = miner_counts.len();
         let mut top_miners: Vec<(String, usize)> = miner_counts.into_iter().collect();
-        top_miners.sort_by(|a, b| b.1.cmp(&a.1));
+        top_miners.sort_by_key(|a| std::cmp::Reverse(a.1));
         top_miners.truncate(5);
 
         Ok(crate::rpc::types::MiningInfo {

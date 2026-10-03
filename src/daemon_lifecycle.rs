@@ -55,7 +55,7 @@ pub fn start_mining_polling(
             {
                 let mut app = app_for_mining.write().await;
                 app.node.mining_info = Some(info);
-                app.dirty = true;
+                app.mark_dirty();
             }
         }
     }));
@@ -163,7 +163,7 @@ pub fn start_log_tailing(config: &DaemonConfig, app: Arc<RwLock<App>>) -> tokio:
                     let total = app_guard.integrated_node.log_lines.len();
                     app_guard.integrated_node.log_scroll = total;
                 }
-                app_guard.dirty = true;
+                app_guard.mark_dirty();
             }
         }
     })

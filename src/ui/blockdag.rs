@@ -5,6 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
 use crate::app::{App, DagFocus};
+use crate::format::truncate_hash;
 use crate::rpc::types::format_number;
 
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
@@ -352,55 +353,4 @@ fn render_block_popup(frame: &mut Frame, area: Rect, detail: &str) {
         .wrap(Wrap { trim: false });
 
     frame.render_widget(popup, popup_area);
-}
-
-fn truncate_hash(hash: &str) -> String {
-    let char_count = hash.chars().count();
-    if char_count > 24 {
-        let prefix: String = hash.chars().take(12).collect();
-        let suffix: String = hash.chars().skip(char_count - 12).collect();
-        format!("{}...{}", prefix, suffix)
-    } else {
-        hash.to_string()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn truncate_hash_short() {
-        assert_eq!(truncate_hash("abcdef"), "abcdef");
-    }
-
-    #[test]
-    fn truncate_hash_exactly_24() {
-        let hash = "a".repeat(24);
-        assert_eq!(truncate_hash(&hash), hash);
-    }
-
-    #[test]
-    fn truncate_hash_long() {
-        let hash = "abcdefghijklmnopqrstuvwxyz0123456789";
-        let result = truncate_hash(hash);
-        // first 12 + "..." + last 12
-        assert_eq!(result, "abcdefghijkl...yz0123456789");
-        assert_eq!(result.len(), 27);
-    }
-
-    #[test]
-    fn truncate_hash_empty() {
-        assert_eq!(truncate_hash(""), "");
-    }
-
-    #[test]
-    fn truncate_hash_realistic() {
-        let hash = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
-        let result = truncate_hash(hash);
-        assert_eq!(result.len(), 27); // 12 + 3 + 12
-        assert!(result.starts_with("abcdef123456"));
-        assert!(result.ends_with("ef1234567890"));
-        assert!(result.contains("..."));
-    }
 }

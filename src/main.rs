@@ -3,9 +3,11 @@ mod analytics_streaming;
 mod app;
 mod cli;
 mod config;
+mod controller;
 mod daemon;
 mod daemon_lifecycle;
 mod event;
+mod format;
 mod keys;
 mod rpc;
 mod ui;
@@ -24,13 +26,11 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::RwLock;
 
-use crate::app::{App, DaemonStatus};
+use crate::app::App;
 use crate::cli::CliArgs;
 use crate::config::DaemonConfig;
-use crate::daemon_lifecycle::{PollingHandles, create_and_start_rpc, start_mining_polling};
+use crate::controller::{ControllerArgs, UiCommand};
 use crate::event::{AppEvent, EventHandler};
-use crate::keys::DaemonCommand;
-use crate::rpc::client::RpcManager;
 use crate::rpc::market;
 
 #[tokio::main]
@@ -60,177 +60,25 @@ async fn main() -> Result<()> {
     // Create shared app state
     let app = Arc::new(RwLock::new(App::new(daemon_config.clone())));
 
-    let original_url = args.url.clone();
-    let refresh_interval_ms = args.refresh_interval_ms;
-    let network = args.network.clone();
-
-    // Daemon lifecycle management channel
-    let (daemon_cmd_tx, mut daemon_cmd_rx) = tokio::sync::mpsc::channel::<DaemonCommand>(4);
-
-    let mut daemon_handle: Option<daemon::DaemonHandle> = None;
-    let mut log_tail_handle: Option<tokio::task::JoinHandle<()>> = None;
-    let mut polling_handles = PollingHandles::new();
-
     // Start market data polling (every 60 seconds) — independent of node
     market::start_market_polling(app.clone(), Duration::from_secs(60));
 
-    // Determine startup mode:
-    // 1. --url provided: connect directly to that node
-    // 2. auto_start_daemon (no --url): start integrated daemon, connect to it
-    // 3. neither: start with no connection, user starts daemon from Embedded Node tab
-    let mut rpc_for_explorer: Arc<RpcManager>;
-
-    if original_url.is_some() {
-        // Direct URL mode — connect to specified node
-        app.write().await.has_direct_node = true;
-        rpc_for_explorer =
-            create_and_start_rpc(args.url, &network, &app, refresh_interval_ms, false).await?;
-        start_mining_polling(&rpc_for_explorer, &app, &mut polling_handles);
-        analytics_streaming::start_analytics_streaming(&rpc_for_explorer, &app, &mut polling_handles);
-    } else if daemon_config.auto_start_daemon {
-        // Auto-start integrated daemon
-        {
-            let mut app_guard = app.write().await;
-            app_guard.integrated_node.status = DaemonStatus::Starting;
-        }
-        match daemon_lifecycle::start_daemon_and_connect(
-            &daemon_config,
-            &app,
-            refresh_interval_ms,
-            &mut polling_handles,
-        )
-        .await
-        {
-            Ok((handle, rpc, log_handle)) => {
-                daemon_handle = Some(handle);
-                rpc_for_explorer = rpc;
-                log_tail_handle = Some(log_handle);
-            }
-            Err(e) => {
-                let mut app_guard = app.write().await;
-                app_guard.integrated_node.status = DaemonStatus::Error(e.to_string());
-                drop(app_guard);
-                rpc_for_explorer =
-                    Arc::new(RpcManager::new(None, &network, app.clone()).await?);
-            }
-        }
-    } else {
-        // No URL, no auto-start: start disconnected, user starts daemon from tab
-        app.write().await.has_direct_node = false;
-        rpc_for_explorer =
-            Arc::new(RpcManager::new(None, &network, app.clone()).await?);
-    }
+    // Controller owns the node connection / embedded daemon lifecycle
+    let cmd_tx = controller::spawn(
+        &tokio::runtime::Handle::current(),
+        app.clone(),
+        ControllerArgs {
+            url: args.url.clone(),
+            network: args.network.clone(),
+            refresh_interval_ms: args.refresh_interval_ms,
+        },
+        daemon_config,
+    );
 
     // Event loop
     let mut events = EventHandler::new(Duration::from_millis(250));
 
     loop {
-        // Check for daemon commands (non-blocking)
-        if let Ok(cmd) = daemon_cmd_rx.try_recv() {
-            match cmd {
-                DaemonCommand::Start(config) => {
-                    // Abort old polling
-                    polling_handles.abort_all();
-                    let _ = rpc_for_explorer.disconnect().await;
-
-                    match daemon_lifecycle::start_daemon_and_connect(
-                        &config,
-                        &app,
-                        refresh_interval_ms,
-                        &mut polling_handles,
-                    )
-                    .await
-                    {
-                        Ok((handle, rpc, log_handle)) => {
-                            daemon_handle = Some(handle);
-                            rpc_for_explorer = rpc;
-                            log_tail_handle = Some(log_handle);
-                        }
-                        Err(e) => {
-                            // Shut down daemon if it was started but RPC failed
-                            if let Some(mut h) = daemon_handle.take() {
-                                h.shutdown();
-                            }
-                            let mut app_guard = app.write().await;
-                            app_guard.integrated_node.status =
-                                DaemonStatus::Error(e.to_string());
-                        }
-                    }
-                }
-                DaemonCommand::Stop => {
-                    // Abort polling
-                    polling_handles.abort_all();
-                    if let Some(h) = log_tail_handle.take() {
-                        h.abort();
-                    }
-                    let _ = rpc_for_explorer.disconnect().await;
-
-                    // Shutdown daemon
-                    if let Some(mut h) = daemon_handle.take() {
-                        h.shutdown();
-                    }
-
-                    // Clear stale data
-                    {
-                        let mut app_guard = app.write().await;
-                        app_guard.node.server_info = None;
-                        app_guard.node.dag_info = None;
-                        app_guard.node.mempool_state = None;
-                        app_guard.node.coin_supply = None;
-                        app_guard.node.fee_estimate = None;
-                        app_guard.node.mining_info = None;
-                        app_guard.analytics.engine = None;
-                        app_guard.analytics.sync_progress = None;
-                        app_guard.analytics.cached_views = None;
-                        app_guard.node.node_url = None;
-                        app_guard.node.node_uid = None;
-                        app_guard.integrated_node.status = DaemonStatus::Stopped;
-                        app_guard.integrated_node.started_at = None;
-                        app_guard.has_direct_node = original_url.is_some();
-                        if original_url.is_none() {
-                            app_guard.node.connection_status =
-                                crate::app::ConnectionStatus::Disconnected;
-                        }
-                    }
-
-                    if let Some(ref url) = original_url {
-                        // Restore original direct URL connection
-                        match create_and_start_rpc(
-                            Some(url.clone()),
-                            &network,
-                            &app,
-                            refresh_interval_ms,
-                            false,
-                        )
-                        .await
-                        {
-                            Ok(new_rpc) => {
-                                rpc_for_explorer = new_rpc;
-                                start_mining_polling(
-                                    &rpc_for_explorer,
-                                    &app,
-                                    &mut polling_handles,
-                                );
-                                analytics_streaming::start_analytics_streaming(
-                                    &rpc_for_explorer,
-                                    &app,
-                                    &mut polling_handles,
-                                );
-                            }
-                            Err(_) => {
-                                // Best effort — app continues without RPC
-                            }
-                        }
-                    } else {
-                        // No original URL — stay disconnected, no PNN fallback
-                        rpc_for_explorer = Arc::new(
-                            RpcManager::new(None, &network, app.clone()).await?,
-                        );
-                    }
-                }
-            }
-        }
-
         // Draw (skip if nothing changed)
         {
             let mut app_guard = app.write().await;
@@ -252,21 +100,11 @@ async fn main() -> Result<()> {
 
                 if app_guard.command_line.active {
                     if let Some(cmd) = keys::handle_command_mode_keys(&mut app_guard, key.code) {
-                        drop(app_guard);
-                        keys::handle_command(&cmd, &app, &rpc_for_explorer).await;
+                        let _ = cmd_tx.send(UiCommand::RunCommandLine(cmd));
                         continue;
                     }
-                } else {
-                    let consumed = keys::handle_normal_keys(
-                        &mut app_guard,
-                        key,
-                        &rpc_for_explorer,
-                        &app,
-                        &daemon_cmd_tx,
-                    );
-                    if consumed {
-                        continue;
-                    }
+                } else if keys::handle_normal_keys(&mut app_guard, key, &cmd_tx) {
+                    continue;
                 }
 
                 if app_guard.should_quit {
@@ -289,42 +127,18 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Shut down embedded daemon before restoring terminal so user sees status
-    if daemon_handle.is_some() {
-        // Update status and render one final frame showing "Stopping..."
+    // Shut down the controller (and embedded daemon) before restoring the terminal
+    // so the user sees the "Stopping..." status.
+    let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
+    let _ = cmd_tx.send(UiCommand::Shutdown(done_tx));
+    loop {
         {
-            let mut app_guard = app.write().await;
-            app_guard.integrated_node.status = DaemonStatus::Stopping;
+            let app_guard = app.read().await;
             terminal.draw(|f| ui::draw(f, &app_guard))?;
         }
-
-        // Stop polling and RPC first
-        polling_handles.abort_all();
-        if let Some(h) = log_tail_handle {
-            h.abort();
-        }
-        drop(rpc_for_explorer);
-
-        // Shut down the daemon — this blocks until the node finishes
-        if let Some(mut h) = daemon_handle {
-            h.shutdown();
-        }
-    } else {
-        polling_handles.abort_all();
-        drop(rpc_for_explorer);
-    }
-
-    // Persist analytics cache before exit (best-effort — analytics streaming also saves on exit)
-    {
-        let app_guard = app.read().await;
-        if let Some(ref engine) = app_guard.analytics.engine
-            && let Ok(eng) = engine.try_read()
-        {
-            let cache_path = dirs::home_dir()
-                .unwrap_or_default()
-                .join(".tui4kas")
-                .join("analytics_cache.bin");
-            let _ = eng.save(&cache_path);
+        tokio::select! {
+            _ = &mut done_rx => break,
+            _ = tokio::time::sleep(Duration::from_millis(250)) => {}
         }
     }
 

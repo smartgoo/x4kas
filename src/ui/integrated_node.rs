@@ -5,24 +5,13 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::app::{App, DaemonStatus, IntegratedNodeState};
+use crate::format::{bool_str, opt_f64, opt_str, opt_usize};
 
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     match &app.integrated_node.status {
         DaemonStatus::Stopped | DaemonStatus::Error(_) => render_settings(frame, area, app),
         _ => render_running(frame, area, app),
     }
-}
-
-fn opt_str(val: &Option<String>) -> &str {
-    val.as_deref().unwrap_or("—")
-}
-
-fn opt_usize(val: &Option<usize>) -> String {
-    val.map_or("—".to_string(), |v| v.to_string())
-}
-
-fn opt_f64(val: &Option<f64>) -> String {
-    val.map_or("—".to_string(), |v| format!("{:.1}", v))
 }
 
 fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
@@ -172,10 +161,6 @@ fn section_header(title: &str) -> Line<'static> {
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
     ))
-}
-
-fn bool_str(v: bool) -> String {
-    if v { "Yes" } else { "No" }.to_string()
 }
 
 fn append_fields(

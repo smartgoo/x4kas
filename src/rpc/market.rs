@@ -39,7 +39,7 @@ pub fn start_market_polling(app_state: Arc<RwLock<App>>, interval: Duration) {
             if let Ok(data) = fetch_market_data(&client).await {
                 let mut app = app_state.write().await;
                 app.market_data = Some(data);
-                app.dirty = true;
+                app.mark_dirty();
             }
         }
     });

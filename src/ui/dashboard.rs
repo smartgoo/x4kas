@@ -5,6 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::app::App;
+use crate::format::{format_hashrate, format_usd};
 use crate::rpc::types::{format_number, sompi_to_kas};
 
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
@@ -323,36 +324,6 @@ fn render_mining_info(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn format_hashrate(hps: f64) -> String {
-    if hps >= 1e18 {
-        format!("{:.2} EH/s", hps / 1e18)
-    } else if hps >= 1e15 {
-        format!("{:.2} PH/s", hps / 1e15)
-    } else if hps >= 1e12 {
-        format!("{:.2} TH/s", hps / 1e12)
-    } else if hps >= 1e9 {
-        format!("{:.2} GH/s", hps / 1e9)
-    } else if hps >= 1e6 {
-        format!("{:.2} MH/s", hps / 1e6)
-    } else if hps >= 1e3 {
-        format!("{:.2} KH/s", hps / 1e3)
-    } else {
-        format!("{:.2} H/s", hps)
-    }
-}
-
-fn format_usd(value: f64) -> String {
-    if value >= 1_000_000_000.0 {
-        format!("${:.2}B", value / 1_000_000_000.0)
-    } else if value >= 1_000_000.0 {
-        format!("${:.2}M", value / 1_000_000.0)
-    } else if value >= 1_000.0 {
-        format!("${:.2}K", value / 1_000.0)
-    } else {
-        format!("${:.2}", value)
-    }
-}
-
 fn render_mempool_summary(frame: &mut Frame, area: Rect, app: &App) {
     if app.is_node_syncing() {
         let block = Block::default().borders(Borders::ALL).title(Span::styled(
@@ -416,87 +387,4 @@ fn render_mempool_summary(frame: &mut Frame, area: Rect, app: &App) {
     ));
 
     frame.render_widget(Paragraph::new(lines).block(block), area);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::rpc::types::format_number;
-
-    #[test]
-    fn format_number_zero() {
-        assert_eq!(format_number(0), "0");
-    }
-
-    #[test]
-    fn format_number_small() {
-        assert_eq!(format_number(1), "1");
-        assert_eq!(format_number(999), "999");
-    }
-
-    #[test]
-    fn format_number_thousands() {
-        assert_eq!(format_number(1_000), "1,000");
-        assert_eq!(format_number(12_345), "12,345");
-    }
-
-    #[test]
-    fn format_number_millions() {
-        assert_eq!(format_number(1_000_000), "1,000,000");
-        assert_eq!(format_number(123_456_789), "123,456,789");
-    }
-
-    #[test]
-    fn format_number_large() {
-        assert_eq!(format_number(1_000_000_000_000), "1,000,000,000,000");
-    }
-
-    // --- format_usd ---
-
-    #[test]
-    fn format_usd_billions() {
-        assert_eq!(format_usd(3_800_000_000.0), "$3.80B");
-    }
-
-    #[test]
-    fn format_usd_millions() {
-        assert_eq!(format_usd(50_000_000.0), "$50.00M");
-    }
-
-    #[test]
-    fn format_usd_thousands() {
-        assert_eq!(format_usd(1_500.0), "$1.50K");
-    }
-
-    #[test]
-    fn format_usd_small() {
-        assert_eq!(format_usd(42.50), "$42.50");
-    }
-
-    // --- format_hashrate ---
-
-    #[test]
-    fn format_hashrate_ph() {
-        assert_eq!(format_hashrate(1.5e15), "1.50 PH/s");
-    }
-
-    #[test]
-    fn format_hashrate_th() {
-        assert_eq!(format_hashrate(500e12), "500.00 TH/s");
-    }
-
-    #[test]
-    fn format_hashrate_gh() {
-        assert_eq!(format_hashrate(2.5e9), "2.50 GH/s");
-    }
-
-    #[test]
-    fn format_hashrate_mh() {
-        assert_eq!(format_hashrate(100e6), "100.00 MH/s");
-    }
-
-    #[test]
-    fn format_hashrate_small() {
-        assert_eq!(format_hashrate(500.0), "500.00 H/s");
-    }
 }

@@ -1,11 +1,8 @@
-use std::sync::Arc;
-
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use tokio::sync::RwLock;
 
-use crate::app::{App, CommandLine, DagFocus, DaemonStatus, IntegratedNodeState, Tab};
+use crate::app::{App, DagFocus, DaemonStatus, IntegratedNodeState, Tab};
 use crate::config::DaemonConfig;
-use crate::rpc::client::RpcManager;
+use crate::controller::{CommandSender, UiCommand};
 use crate::rpc::types::sompi_to_kas;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,9 +82,7 @@ pub fn handle_command_mode_keys(app: &mut App, code: KeyCode) -> Option<String> 
 pub fn handle_normal_keys(
     app: &mut App,
     key: KeyEvent,
-    rpc: &Arc<RpcManager>,
-    app_state: &Arc<RwLock<App>>,
-    daemon_tx: &tokio::sync::mpsc::Sender<DaemonCommand>,
+    cmd_tx: &CommandSender,
 ) -> bool {
     // Reset quit confirmation on any key that isn't 'q'
     if key.code != KeyCode::Char('q') {
@@ -147,11 +142,11 @@ pub fn handle_normal_keys(
         (KeyCode::Char('5'), _) => { app.active_tab = Tab::RpcExplorer; }
         (KeyCode::Char('6'), _) => { app.active_tab = Tab::IntegratedNode; }
         _ => match app.active_tab {
-            Tab::RpcExplorer => handle_rpc_explorer_keys(app, key.code, rpc, app_state),
+            Tab::RpcExplorer => handle_rpc_explorer_keys(app, key.code, cmd_tx),
             Tab::Mempool => handle_mempool_keys(app, key.code),
-            Tab::BlockDag => handle_blockdag_keys(app, key.code, rpc, app_state),
+            Tab::BlockDag => handle_blockdag_keys(app, key.code, cmd_tx),
             Tab::Analytics => handle_analytics_keys(app, key.code),
-            Tab::IntegratedNode => handle_integrated_node_keys(app, key.code, daemon_tx),
+            Tab::IntegratedNode => handle_integrated_node_keys(app, key.code, cmd_tx),
             _ => {}
         },
     }
@@ -246,17 +241,10 @@ pub fn handle_mouse(app: &mut App, mouse: MouseEvent) -> bool {
     false
 }
 
-/// Commands sent from key handlers to the main loop for daemon lifecycle management.
-pub enum DaemonCommand {
-    Start(Box<DaemonConfig>),
-    Stop,
-}
-
 pub fn handle_rpc_explorer_keys(
     app: &mut App,
     key: KeyCode,
-    rpc: &Arc<RpcManager>,
-    app_state: &Arc<RwLock<App>>,
+    cmd_tx: &CommandSender,
 ) {
     if app.rpc_explorer.available_methods.is_empty() {
         return;
@@ -279,18 +267,7 @@ pub fn handle_rpc_explorer_keys(
             app.rpc_explorer.is_loading = true;
             app.rpc_explorer.scroll_offset = 0;
 
-            let method = method.to_string();
-            let rpc = rpc.clone();
-            let state = app_state.clone();
-            tokio::spawn(async move {
-                let result = match rpc.execute_rpc_call(&method).await {
-                    Ok(response) => response,
-                    Err(e) => format!("Error: {}", e),
-                };
-                let mut app_guard = state.write().await;
-                app_guard.rpc_explorer.last_response = Some(result);
-                app_guard.rpc_explorer.is_loading = false;
-            });
+            let _ = cmd_tx.send(UiCommand::ExecuteRpc(method.to_string()));
         }
         KeyCode::Char('j') | KeyCode::Char('J') => {
             let step = if key == KeyCode::Char('J') { 10 } else { 1 };
@@ -369,8 +346,7 @@ pub fn handle_mempool_keys(app: &mut App, key: KeyCode) {
 pub fn handle_blockdag_keys(
     app: &mut App,
     key: KeyCode,
-    rpc: &Arc<RpcManager>,
-    app_state: &Arc<RwLock<App>>,
+    cmd_tx: &CommandSender,
 ) {
     if app.dag_selection.block_detail.is_some() {
         if key == KeyCode::Esc {
@@ -448,17 +424,7 @@ pub fn handle_blockdag_keys(
 
             if let Some(hash) = hash {
                 app.dag_selection.block_loading = true;
-                let rpc = rpc.clone();
-                let state = app_state.clone();
-                tokio::spawn(async move {
-                    let result = match rpc.get_block_by_hash(&hash).await {
-                        Ok(info) => info,
-                        Err(e) => format!("Error: {}", e),
-                    };
-                    let mut app_guard = state.write().await;
-                    app_guard.dag_selection.block_detail = Some(result);
-                    app_guard.dag_selection.block_loading = false;
-                });
+                let _ = cmd_tx.send(UiCommand::LookupBlock(hash));
             }
         }
         _ => {}
@@ -528,7 +494,7 @@ pub fn handle_analytics_keys(app: &mut App, key: KeyCode) {
 pub fn handle_integrated_node_keys(
     app: &mut App,
     key: KeyCode,
-    daemon_tx: &tokio::sync::mpsc::Sender<DaemonCommand>,
+    cmd_tx: &CommandSender,
 ) {
     let state = &mut app.integrated_node;
 
@@ -537,7 +503,7 @@ pub fn handle_integrated_node_keys(
         match key {
             KeyCode::Enter => {
                 if matches!(state.status, DaemonStatus::Running)
-                    && daemon_tx.try_send(DaemonCommand::Stop).is_ok()
+                    && cmd_tx.send(UiCommand::StopDaemon).is_ok()
                 {
                     state.status = DaemonStatus::Stopping;
                 }
@@ -630,7 +596,7 @@ pub fn handle_integrated_node_keys(
                                 state.log_scroll = 0;
                                 state.log_auto_scroll = true;
                                 state.status_message = None;
-                                match daemon_tx.try_send(DaemonCommand::Start(Box::new(state.config.clone()))) {
+                                match cmd_tx.send(UiCommand::StartDaemon(Box::new(state.config.clone()))) {
                                     Ok(()) => {
                                         state.status = DaemonStatus::Starting;
                                     }
@@ -757,47 +723,5 @@ fn apply_field_edit(config: &mut DaemonConfig, field: ConfigField, val: &str) {
             }
         }
         _ => {}
-    }
-}
-
-pub async fn handle_command(cmd: &str, app: &Arc<RwLock<App>>, rpc: &Arc<RpcManager>) {
-    let parts: Vec<&str> = cmd.trim().splitn(2, ' ').collect();
-    let command = parts[0];
-
-    match command {
-        "help" => {
-            let mut help_text = String::from("Available commands:\n\n");
-            for (name, desc) in CommandLine::available_commands() {
-                help_text.push_str(&format!("  {:<28} {}\n", name, desc));
-            }
-            help_text
-                .push_str("\nPress ':' to open command line, Esc to close, Up/Down for history");
-            let mut app_guard = app.write().await;
-            app_guard
-                .command_line
-                .push_output(cmd.to_string(), help_text, false);
-        }
-        "clear" => {
-            let mut app_guard = app.write().await;
-            app_guard.command_line.output.clear();
-            app_guard.command_line.show_output = false;
-        }
-        _ => {
-            // Try as RPC call
-            match rpc.execute_rpc_call(command).await {
-                Ok(response) => {
-                    let mut app_guard = app.write().await;
-                    app_guard
-                        .command_line
-                        .push_output(cmd.to_string(), response, false);
-                }
-                Err(e) => {
-                    let mut app_guard = app.write().await;
-                    app_guard
-                        .command_line
-                        .push_output(cmd.to_string(), e.to_string(), true);
-                }
-            }
-        }
     }
 }

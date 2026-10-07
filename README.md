@@ -8,9 +8,11 @@ Built with [egui/eframe](https://github.com/emilk/egui) and [rusty-kaspa](https:
 
 ## Features
 
-- **Dashboard**: node info, network stats and coin supply, market data (CoinGecko), mempool and fee estimates
-- **Analytics** (direct node only): transaction summary, fees, transaction inspection (opcodes, covenants, protocols), mining share by node version, mining analysis, top senders and receivers, each over a 1m / 1h / 24h window
-- **BlockDAG**: interactive DAG visualizer, DAG metrics, GHOSTDAG stats, tip and virtual-parent hashes; click any block for full block info
+- **Dashboard**: one responsive page whose cards reflow into rows as the window resizes
+  - Live, interactive BlockDAG visualizer; click any block for full block info
+  - BlockDAG stats (DAA and blue score, sink, pruning point, tips, DAG width, block interval, blue block rate) and market data (CoinGecko)
+  - Supply (incl. unspendable burn-address balance, block reward and next reduction), mining (difficulty, hashrate, unique miners) and node info
+  - Chain analytics (direct node only): transactions per 10 minutes over 24h, transaction summary, mempool, transaction inspection (opcodes, covenants, protocols), fees, mining share by node version, top miners, top senders and receivers, each over a 1m / 1h / 24h window
 - **Mempool**: live transaction table; click a row for details
 - **RPC Cmds**: run any of 36 read-only RPC methods (with argument forms for those that take a hash, address or number) and inspect formatted responses
 - **Connection switcher**: connect to a node by URL or through the public resolver, from inside the app
@@ -48,7 +50,7 @@ cargo build --release
 Without `--url`, the app opens the **Connection** window, where you choose:
 
 - **Custom URL**: any node's Borsh wRPC endpoint (port 17110 on mainnet, 17210 on testnets)
-- **Public resolver**: a public node chosen by the Kaspa resolver (mining and analytics need a direct node, so they're disabled)
+- **Public resolver**: a public node chosen by the Kaspa resolver (chain analytics needs a direct node, so it's disabled)
 
 Click the connection button in the bottom status bar to open the window again at any time. Switching connections stops whatever was running. Your last choice is saved and pre-filled next time.
 
@@ -108,7 +110,7 @@ Most actions are also available with the mouse.
 
 | Key | Action |
 |-----|--------|
-| `1` – `5` | Switch tab |
+| `1` – `3` | Switch tab |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous tab |
 | `p` | Pause / resume polling |
 | `` Ctrl+` `` | Show / hide the terminal |
@@ -122,12 +124,13 @@ Click into the terminal to type; app shortcuts are off until you click elsewhere
 ```
 crates/
   x4kas-core/src/       Shared library (no GUI): everything below the frontends
-    app.rs                Shared App state (Arc<RwLock<App>>), tabs
+    app.rs                Shared App state (Arc<RwLock<App>>), tabs (Dashboard, Mempool, RPC Cmds)
     controller.rs         UiCommand handling: connections, RPC calls, shutdown
     config.rs             Saved connection choice (~/.x4kas/connection.toml)
     polling.rs            RPC creation and background polling tasks
     analytics.rs          Chain analytics aggregation
     analytics_streaming.rs Analytics streaming task
+    emission.rs           Block reward schedule and burn address
     format.rs             Formatting helpers
     tx_inspect.rs         Per-transaction classification (scripts, opcodes, protocols)
     rpc/
@@ -140,7 +143,11 @@ crates/
     main.rs               Entry point: args, tokio runtime, GUI launch
     gui/
       mod.rs              GuiApp: frame loop, top bar, shortcuts, quit
-      dashboard.rs  mempool.rs  blockdag.rs  analytics.rs  rpc_explorer.rs
+      dashboard.rs        Dashboard tab: card layout and node-backed cards
+      blockdag.rs         DAG visualizer, BlockDAG card, Block Info window
+      analytics.rs        Dashboard's chain analytics cards and tx chart
+      mempool.rs          Mempool tab
+      rpc_explorer.rs     RPC Cmds tab
       connection.rs       Connection window (URL / resolver)
       terminal.rs         Integrated terminal pane
       help.rs             Help window

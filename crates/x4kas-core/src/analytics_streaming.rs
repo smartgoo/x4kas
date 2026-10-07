@@ -21,7 +21,7 @@ pub fn cache_path() -> PathBuf {
 /// Delay between requests while catching up to the tip.
 const CATCH_UP_INTERVAL: Duration = Duration::from_millis(100);
 /// Delay between requests once at the tip.
-const LIVE_INTERVAL: Duration = Duration::from_secs(2);
+const LIVE_INTERVAL: Duration = Duration::from_secs(1);
 /// How long to wait before retrying a failed request.
 const RETRY_DELAY: Duration = Duration::from_secs(5);
 /// How often to check whether the node is ready.

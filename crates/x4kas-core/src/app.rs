@@ -392,7 +392,7 @@ pub enum AnalyticsPhase {
     Seeking,
     /// Fetching chain blocks quickly to reach the tip.
     CatchingUp,
-    /// At the tip, fetching new chain blocks every few seconds.
+    /// At the tip, fetching new chain blocks every second.
     Live,
     /// The last request failed; the task retries.
     Error(String),

@@ -10,7 +10,11 @@ use x4kas_core::format::{explorer_address_url, kaspa_stream_address_url, shorten
 use x4kas_core::rpc::hash_links::HashLink;
 
 /// Vertical space between stacked cards.
-pub const CARD_GAP: f32 = 4.0;
+pub const CARD_GAP: f32 = 8.0;
+/// Horizontal space between cards side by side in a [`weighted_columns`] row.
+pub const CARD_GAP_X: f32 = 12.0;
+/// Vertical space between [`kv_columns`] that wrapped onto rows inside a card.
+const COLUMN_ROW_GAP: f32 = 4.0;
 
 /// A bordered pane with its title set into the top border, like a TUI block:
 /// `┌─ Title ───────┐`.
@@ -18,17 +22,192 @@ pub fn card(ui: &mut Ui, title: &str, add_contents: impl FnOnce(&mut Ui)) {
     card_with_header(ui, title, &mut (), |_, _| {}, |ui, _| add_contents(ui));
 }
 
+/// Gutter between [`kv_columns`], so a value never runs into the next column's label.
+pub const COLUMN_GAP: f32 = 24.0;
+
+/// A row of cards side by side, like [`egui::Ui::columns`] but with column widths
+/// proportional to `weights`, e.g. `[1.0, 2.0]` for a third and two thirds. Each column's
+/// [`card`] stretches to the height of its row's tallest card, so their borders line up.
+///
+/// Responsive, like a web page's flex-wrap: a card that would get narrower than
+/// `min_width` wraps onto a new row, and each row shares the full width by its weights.
+pub fn weighted_columns<R, const N: usize>(
+    ui: &mut Ui,
+    weights: [f32; N],
+    min_width: f32,
+    add_contents: impl FnOnce(&mut [Ui; N]) -> R,
+) -> R {
+    columns_with_gap(ui, weights, min_width, CARD_GAP_X, true, add_contents)
+}
+
+/// `N` equal columns inside a card (e.g. side-by-side [`kv_grid`]s), [`COLUMN_GAP`] apart.
+/// Columns narrower than `min_width` wrap onto new rows, like [`weighted_columns`].
+pub fn kv_columns<R, const N: usize>(
+    ui: &mut Ui,
+    min_width: f32,
+    add_contents: impl FnOnce(&mut [Ui; N]) -> R,
+) -> R {
+    columns_with_gap(ui, [1.0; N], min_width, COLUMN_GAP, false, add_contents)
+}
+
+/// Splits columns into rows: each row takes columns while every one of them still gets
+/// `min_width` of its weighted share. Returns each row's first column index.
+fn wrap_rows(weights: &[f32], min_width: f32, width: f32, spacing: f32) -> Vec<usize> {
+    let mut starts = vec![0];
+    for i in 1..weights.len() {
+        let row = &weights[*starts.last().unwrap()..=i];
+        let total = row.iter().sum::<f32>();
+        let usable = width - spacing * (row.len() as f32 - 1.0);
+        if row.iter().any(|w| usable * w / total < min_width) {
+            starts.push(i);
+        }
+    }
+    starts
+}
+
+/// Last frame's layout of a wrapped [`columns_with_gap`]: where its rows start, their
+/// heights (to place the next row) and their cards' natural heights (to stretch them).
+#[derive(Clone, Default)]
+struct RowLayout {
+    starts: Vec<usize>,
+    heights: Vec<f32>,
+    natural: Vec<f32>,
+}
+
+fn columns_with_gap<R, const N: usize>(
+    ui: &mut Ui,
+    weights: [f32; N],
+    min_width: f32,
+    spacing: f32,
+    stretch_cards: bool,
+    add_contents: impl FnOnce(&mut [Ui; N]) -> R,
+) -> R {
+    let full_width = ui.available_width();
+    let starts = wrap_rows(&weights, min_width, full_width, spacing);
+    let row_of = |i: usize| starts.iter().rposition(|&s| s <= i).unwrap_or(0);
+    let row_range = |r: usize| starts[r]..starts.get(r + 1).copied().unwrap_or(N);
+    let top_left = ui.cursor().min;
+    let bottom = ui.max_rect().bottom();
+
+    // egui lays out in one pass, so rows go below the previous frame's row heights, and
+    // cards stretch to the tallest card's natural height from the previous frame
+    // (repainting once when either changes).
+    let layout_id = ui.next_auto_id().with("card_rows");
+    let previous: RowLayout = ui
+        .data(|d| d.get_temp::<RowLayout>(layout_id))
+        .filter(|l| l.starts == starts)
+        .unwrap_or_default();
+    let mut row_tops = Vec::with_capacity(starts.len());
+    let mut y = top_left.y;
+    for r in 0..starts.len() {
+        row_tops.push(y);
+        let gap = if stretch_cards {
+            CARD_GAP
+        } else {
+            COLUMN_ROW_GAP
+        };
+        y += previous.heights.get(r).copied().unwrap_or(0.0) + gap;
+    }
+
+    let mut x = top_left.x;
+    let mut columns: [Ui; N] = std::array::from_fn(|i| {
+        let r = row_of(i);
+        let range = row_range(r);
+        if i == range.start {
+            x = top_left.x;
+        }
+        let row = &weights[range.clone()];
+        let usable = (full_width - spacing * (row.len() as f32 - 1.0)).max(0.0);
+        let w = usable * weights[i] / row.iter().sum::<f32>();
+        let rect = egui::Rect::from_min_max(pos2(x, row_tops[r]), pos2(x + w, bottom));
+        x += w + spacing;
+        let mut column = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(rect)
+                .layout(egui::Layout::top_down_justified(egui::Align::LEFT)),
+        );
+        column.set_width(w);
+        column
+    });
+    if stretch_cards {
+        for (i, column) in columns.iter().enumerate() {
+            if let Some(&height) = previous.natural.get(row_of(i)) {
+                ui.data_mut(|d| d.insert_temp(card_stretch_id(column), height));
+            }
+        }
+    }
+    let result = add_contents(&mut columns);
+
+    let rows = 0..starts.len();
+    let heights: Vec<f32> = rows
+        .clone()
+        .map(|r| {
+            columns[row_range(r)]
+                .iter()
+                .map(|c| c.min_size().y)
+                .fold(0.0, f32::max)
+        })
+        .collect();
+    let natural: Vec<f32> = if stretch_cards {
+        rows.map(|r| {
+            columns[row_range(r)]
+                .iter()
+                .map(|c| {
+                    ui.data_mut(|d| d.remove_temp::<f32>(card_natural_id(c)))
+                        .unwrap_or(c.min_size().y)
+                })
+                .fold(0.0, f32::max)
+        })
+        .collect()
+    } else {
+        Vec::new()
+    };
+    let changed = |a: &[f32], b: &[f32]| {
+        a.len() != b.len() || a.iter().zip(b).any(|(a, b)| (a - b).abs() > 0.5)
+    };
+    if changed(&heights, &previous.heights) || changed(&natural, &previous.natural) {
+        ui.ctx().request_repaint();
+    }
+    let total = row_tops.last().copied().unwrap_or(top_left.y) - top_left.y
+        + heights.last().copied().unwrap_or(0.0);
+    ui.data_mut(|d| {
+        d.insert_temp(
+            layout_id,
+            RowLayout {
+                starts,
+                heights,
+                natural,
+            },
+        )
+    });
+    ui.advance_cursor_after_rect(egui::Rect::from_min_size(
+        top_left,
+        egui::vec2(full_width, total),
+    ));
+    result
+}
+
+/// The height a card in this column of a [`weighted_columns`] row stretches to.
+fn card_stretch_id(column: &Ui) -> egui::Id {
+    column.unique_id().with("card_stretch")
+}
+
+/// A card's height before stretching, reported to its [`weighted_columns`] row.
+fn card_natural_id(column: &Ui) -> egui::Id {
+    column.unique_id().with("card_natural")
+}
+
 /// A [`card`] with extra widgets (e.g. a dropdown) set into the top border right after
 /// the title: `┌─ Title [1h ▾] ───┐`. Both closures get `state`, so they can share
-/// mutable data such as the app.
+/// mutable data such as the app. Returns the card's rect (its border).
 pub fn card_with_header<T: ?Sized>(
     ui: &mut Ui,
     title: &str,
     state: &mut T,
     add_header: impl FnOnce(&mut Ui, &mut T),
     add_contents: impl FnOnce(&mut Ui, &mut T),
-) {
-    let font = FontId::monospace(theme::FONT_SIZE);
+) -> egui::Rect {
+    let font = FontId::monospace(theme::CARD_TITLE_SIZE);
     let galley = ui
         .painter()
         .layout_no_wrap(format!(" {title} "), font, theme::ACCENT);
@@ -36,22 +215,38 @@ pub fn card_with_header<T: ?Sized>(
 
     // Room above the border for the top half of the title.
     ui.add_space(title_height / 2.0);
+    let margin = Margin {
+        left: 10,
+        right: 10,
+        top: 11,
+        bottom: 6,
+    };
+    let stroke = Stroke::new(1.0_f32, theme::BORDER_HI);
+    // Everything but the contents: the title's top half, the margins and the border.
+    let overhead = title_height / 2.0 + margin.sum().y + 2.0 * stroke.width;
+    let stretch_id = card_stretch_id(ui);
+    let stretch_to: Option<f32> = ui.data_mut(|d| d.remove_temp(stretch_id));
+    let mut natural = 0.0;
     let rect = egui::Frame::new()
         .fill(theme::BG)
-        .stroke(Stroke::new(1.0_f32, theme::BORDER_HI))
+        .stroke(stroke)
         .corner_radius(3)
-        .inner_margin(Margin {
-            left: 10,
-            right: 10,
-            top: 11,
-            bottom: 6,
-        })
+        .inner_margin(margin)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            add_contents(ui, state);
+            // Before the contents: the min height counts from the cursor.
+            if let Some(height) = stretch_to {
+                ui.set_min_height(height - overhead);
+            }
+            natural = ui
+                .scope(|ui| add_contents(ui, state))
+                .response
+                .rect
+                .height();
         })
         .response
         .rect;
+    ui.data_mut(|d| d.insert_temp(card_natural_id(ui), natural + overhead));
 
     // Cut the border behind the title, then draw it.
     let pos = pos2(rect.left() + 10.0, rect.top() - title_height / 2.0);
@@ -91,6 +286,12 @@ pub fn card_with_header<T: ?Sized>(
             ),
         );
     }
+    rect
+}
+
+/// A heading over a group of rows inside a card (e.g. a [`kv_columns`] column), in white.
+pub fn subheader(ui: &mut Ui, title: &str) {
+    ui.label(RichText::new(title).color(theme::TEXT_BRIGHT));
 }
 
 /// Accent-colored heading: sections that aren't cards (side panels, help) and table
@@ -161,14 +362,33 @@ pub fn json_view(ui: &mut Ui, text: &str, links: &[HashLink]) -> Option<String> 
 pub fn kv_grid(ui: &mut Ui, id: &str, add_rows: impl FnOnce(&mut Ui)) {
     egui::Grid::new(id)
         .num_columns(2)
-        .spacing([16.0, 1.0])
-        .min_row_height(theme::ROW_HEIGHT)
-        .show(ui, add_rows);
+        .spacing([16.0, KV_ROW_GAP])
+        .min_row_height(theme::KV_ROW_HEIGHT)
+        .show(ui, |ui| {
+            ui.data_mut(|d| d.insert_temp(kv_row_id(ui), KvRow::default()));
+            add_rows(ui)
+        });
+}
+
+/// Vertical gap between [`kv_grid`] rows, covered by the rows' stripes.
+const KV_ROW_GAP: f32 = 1.0;
+
+/// The [`kv_grid`] being filled: the next row's index (for striping) and where the last
+/// row's stripe ended, so the next one starts exactly there.
+#[derive(Clone, Copy, Default)]
+struct KvRow {
+    index: usize,
+    bottom: Option<f32>,
+}
+
+/// The next row's index in the [`kv_grid`] being filled, for striping.
+fn kv_row_id(grid: &Ui) -> egui::Id {
+    grid.id().with("kv_row")
 }
 
 /// A dim field label with a trailing colon, e.g. `Network:`.
 pub fn field_label(ui: &mut Ui, label: &str) -> egui::Response {
-    ui.label(RichText::new(format!("{label}:")).weak())
+    ui.label(RichText::new(format!("{label}:")).color(theme::LABEL))
 }
 
 /// One row of a [`kv_grid`]: the label on the left, the value against the right edge.
@@ -181,15 +401,57 @@ pub fn kv(ui: &mut Ui, label: &str, value: impl Into<WidgetText>) {
 /// A [`kv`] row with a custom value. Widgets added by `add_value` run right to left, so
 /// the first one ends up rightmost.
 pub fn kv_with(ui: &mut Ui, label: &str, add_value: impl FnOnce(&mut Ui)) {
-    field_label(ui, label);
+    // Reserved behind the row, sized once it is laid out.
+    let stripe = ui.painter().add(egui::Shape::Noop);
+    let label_rect = field_label(ui, label).rect;
     // The grid's last column spans the rest of the row, so this pins values to the right
     // edge. Not in tooltips, which would stretch to their maximum width.
-    if ui.layer_id().order == egui::Order::Tooltip {
-        ui.horizontal(add_value);
+    let tooltip = ui.layer_id().order == egui::Order::Tooltip;
+    let value_rect = if tooltip {
+        ui.horizontal(add_value).response.rect
     } else {
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), add_value);
-    }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), add_value)
+            .response
+            .rect
+    };
     ui.end_row();
+
+    // Every other row shaded across the full width, like the striped tables, and the row
+    // under the pointer highlighted. egui's own grid stripes stop at the value's width,
+    // since the value cell is right-aligned.
+    // Cells are centered vertically in the row, so center the stripe on them and grow it
+    // to the row's height. Rows tile: each stripe starts where the previous one ended.
+    let y = label_rect.union(value_rect).y_range();
+    let half = (y.span().max(theme::KV_ROW_HEIGHT) + KV_ROW_GAP) / 2.0;
+    let bottom = y.center() + half;
+    let previous = ui.data_mut(|d| {
+        let state = d.get_temp_mut_or_default::<KvRow>(kv_row_id(ui));
+        let previous = *state;
+        *state = KvRow {
+            index: previous.index + 1,
+            bottom: Some(bottom),
+        };
+        previous
+    });
+    if tooltip {
+        return;
+    }
+    let top = previous.bottom.unwrap_or(y.center() - half);
+    let x = ui.max_rect().x_range().expand(2.0);
+    let rect = egui::Rect::from_x_y_ranges(x, top..=bottom);
+    // Half-open, so a pointer on the line between two rows hovers only the lower one.
+    let hovered = ui.rect_contains_pointer(rect)
+        && ui.ctx().pointer_hover_pos().is_some_and(|p| p.y < bottom);
+    let row = previous.index;
+    let fill = if hovered {
+        theme::ROW_HOVER
+    } else if row.is_multiple_of(2) {
+        ui.visuals().faint_bg_color
+    } else {
+        return;
+    };
+    ui.painter()
+        .set(stripe, egui::Shape::rect_filled(rect, 2.0, fill));
 }
 
 /// `text` in full if it fits the available width, otherwise shortened in the middle
@@ -253,7 +515,7 @@ fn linked_value(ui: &mut Ui, value: &str, kind: LinkKind, selected: bool) -> boo
 
     // Leave room for the label's padding and the copy icon.
     let padding = 2.0 * ui.spacing().button_padding.x;
-    let room = ui.available_width() - padding - COPY_ICON_SIZE - ui.spacing().item_spacing.x;
+    let room = ui.available_width() - padding - COPY_ICON_SIZE - COPY_ICON_GAP;
     let shown = fit_text(ui, value, room);
 
     // In a right-to-left row (a right-aligned value) the first widget lands rightmost, so
@@ -267,9 +529,10 @@ fn linked_value(ui: &mut Ui, value: &str, kind: LinkKind, selected: bool) -> boo
     // menu is open.
     let menu_id = id.with("menu");
     let menu_open = egui::Popup::is_id_open(ui.ctx(), menu_id);
-    let response = ui
-        .selectable_label(selected || menu_open, shown.as_str())
-        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    let response = icon_gap(ui, rtl, |ui| {
+        ui.selectable_label(selected || menu_open, shown.as_str())
+    })
+    .on_hover_cursor(egui::CursorIcon::PointingHand);
     let hint = match kind {
         LinkKind::Address => None,
         LinkKind::Block => Some("Click for block info"),
@@ -304,7 +567,7 @@ fn linked_value(ui: &mut Ui, value: &str, kind: LinkKind, selected: bool) -> boo
     }
 
     if !rtl {
-        copy_button(ui, id, value, copy_hint);
+        icon_gap(ui, true, |ui| copy_button(ui, id, value, copy_hint));
     }
     get_block
 }
@@ -325,16 +588,31 @@ pub fn copy_value(ui: &mut Ui, value: &str, hint: &str) {
         - if rtl {
             0.0
         } else {
-            COPY_ICON_SIZE + ui.spacing().item_spacing.x
+            COPY_ICON_SIZE + COPY_ICON_GAP
         };
     let shown = fit_text(ui, value, room);
-    let label = ui.add(egui::Label::new(shown.as_str()).wrap_mode(egui::TextWrapMode::Extend));
+    let label = icon_gap(ui, rtl, |ui| {
+        ui.add(egui::Label::new(shown.as_str()).wrap_mode(egui::TextWrapMode::Extend))
+    });
     if shown != value {
         label.on_hover_text(value);
     }
     if !rtl {
-        copy_button(ui, id, value, hint);
+        icon_gap(ui, true, |ui| copy_button(ui, id, value, hint));
     }
+}
+
+/// Adds `add` [`COPY_ICON_GAP`] after the previous widget when `apply` (the value and its
+/// copy icon, whichever comes second in the row), else with the usual item spacing.
+fn icon_gap<R>(ui: &mut Ui, apply: bool, add: impl FnOnce(&mut Ui) -> R) -> R {
+    if !apply {
+        return add(ui);
+    }
+    let spacing = ui.spacing().item_spacing.x;
+    ui.spacing_mut().item_spacing.x = COPY_ICON_GAP;
+    let result = add(ui);
+    ui.spacing_mut().item_spacing.x = spacing;
+    result
 }
 
 /// The copy icon for `value`: copies it on click and shows a check mark for a moment.
@@ -387,6 +665,8 @@ pub fn is_testnet(ctx: &egui::Context) -> bool {
 
 /// Side of the square copy icon, about the height of a capital letter.
 const COPY_ICON_SIZE: f32 = 11.0;
+/// Gap between a value and its copy icon, a little tighter than the usual item spacing.
+const COPY_ICON_GAP: f32 = 5.0;
 
 /// The usual copy icon, two overlapping rounded squares, or a check mark once copied.
 /// Brightens on hover.

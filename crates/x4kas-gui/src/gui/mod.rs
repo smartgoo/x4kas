@@ -176,14 +176,12 @@ impl eframe::App for GuiApp {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| match app.active_tab {
-            Tab::Dashboard => dashboard::show(ui, &app),
+            Tab::Dashboard => dashboard::show(ui, &mut app),
             Tab::Mempool => mempool::show(ui, &mut app),
             Tab::RpcExplorer => rpc_explorer::show(ui, &mut app, &self.cmd_tx),
-            Tab::Analytics => analytics::show(ui, &mut app),
-            Tab::BlockDag => blockdag::show(ui, &mut app),
         });
 
-        // A click on any block hash (or a BlockDAG block) opens Block Info here, whatever
+        // A click on any block hash (or a block in the DAG visualizer) opens Block Info here, whatever
         // the tab.
         if let Some(hash) = widgets::take_block_request(ctx) {
             app.dag_selection.request(hash.clone());
@@ -217,7 +215,7 @@ fn handle_shortcuts(
     show_help: &mut bool,
     terminal: &mut TerminalPane,
 ) {
-    const TAB_KEYS: [Key; 5] = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5];
+    const TAB_KEYS: [Key; 3] = [Key::Num1, Key::Num2, Key::Num3];
 
     // Works even while the terminal or a text field has focus.
     if ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, Key::Backtick)) {
@@ -445,6 +443,11 @@ fn analytics_chip(ui: &mut egui::Ui, app: &App) {
             theme::TEXT_DIM,
             "Waiting for the node to connect and sync",
         ),
+        AnalyticsPhase::Seeking => (
+            "◐ Analytics seeking".into(),
+            theme::WARN,
+            "Skipping to the last 24 hours",
+        ),
         AnalyticsPhase::CatchingUp => (
             match fraction {
                 Some(f) => format!("◐ Analytics {:.0}%", f * 100.0),
@@ -504,6 +507,7 @@ fn analytics_chip(ui: &mut egui::Ui, app: &App) {
             }
             Some(StartPoint::Cache(None)) => kv(ui, "Started from", "cache"),
             Some(StartPoint::PruningPoint) => kv(ui, "Started from", "pruning point"),
+            Some(StartPoint::LastDay) => kv(ui, "Started from", "24 hours ago"),
             None => {}
         }
         if status.phase == AnalyticsPhase::CatchingUp {

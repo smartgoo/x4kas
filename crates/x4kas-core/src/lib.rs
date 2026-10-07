@@ -6,6 +6,7 @@ pub mod analytics_streaming;
 pub mod app;
 pub mod config;
 pub mod controller;
+pub mod emission;
 pub mod format;
 pub mod polling;
 pub mod rpc;

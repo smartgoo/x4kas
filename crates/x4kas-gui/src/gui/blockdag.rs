@@ -1,3 +1,6 @@
+//! The Dashboard's BlockDAG section: the live DAG visualizer band and the BlockDAG card,
+//! plus the Block Info window shown on any tab.
+
 use std::collections::{HashMap, HashSet};
 
 use eframe::egui::{
@@ -7,8 +10,8 @@ use eframe::egui::{
 
 use super::theme;
 use super::widgets::{
-    CARD_GAP, block_hash, card, copy_value, is_testnet, json_view, kv, kv_grid, kv_with,
-    modal_window, or_dash, placeholder, request_block,
+    block_hash, copy_value, is_testnet, json_view, kv, kv_columns, kv_grid, kv_with, modal_window,
+    or_dash, request_block,
 };
 use x4kas_core::app::{App, DAG_MAX_DAA_SCORES, DagBlock, DagVisualizer};
 use x4kas_core::format::{
@@ -37,26 +40,17 @@ const EXIT_X: f32 = -BLOCK_SIZE - 100.0;
 /// Pointer distance at which a block counts as hovered (blocks are tiny).
 const HIT_RADIUS: f32 = 6.0;
 
-pub fn show(ui: &mut Ui, app: &mut App) {
-    egui::ScrollArea::vertical().show(ui, |ui| {
-        let waiting = if app.node.server_info.as_ref().is_some_and(|s| s.is_synced) {
-            "Waiting for blocks…"
-        } else {
-            "Waiting for the node to sync…"
-        };
-        if let Some(hash) = visualizer(ui, &app.node.dag_visualizer, waiting) {
-            request_block(ui.ctx(), &hash);
-        }
-        ui.add_space(CARD_GAP);
-
-        ui.columns(2, |cols| {
-            card(&mut cols[0], "BlockDAG Metrics", |ui| metrics(ui, app));
-            card(&mut cols[1], "GHOSTDAG", |ui| ghostdag(ui, app));
-        });
-        ui.add_space(CARD_GAP);
-
-        hash_lists(ui, app);
-    });
+/// The live DAG visualizer band across the top of the Dashboard. A click on a block opens
+/// its Block Info.
+pub(super) fn band(ui: &mut Ui, app: &App) {
+    let waiting = if app.node.server_info.as_ref().is_some_and(|s| s.is_synced) {
+        "Waiting for blocks…"
+    } else {
+        "Waiting for the node to sync…"
+    };
+    if let Some(hash) = visualizer(ui, &app.node.dag_visualizer, waiting) {
+        request_block(ui.ctx(), &hash);
+    }
 }
 
 /// Animation and hover state of the visualizer, kept in egui memory between frames.
@@ -344,98 +338,71 @@ fn title_chip(ui: &Ui, rect: Rect, max_scores: usize) {
         ));
 }
 
-fn metrics(ui: &mut Ui, app: &App) {
-    let Some(ref dag) = app.node.dag_info else {
-        placeholder(ui, "Collecting data…");
-        return;
-    };
-    kv_grid(ui, "dag_metrics", |ui| {
-        kv(ui, "Network", &dag.network);
-        kv(ui, "Block Count", format_number(dag.block_count));
-        kv(ui, "Header Count", format_number(dag.header_count));
-        kv(ui, "Difficulty", format_number(dag.difficulty as u64));
-        kv(ui, "DAA Score", format_number(dag.virtual_daa_score));
-        kv(ui, "Past Median Time", dag.past_median_time.to_string());
-        kv_with(ui, "Pruning Point", |ui| {
-            block_hash(ui, &dag.pruning_point_hash, false);
-        });
-        kv_with(ui, "Sink", |ui| {
-            block_hash(ui, &dag.sink, false);
-        });
-        kv(ui, "Tips Count", dag.tip_hashes.len().to_string());
-        kv(
-            ui,
-            "Virtual Parents",
-            dag.virtual_parent_hashes.len().to_string(),
-        );
-    });
-}
-
-fn ghostdag(ui: &mut Ui, app: &App) {
-    if app.node.dag_info.is_none() {
-        placeholder(ui, "Collecting data…");
-        return;
-    }
+/// The BlockDAG card under the visualizer: DAG counts, GHOSTDAG stats and the selected
+/// chain's key blocks, in three columns. Every row shows from the start, with dashes until
+/// the data arrives, so the layout doesn't jump.
+pub(super) fn stats(ui: &mut Ui, app: &App) {
+    let dag = app.node.dag_info.as_ref();
     let stats = &app.node.dag_stats;
-    kv_grid(ui, "ghostdag", |ui| {
-        kv(
-            ui,
-            "Blue Score",
-            or_dash(app.node.sink_blue_score, format_number),
-        );
-        kv(
-            ui,
-            "Blue/Red Tips",
-            or_dash(stats.blue_red_ratio(), |(blue, red)| {
-                format!("{blue} blue / {red} red")
-            }),
-        );
-        kv(
-            ui,
-            "DAG Width",
-            or_dash(
-                stats.samples.back().zip(stats.avg_dag_width()),
-                |(s, avg)| format!("{} tips (avg: {avg:.1})", s.tip_count),
-            ),
-        );
-        kv(
-            ui,
-            "Block Interval",
-            or_dash(stats.block_interval_ms(), |ms| format!("{ms:.0} ms")),
-        );
-        kv(
-            ui,
-            "Blue Block Rate",
-            or_dash(stats.blue_block_rate(), |r| format!("{r:.2} blocks/s")),
-        );
-        kv(
-            ui,
-            "Unvalidated",
-            or_dash(stats.headers_blocks_delta(), |d| {
-                format!("{} headers ahead", format_number(d))
-            }),
-        );
+    kv_columns(ui, 260.0, |[chain, ghostdag]| {
+        kv_grid(chain, "dag_chain", |ui| {
+            kv(
+                ui,
+                "DAA Score",
+                or_dash(dag, |d| format_number(d.virtual_daa_score)),
+            );
+            kv(
+                ui,
+                "Blue Score",
+                or_dash(app.node.sink_blue_score, format_number),
+            );
+            hash_row(ui, "Sink", dag.map(|d| d.sink.as_str()));
+            hash_row(
+                ui,
+                "Pruning Point",
+                dag.map(|d| d.pruning_point_hash.as_str()),
+            );
+            kv(
+                ui,
+                "Past Median Time",
+                or_dash(dag, |d| d.past_median_time.to_string()),
+            );
+        });
+
+        kv_grid(ghostdag, "ghostdag", |ui| {
+            kv(
+                ui,
+                "Tips",
+                or_dash(dag, |d| format_number(d.tip_hashes.len() as u64)),
+            );
+            kv(
+                ui,
+                "DAG Width (60s avg)",
+                or_dash(stats.avg_dag_width(), |avg| format!("{avg:.1}")),
+            );
+            kv(
+                ui,
+                "Block Interval",
+                or_dash(stats.block_interval_ms(), |ms| format!("{ms:.0} ms")),
+            );
+            kv(
+                ui,
+                "Blue Block Rate",
+                or_dash(stats.blue_block_rate(), |r| format!("{r:.2} blocks/s")),
+            );
+        });
     });
 }
 
-/// Tip and virtual parent hashes. Only the block open in Block Info is highlighted.
-fn hash_lists(ui: &mut Ui, app: &mut App) {
-    let Some(dag) = app.node.dag_info.as_ref() else {
-        return;
-    };
-    let open = app.dag_selection.block_hash.as_deref();
-
-    ui.columns(2, |cols| {
-        let lists = [
-            ("Tip Hashes", &dag.tip_hashes),
-            ("Virtual Parent Hashes", &dag.virtual_parent_hashes),
-        ];
-        for (col, (title, hashes)) in cols.iter_mut().zip(lists) {
-            card(col, title, |ui| {
-                for hash in hashes {
-                    block_hash(ui, hash, open == Some(hash.as_str()));
-                }
-            });
+/// A [`kv`] row with a [`block_hash`], or a dash as tall as one until there is a hash.
+fn hash_row(ui: &mut Ui, label: &str, hash: Option<&str>) {
+    kv_with(ui, label, |ui| match hash {
+        Some(hash) => {
+            block_hash(ui, hash, false);
+        }
+        None => {
+            ui.set_min_height(ui.spacing().interact_size.y);
+            ui.label("—");
         }
     });
 }

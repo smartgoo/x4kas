@@ -1,88 +1,135 @@
+//! Dashboard tab, modeled on the Kaspalytics home page: the live DAG visualizer and
+//! BlockDAG card from [`blockdag`], node-backed cards (markets, supply, mining and mempool, node info, fee
+//! rates) and the chain analytics cards from [`analytics`].
+
 use eframe::egui::{self, RichText, Ui};
 
+use super::analytics::{self, panel_card};
+use super::blockdag;
 use super::theme;
-use super::widgets::{CARD_GAP, card, kv, kv_grid, kv_with, or_dash, placeholder, yes_no};
-use x4kas_core::app::App;
-use x4kas_core::format::{format_hashrate, format_kas, format_number, format_usd};
+use super::widgets::{
+    CARD_GAP, card, card_with_header, kv, kv_columns, kv_grid, kv_with, or_dash, subheader,
+    weighted_columns, yes_no,
+};
+use x4kas_core::app::{AnalyticsPanel, App};
+use x4kas_core::format::{format_duration, format_hashrate, format_kas, format_number, format_usd};
 
-pub fn show(ui: &mut Ui, app: &App) {
+/// Narrowest a card gets before its row wraps (see [`weighted_columns`]).
+const SMALL_CARD: f32 = 320.0;
+/// Narrowest a card with a list table gets before its row wraps.
+const TABLE_CARD: f32 = 420.0;
+
+pub fn show(ui: &mut Ui, app: &mut App) {
+    analytics::banners(ui, app);
+
     egui::ScrollArea::vertical().show(ui, |ui| {
-        ui.columns(2, |cols| {
-            card(&mut cols[0], "Node Info", |ui| node_info(ui, app));
-            card(&mut cols[1], "Markets", |ui| markets(ui, app));
+        blockdag::band(ui, app);
+        ui.add_space(CARD_GAP);
+        weighted_columns(ui, [2.0, 1.0], SMALL_CARD, |[left, right]| {
+            card(left, "BlockDAG", |ui| blockdag::stats(ui, app));
+            card(right, "Markets", |ui| markets(ui, app));
         });
         ui.add_space(CARD_GAP);
-        ui.columns(2, |cols| {
-            card(&mut cols[0], "Network Stats", |ui| network_stats(ui, app));
-            card(&mut cols[1], "Mempool & Fees", |ui| {
-                mempool_summary(ui, app)
-            });
+        weighted_columns(
+            ui,
+            [1.0; 3],
+            SMALL_CARD,
+            |[supply_col, mining_col, node_col]| {
+                card(supply_col, "Supply", |ui| supply(ui, app));
+                card(mining_col, "Mining", |ui| mining(ui, app));
+                card(node_col, "Node Info", |ui| node_info(ui, app));
+            },
+        );
+        ui.add_space(CARD_GAP);
+        card_with_header(
+            ui,
+            "Transactions per 10 Minutes (24h)",
+            app,
+            |ui, app| analytics::sync_dot(ui, app),
+            |ui, app| analytics::tx_chart(ui, app),
+        );
+        ui.add_space(CARD_GAP);
+        weighted_columns(ui, [2.0, 1.0], SMALL_CARD, |[left, right]| {
+            panel_card(
+                left,
+                app,
+                "Transaction Summary",
+                AnalyticsPanel::TxSummary,
+                analytics::tx_summary,
+            );
+            card(right, "Mempool", |ui| mempool(ui, app));
+        });
+        ui.add_space(CARD_GAP);
+        panel_card(
+            ui,
+            app,
+            "Transaction Inspection",
+            AnalyticsPanel::Inspection,
+            analytics::inspection,
+        );
+        ui.add_space(CARD_GAP);
+        card_with_header(
+            ui,
+            "Fees",
+            app,
+            |ui, app| analytics::sync_dot(ui, app),
+            |ui, app| {
+                kv_columns(ui, 220.0, |[rates, avg, total]| {
+                    fee_rates(rates, app);
+                    analytics::fee_windows(avg, total, app);
+                });
+            },
+        );
+        ui.add_space(CARD_GAP);
+        weighted_columns(ui, [1.0; 2], TABLE_CARD, |[left, right]| {
+            panel_card(
+                left,
+                app,
+                "Mining Share by Node Version",
+                AnalyticsPanel::NodeVersions,
+                analytics::node_versions,
+            );
+            panel_card(
+                right,
+                app,
+                "Top Miners",
+                AnalyticsPanel::Miners,
+                analytics::top_miners,
+            );
+        });
+        ui.add_space(CARD_GAP);
+        weighted_columns(ui, [1.0; 2], TABLE_CARD, |[left, right]| {
+            panel_card(
+                left,
+                app,
+                "Top Senders",
+                AnalyticsPanel::TopSenders,
+                |ui, view| {
+                    analytics::addresses(ui, view.map(|v| v.top_senders.as_slice()), "sender")
+                },
+            );
+            panel_card(
+                right,
+                app,
+                "Top Receivers",
+                AnalyticsPanel::TopReceivers,
+                |ui, view| {
+                    analytics::addresses(ui, view.map(|v| v.top_receivers.as_slice()), "receiver")
+                },
+            );
         });
     });
 }
 
-fn node_info(ui: &mut Ui, app: &App) {
-    let Some(ref info) = app.node.server_info else {
-        placeholder(ui, "Waiting for data…");
-        return;
-    };
-    kv_grid(ui, "node_info", |ui| {
-        kv(ui, "Version", &info.server_version);
-        kv(ui, "Network", &info.network_id);
-        let synced_color = if info.is_synced {
-            theme::OK
-        } else {
-            theme::ERROR
-        };
-        kv(
-            ui,
-            "Synced",
-            RichText::new(yes_no(info.is_synced)).color(synced_color),
-        );
-        kv(ui, "UTXO Index", yes_no(info.has_utxo_index));
-        if let Some(ref dag) = app.node.dag_info {
-            kv(ui, "Block Count", format_number(dag.block_count));
-            kv(ui, "Header Count", format_number(dag.header_count));
-        }
-        if let Some(ref url) = app.node.node_url {
-            kv(ui, "URL", url);
-        }
-        if let Some(ref uid) = app.node.node_uid {
-            kv(ui, "Node ID", uid);
-        }
-    });
-}
-
-fn network_stats(ui: &mut Ui, app: &App) {
-    let Some(ref dag) = app.node.dag_info else {
-        placeholder(ui, "Waiting for data…");
-        return;
-    };
-    kv_grid(ui, "network_stats", |ui| {
-        kv(ui, "Difficulty", format_number(dag.difficulty as u64));
-        kv(ui, "Hashrate", or_dash(app.node.hashrate, format_hashrate));
-        kv(ui, "DAA Score", format_number(dag.virtual_daa_score));
-        kv(ui, "Tips", dag.tip_hashes.len().to_string());
-
-        if let Some(ref supply) = app.node.coin_supply {
-            let (max, circ) = (supply.max_sompi as f64, supply.circulating_sompi as f64);
-            let pct = if max > 0.0 { circ / max * 100.0 } else { 0.0 };
-            kv(ui, "Max Supply", format!("{} KAS", format_kas(max, 0)));
-            kv(ui, "Circulating", format!("{} KAS", format_kas(circ, 0)));
-            kv(ui, "% Circulating", format!("{pct:.2}%"));
-        }
-    });
-}
+// Node-backed cards always draw every row, with dashes until the data arrives, so the
+// layout doesn't jump as it fills in.
 
 fn markets(ui: &mut Ui, app: &App) {
-    let Some(ref market) = app.market_data else {
-        placeholder(ui, "Fetching market data…");
-        return;
-    };
+    let market = app.market_data.as_ref();
     kv_grid(ui, "markets", |ui| {
         kv_with(ui, "Price (USD)", |ui| {
             // Right to left: the change first, so it ends up after the price.
-            if let Some(change) = market.price_change_24h_pct {
+            if let Some(change) = market.and_then(|m| m.price_change_24h_pct) {
                 let color = if change >= 0.0 {
                     theme::OK
                 } else {
@@ -91,40 +138,134 @@ fn markets(ui: &mut Ui, app: &App) {
                 ui.label(RichText::new(format!("(24h {change:+.2}%)")).color(color));
             }
             ui.label(
-                RichText::new(format!("${:.6}", market.price_usd)).color(theme::ACCENT_BRIGHT),
+                RichText::new(or_dash(market, |m| format!("${:.6}", m.price_usd)))
+                    .color(theme::ACCENT_BRIGHT),
             );
         });
-        kv(ui, "Price (BTC)", format!("{:.10}", market.price_btc));
-        kv(ui, "Market Cap", format_usd(market.market_cap));
-        kv(ui, "24h Volume", format_usd(market.volume_24h));
+        kv(
+            ui,
+            "Price (BTC)",
+            or_dash(market, |m| format!("{:.10}", m.price_btc)),
+        );
+        kv(
+            ui,
+            "Market Cap",
+            or_dash(market, |m| format_usd(m.market_cap)),
+        );
+        kv(
+            ui,
+            "24h Volume",
+            or_dash(market, |m| format_usd(m.volume_24h)),
+        );
     });
 }
 
-fn mempool_summary(ui: &mut Ui, app: &App) {
-    let Some(ref mempool) = app.node.mempool_state else {
-        placeholder(ui, "Waiting for data…");
-        return;
-    };
-    kv_grid(ui, "mempool_summary", |ui| {
+/// Coin supply and the block reward schedule.
+fn supply(ui: &mut Ui, app: &App) {
+    let node = &app.node;
+    let supply = node
+        .coin_supply
+        .as_ref()
+        .map(|s| (s.max_sompi as f64, s.circulating_sompi as f64));
+    let reward = node.block_reward();
+    kv_grid(ui, "supply", |ui| {
+        let kas = |v: f64| format!("{} KAS", format_kas(v, 0));
+        kv(ui, "Circulating", or_dash(supply, |(_, circ)| kas(circ)));
+        kv(ui, "Max Supply", or_dash(supply, |(max, _)| kas(max)));
+        let pct = supply.map(|(max, circ)| if max > 0.0 { circ / max * 100.0 } else { 0.0 });
+        kv(ui, "% Issued", or_dash(pct, |pct| format!("{pct:.2}%")));
         kv(
             ui,
-            "Transactions",
-            format_number(mempool.entries.len() as u64),
+            "Unspendable",
+            or_dash(node.burn_balance, |b| kas(b as f64)),
+        );
+        kv(
+            ui,
+            "Block Reward",
+            or_dash(reward, |r| format!("{} KAS", format_kas(r.sompi as f64, 4))),
+        );
+        kv(
+            ui,
+            "Next Reward",
+            or_dash(reward, |r| {
+                format!(
+                    "{} KAS in {}",
+                    format_kas(r.next_sompi as f64, 4),
+                    format_duration(r.next_in)
+                )
+            }),
+        );
+    });
+}
+
+fn mining(ui: &mut Ui, app: &App) {
+    let node = &app.node;
+    kv_grid(ui, "mining", |ui| {
+        let difficulty = node.dag_info.as_ref().map(|d| d.difficulty as u64);
+        kv(ui, "Difficulty", or_dash(difficulty, format_number));
+        kv(ui, "Hashrate", or_dash(node.hashrate, format_hashrate));
+        analytics::miner_counts(ui, app);
+    });
+}
+
+fn mempool(ui: &mut Ui, app: &App) {
+    let mempool = app.node.mempool_state.as_ref();
+    kv_grid(ui, "mempool", |ui| {
+        kv(
+            ui,
+            "Entries",
+            or_dash(mempool, |m| format_number(m.entries.len() as u64)),
         );
         kv(
             ui,
             "Total Fees",
-            format!("{} KAS", format_kas(mempool.total_fees as f64, 8)),
+            or_dash(mempool, |m| {
+                format!("{} KAS", format_kas(m.total_fees as f64, 8))
+            }),
         );
-        if let Some(ref fee) = app.node.fee_estimate {
-            let rate = |r: f64| format!("{r:.2} sompi/gram");
-            kv(ui, "Priority Fee", rate(fee.priority_feerate));
-            if let Some(normal) = fee.normal_feerate {
-                kv(ui, "Normal Fee", rate(normal));
-            }
-            if let Some(low) = fee.low_feerate {
-                kv(ui, "Low Fee", rate(low));
-            }
-        }
+    });
+}
+
+fn node_info(ui: &mut Ui, app: &App) {
+    let info = app.node.server_info.as_ref();
+    kv_grid(ui, "node_info", |ui| {
+        kv(ui, "Version", or_dash(info, |i| i.server_version.clone()));
+        kv(ui, "Network", or_dash(info, |i| i.network_id.clone()));
+        let synced = match info {
+            Some(i) if i.is_synced => RichText::new(yes_no(true)).color(theme::OK),
+            Some(_) => RichText::new(yes_no(false)).color(theme::ERROR),
+            None => RichText::new("—"),
+        };
+        kv(ui, "Synced", synced);
+        kv(
+            ui,
+            "UTXO Index",
+            or_dash(info, |i| yes_no(i.has_utxo_index).into()),
+        );
+        let dag = app.node.dag_info.as_ref();
+        kv(
+            ui,
+            "Block Count",
+            or_dash(dag, |d| format_number(d.block_count)),
+        );
+        kv(
+            ui,
+            "Header Count",
+            or_dash(dag, |d| format_number(d.header_count)),
+        );
+        kv(ui, "URL", or_dash(app.node.node_url.clone(), |u| u));
+        kv(ui, "Node ID", or_dash(app.node.node_uid.clone(), |u| u));
+    });
+}
+
+/// The node's fee-rate estimate: the first column of the Fees card.
+fn fee_rates(ui: &mut Ui, app: &App) {
+    subheader(ui, "Fee Rates (sompi/gram)");
+    let fee = app.node.fee_estimate.as_ref();
+    let rate = |r: Option<f64>| or_dash(r, |r| format!("{r:.2}"));
+    kv_grid(ui, "fee_rates", |ui| {
+        kv(ui, "Low", rate(fee.and_then(|f| f.low_feerate)));
+        kv(ui, "Normal", rate(fee.and_then(|f| f.normal_feerate)));
+        kv(ui, "Priority", rate(fee.map(|f| f.priority_feerate)));
     });
 }

@@ -25,8 +25,10 @@ pub const BORDER_HI: Color32 = Color32::from_rgb(0x3b, 0x4d, 0x4b);
 
 // ── Text ──
 pub const TEXT: Color32 = Color32::from_rgb(0xcd, 0xd8, 0xd6);
-/// Labels and secondary text (`.weak()`). Kept above 6:1 contrast on `SURFACE`.
+/// Secondary text (`.weak()`). Kept above 6:1 contrast on `SURFACE`.
 pub const TEXT_DIM: Color32 = Color32::from_rgb(0x8a, 0x9c, 0x99);
+/// Row labels: a shade lighter than [`TEXT_DIM`], toward [`TEXT`].
+pub const LABEL: Color32 = Color32::from_rgb(0xa1, 0xb2, 0xaf);
 pub const TEXT_BRIGHT: Color32 = Color32::from_rgb(0xef, 0xfa, 0xf8);
 
 // ── Accents and status ──
@@ -50,8 +52,14 @@ pub const DAG_EDGE: Color32 = TEXT_DIM;
 
 pub const FONT_SIZE: f32 = 12.0;
 pub const SMALL_FONT_SIZE: f32 = 10.0;
+/// Card titles set into the border (`widgets::card`).
+pub const CARD_TITLE_SIZE: f32 = FONT_SIZE + 1.0;
 /// Minimum height of a read-only grid row (egui defaults to the button height).
 pub const ROW_HEIGHT: f32 = 14.0;
+/// Label/value rows (`widgets::kv_grid`), a little taller so their stripes breathe.
+pub const KV_ROW_HEIGHT: f32 = 18.0;
+/// A label/value row under the pointer, like a hovered table row.
+pub const ROW_HOVER: Color32 = SURFACE_HOVER;
 
 /// Install fonts and visuals. The app is always dark, whatever the system theme.
 pub fn apply(ctx: &egui::Context) {

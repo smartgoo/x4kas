@@ -389,6 +389,42 @@ impl AnalyticsEngine {
         }
     }
 
+    /// Transactions per 10-minute interval over the last 24h, for the Dashboard's bar
+    /// chart. Includes the blocks of the last minute, still in the recent cache.
+    pub fn tx_histogram(&self, now_ms: u64) -> TxHistogram {
+        let width = TEN_MINUTES_MS;
+        let slots = MAX_TEN_MINUTE_BUCKETS;
+        let start_ms = (now_ms / width).saturating_sub(slots as u64 - 1) * width;
+        let mut counts = vec![None; slots];
+        let finalized = self
+            .ten_minute_buckets
+            .iter()
+            .map(|b| (b.bucket_start_ms, b.metrics.tx_count));
+        let recent = self
+            .recent_blocks
+            .values()
+            .map(|b| (b.timestamp_ms, b.metrics.tx_count));
+        for (ts, tx_count) in finalized.chain(recent) {
+            let Some(offset) = ts.checked_sub(start_ms) else {
+                continue;
+            };
+            if let Some(count) = counts.get_mut((offset / width) as usize) {
+                *count = Some(count.unwrap_or(0) + tx_count);
+            }
+        }
+        // Once the data begins, an interval without a bucket had no transactions.
+        if let Some(first) = counts.iter().position(Option::is_some) {
+            for count in &mut counts[first..] {
+                count.get_or_insert(0);
+            }
+        }
+        TxHistogram {
+            start_ms,
+            interval_ms: width,
+            counts,
+        }
+    }
+
     /// Views for every window, indexed like [`TimeWindow::ALL`].
     pub fn views(&self, now_ms: u64) -> [AggregatedView; 3] {
         TimeWindow::ALL.map(|w| self.get_view(w, now_ms))
@@ -433,6 +469,18 @@ impl AnalyticsEngine {
         anyhow::ensure!(magic == CACHE_MAGIC, "outdated analytics cache");
         Ok(engine)
     }
+}
+
+/// Transaction counts per fixed interval, oldest first, from
+/// [`AnalyticsEngine::tx_histogram`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TxHistogram {
+    /// Start of the first interval.
+    pub start_ms: u64,
+    pub interval_ms: u64,
+    /// One count per interval, `None` before the data begins. The last interval is the
+    /// current one, still filling.
+    pub counts: Vec<Option<u64>>,
 }
 
 /// Merge a block into the bucket covering its timestamp. Chain blocks arrive
@@ -812,5 +860,29 @@ mod tests {
         assert_eq!(m.fee_tx_count, 8);
         assert_eq!(m.total_fees, 5 * 50 + 3 * 100);
         assert_eq!(m.senders["sender1"], 8);
+    }
+
+    #[test]
+    fn tx_histogram_covers_24h_in_10_minute_intervals() {
+        let now = 2 * TWENTY_FOUR_HOURS_MS + 5 * 60_000;
+        let mut engine = AnalyticsEngine::default();
+        // Two hours ago, finalized into a bucket
+        engine.add_block(make_block("old", now - 2 * ONE_HOUR_MS, 4, 1));
+        engine.finalize_old_blocks(now);
+        // Still in the recent cache
+        engine.add_block(make_block("new", now - 1_000, 7, 1));
+
+        let h = engine.tx_histogram(now);
+        assert_eq!(h.counts.len(), 144);
+        assert_eq!(h.interval_ms, TEN_MINUTES_MS);
+        assert_eq!(
+            h.start_ms + 143 * TEN_MINUTES_MS,
+            now / TEN_MINUTES_MS * TEN_MINUTES_MS
+        );
+        assert_eq!(h.counts[143], Some(7));
+        assert_eq!(h.counts[143 - 12], Some(4));
+        // No data before the first block; zeros after it
+        assert_eq!(h.counts[143 - 13], None);
+        assert_eq!(h.counts[143 - 11], Some(0));
     }
 }

@@ -2,7 +2,8 @@ use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::analytics::{AggregatedView, AnalyticsEngine};
+use crate::analytics::{AggregatedView, AnalyticsEngine, TxHistogram};
+use crate::emission::{BlockReward, Emission};
 use crate::rpc::hash_links::{HashLink, block_hash_links};
 use crate::rpc::methods::{RPC_METHODS, RpcMethod};
 use crate::rpc::types::*;
@@ -80,11 +81,11 @@ impl DagVisualizer {
 pub struct DagSample {
     pub timestamp: Instant,
     pub blue_score: u64,
-    pub block_count: u64,
-    pub header_count: u64,
     pub tip_count: usize,
-    pub virtual_parent_count: usize,
 }
+
+/// How far back [`DagStats::avg_dag_width`] averages.
+pub const DAG_WIDTH_WINDOW: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Default)]
 pub struct DagStats {
@@ -96,10 +97,7 @@ impl DagStats {
         self.samples.push_back(DagSample {
             timestamp: Instant::now(),
             blue_score: blue_score.unwrap_or(0),
-            block_count: dag_info.block_count,
-            header_count: dag_info.header_count,
             tip_count: dag_info.tip_hashes.len(),
-            virtual_parent_count: dag_info.virtual_parent_hashes.len(),
         });
         while self.samples.len() > 120 {
             self.samples.pop_front();
@@ -120,12 +118,17 @@ impl DagStats {
         Some(delta / elapsed)
     }
 
+    /// The average tip count over the samples from the last [`DAG_WIDTH_WINDOW`].
     pub fn avg_dag_width(&self) -> Option<f64> {
-        if self.samples.is_empty() {
-            return None;
-        }
-        let sum: usize = self.samples.iter().map(|s| s.tip_count).sum();
-        Some(sum as f64 / self.samples.len() as f64)
+        let last = self.samples.back()?;
+        let recent: Vec<usize> = self
+            .samples
+            .iter()
+            .rev()
+            .take_while(|s| last.timestamp.duration_since(s.timestamp) <= DAG_WIDTH_WINDOW)
+            .map(|s| s.tip_count)
+            .collect();
+        Some(recent.iter().sum::<usize>() as f64 / recent.len() as f64)
     }
 
     pub fn block_interval_ms(&self) -> Option<f64> {
@@ -141,46 +144,25 @@ impl DagStats {
         let elapsed_ms = last.timestamp.duration_since(first.timestamp).as_secs_f64() * 1000.0;
         Some(elapsed_ms / delta as f64)
     }
-
-    pub fn blue_red_ratio(&self) -> Option<(usize, usize)> {
-        let last = self.samples.back()?;
-        let red = last.tip_count.saturating_sub(last.virtual_parent_count);
-        Some((last.virtual_parent_count, red))
-    }
-
-    pub fn headers_blocks_delta(&self) -> Option<u64> {
-        let last = self.samples.back()?;
-        Some(last.header_count.saturating_sub(last.block_count))
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Tab {
     #[default]
     Dashboard,
-    Analytics,
-    BlockDag,
     Mempool,
     RpcExplorer,
 }
 
 impl Tab {
     pub fn all() -> &'static [Tab] {
-        &[
-            Tab::Dashboard,
-            Tab::Analytics,
-            Tab::BlockDag,
-            Tab::Mempool,
-            Tab::RpcExplorer,
-        ]
+        &[Tab::Dashboard, Tab::Mempool, Tab::RpcExplorer]
     }
 
     /// Name in the tab strip, after its number shortcut (its position in [`Self::all`] + 1).
     pub fn label(&self) -> &'static str {
         match self {
             Tab::Dashboard => "Dashboard",
-            Tab::Analytics => "Analytics",
-            Tab::BlockDag => "BlockDAG",
             Tab::Mempool => "Mempool",
             Tab::RpcExplorer => "RPC Cmds",
         }
@@ -356,6 +338,8 @@ pub struct NodeState {
     pub mempool_state: Option<MempoolState>,
     pub coin_supply: Option<CoinSupplyInfo>,
     pub fee_estimate: Option<FeeEstimateInfo>,
+    /// Balance of the network's burn address in sompi (needs the node's UTXO index).
+    pub burn_balance: Option<u64>,
     /// Estimated network hashrate in hashes per second.
     pub hashrate: Option<f64>,
     pub dag_visualizer: DagVisualizer,
@@ -369,6 +353,15 @@ pub struct NodeState {
     pub last_refresh: Option<Instant>,
     pub last_poll_duration_ms: Option<f64>,
     pub last_error: Option<String>,
+}
+
+impl NodeState {
+    /// The current block reward and next reduction, from the network and DAA score.
+    /// `None` until both are known, or on a network with an unknown schedule.
+    pub fn block_reward(&self) -> Option<BlockReward> {
+        let emission = Emission::for_network(&self.server_info.as_ref()?.network_id)?;
+        emission.block_reward(self.dag_info.as_ref()?.virtual_daa_score)
+    }
 }
 
 /// Analytics cards with their own time window.
@@ -395,6 +388,8 @@ pub enum AnalyticsPhase {
     LoadingCache,
     /// Waiting for the node to connect and finish syncing.
     WaitingForNode,
+    /// Finding where to start: skipping chain blocks older than the 24h window.
+    Seeking,
     /// Fetching chain blocks quickly to reach the tip.
     CatchingUp,
     /// At the tip, fetching new chain blocks every few seconds.
@@ -409,9 +404,11 @@ pub enum StartPoint {
     /// The last chain block in the saved cache, saved at the given time if known.
     Cache(Option<std::time::SystemTime>),
     PruningPoint,
+    /// Skipped ahead from the cache or pruning point to the start of the 24h window.
+    LastDay,
 }
 
-/// Progress of the analytics task, shown in the status bar and on the Analytics tab.
+/// Progress of the analytics task, shown in the status bar and on the Dashboard tab.
 #[derive(Debug, Clone, Default)]
 pub struct AnalyticsStatus {
     pub phase: AnalyticsPhase,
@@ -481,6 +478,8 @@ pub struct AnalyticsState {
     pub reorg_notification: Option<String>,
     /// One view per window, indexed by [`TimeWindow::index`].
     pub cached_views: Option<[AggregatedView; 3]>,
+    /// Transactions per 10 minutes over the last 24h, updated with the views.
+    pub tx_histogram: Option<TxHistogram>,
 }
 
 impl Default for AnalyticsState {
@@ -500,6 +499,7 @@ impl Default for AnalyticsState {
             status: AnalyticsStatus::default(),
             reorg_notification: None,
             cached_views: None,
+            tx_histogram: None,
         }
     }
 }
@@ -594,6 +594,7 @@ impl App {
         self.analytics.engine = None;
         self.analytics.status = AnalyticsStatus::default();
         self.analytics.cached_views = None;
+        self.analytics.tx_histogram = None;
         self.analytics.reorg_notification = None;
         self.mempool_open = None;
         self.dag_selection.set_detail(None);
@@ -763,10 +764,7 @@ mod tests {
     #[test]
     fn tab_labels() {
         let labels: Vec<_> = Tab::all().iter().map(Tab::label).collect();
-        assert_eq!(
-            labels,
-            ["Dashboard", "Analytics", "BlockDAG", "Mempool", "RPC Cmds"]
-        );
+        assert_eq!(labels, ["Dashboard", "Mempool", "RPC Cmds"]);
     }
 
     #[test]
@@ -783,10 +781,6 @@ mod tests {
         let mut app = App::default();
         assert_eq!(app.active_tab, Tab::Dashboard);
         app.next_tab();
-        assert_eq!(app.active_tab, Tab::Analytics);
-        app.next_tab();
-        assert_eq!(app.active_tab, Tab::BlockDag);
-        app.next_tab();
         assert_eq!(app.active_tab, Tab::Mempool);
         app.next_tab();
         assert_eq!(app.active_tab, Tab::RpcExplorer);
@@ -799,10 +793,8 @@ mod tests {
         let mut app = App::default();
         app.prev_tab();
         assert_eq!(app.active_tab, Tab::RpcExplorer); // wraps from 0
-        // Navigate back a couple
-        app.active_tab = Tab::Mempool;
         app.prev_tab();
-        assert_eq!(app.active_tab, Tab::BlockDag);
+        assert_eq!(app.active_tab, Tab::Mempool);
     }
 
     // --- RpcExplorerState ---
@@ -897,8 +889,6 @@ mod tests {
         assert!(stats.blue_block_rate().is_none());
         assert!(stats.avg_dag_width().is_none());
         assert!(stats.block_interval_ms().is_none());
-        assert!(stats.blue_red_ratio().is_none());
-        assert!(stats.headers_blocks_delta().is_none());
     }
 
     #[test]
@@ -921,16 +911,6 @@ mod tests {
     }
 
     #[test]
-    fn dag_stats_blue_red_ratio() {
-        let mut stats = DagStats::default();
-        let dag = make_dag_info(5, 3, 1000, 1010);
-        stats.update(&dag, Some(500));
-        let (blue, red) = stats.blue_red_ratio().unwrap();
-        assert_eq!(blue, 3);
-        assert_eq!(red, 2);
-    }
-
-    #[test]
     fn dag_stats_avg_dag_width() {
         let mut stats = DagStats::default();
         // 3 samples with tip counts 2, 4, 6 → avg 4.0
@@ -943,11 +923,18 @@ mod tests {
     }
 
     #[test]
-    fn dag_stats_headers_blocks_delta() {
+    fn dag_stats_avg_dag_width_last_minute_only() {
         let mut stats = DagStats::default();
-        let dag = make_dag_info(4, 3, 1000, 1050);
-        stats.update(&dag, Some(500));
-        assert_eq!(stats.headers_blocks_delta(), Some(50));
+        let dag = make_dag_info(4, 1, 1000, 1010);
+        stats.update(&dag, Some(100));
+        stats.update(&dag, Some(101));
+        // The first sample is older than the window, so only the other two count.
+        let now = stats.samples[1].timestamp;
+        stats.samples[0].timestamp = now - DAG_WIDTH_WINDOW - Duration::from_secs(1);
+        stats.samples[0].tip_count = 100;
+        stats.update(&make_dag_info(6, 1, 1000, 1010), Some(102));
+        let avg = stats.avg_dag_width().unwrap();
+        assert!((avg - 5.0).abs() < f64::EPSILON);
     }
 
     #[test]

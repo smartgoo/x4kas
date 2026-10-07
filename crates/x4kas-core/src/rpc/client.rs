@@ -13,6 +13,7 @@ use std::str::FromStr;
 use tokio::sync::RwLock;
 
 use crate::app::{App, ConnectionStatus, DagBlock, Tab};
+use crate::emission;
 use crate::format::sompi_to_kas;
 use crate::rpc::methods::{
     self, parse_address, parse_addresses, parse_bool, parse_hash, parse_opt_u64,
@@ -103,6 +104,16 @@ impl RpcManager {
             Ok(ref info) => Some(client.get_block(info.sink, false).await),
             Err(_) => None,
         };
+        // Balance lookups need the node's UTXO index.
+        let burn_address = server_info
+            .as_ref()
+            .ok()
+            .filter(|info| info.has_utxo_index)
+            .and_then(|info| emission::burn_address(&info.network_id.to_string()));
+        let burn_balance = match burn_address {
+            Some(address) => Some(client.get_balance_by_address(address).await),
+            None => None,
+        };
 
         let mut app = self.app_state.write().await;
         let mut errors: Vec<String> = Vec::new();
@@ -133,6 +144,11 @@ impl RpcManager {
         match sink_blue_score {
             Ok(v) => app.node.sink_blue_score = Some(v),
             Err(e) => errors.push(format!("sink_blue_score: {}", e)),
+        }
+        match burn_balance {
+            Some(Ok(sompi)) => app.node.burn_balance = Some(sompi),
+            Some(Err(e)) => errors.push(format!("burn_balance: {}", e)),
+            None => {}
         }
         match sink_block {
             Some(Ok(block)) => app.node.sink_timestamp_ms = Some(block.header.timestamp),
@@ -217,8 +233,8 @@ impl RpcManager {
                 .map(|h| h.to_string())
                 .collect(),
         };
-        // Only the BlockDAG tab shows these, so don't wake the GUI ten times a second elsewhere.
-        if app.node.dag_visualizer.add(block) && app.active_tab == Tab::BlockDag {
+        // Only the Dashboard shows these, so don't wake the GUI ten times a second elsewhere.
+        if app.node.dag_visualizer.add(block) && app.active_tab == Tab::Dashboard {
             app.mark_dirty();
         }
     }
@@ -394,6 +410,21 @@ impl RpcManager {
             )
             .await?;
         Ok(response)
+    }
+
+    /// The next batch of selected chain block hashes after `start_hash` (VSPC v1 without
+    /// transaction IDs: a cheap way to walk the chain).
+    pub async fn fetch_chain_hashes(&self, start_hash: RpcHash) -> Result<Vec<RpcHash>> {
+        let response = self
+            .client
+            .get_virtual_chain_from_block(start_hash, false, None)
+            .await?;
+        Ok(response.added_chain_block_hashes.to_vec())
+    }
+
+    /// A block's header timestamp in milliseconds.
+    pub async fn get_block_timestamp(&self, hash: RpcHash) -> Result<u64> {
+        Ok(self.client.get_block(hash, false).await?.header.timestamp)
     }
 
     /// Get the pruning point hash from block DAG info.

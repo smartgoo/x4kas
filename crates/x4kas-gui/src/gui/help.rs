@@ -6,7 +6,7 @@ use super::theme;
 use super::widgets::{modal_window, section_title};
 
 const SHORTCUTS: &[(&str, &str)] = &[
-    ("1 – 5", "Switch tab"),
+    ("1 – 3", "Switch tab"),
     ("Ctrl+Tab / Ctrl+Shift+Tab", "Next / previous tab"),
     ("P", "Pause / resume polling"),
     ("Ctrl+`", "Show / hide the terminal"),

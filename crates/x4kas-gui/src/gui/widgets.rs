@@ -568,9 +568,10 @@ fn linked_value(ui: &mut Ui, value: &str, kind: LinkKind, selected: bool, chip: 
     }
 
     // Leave room for the label's padding, the copy icon and the chip that follows. The
-    // padding already separates the text from the icon, so the gap only tops it up.
+    // padding already separates the text from the icon, so the gap only tops it up
+    // (keeping the icon just off the hover highlight).
     let padding = 2.0 * ui.spacing().button_padding.x;
-    let gap = (COPY_ICON_GAP - ui.spacing().button_padding.x).max(0.0);
+    let gap = (COPY_ICON_GAP - ui.spacing().button_padding.x).max(1.0);
     let chip_room = if chip && !rtl {
         label_slot_width(ui, id, label.as_ref())
     } else {
@@ -579,15 +580,16 @@ fn linked_value(ui: &mut Ui, value: &str, kind: LinkKind, selected: bool, chip: 
     let room = ui.available_width() - padding - COPY_ICON_WIDTH - gap - chip_room;
     let shown = fit_text(ui, value, room);
 
+    // The gap goes after whichever of the icon and the value comes first in the row.
     if rtl {
-        copy_button(ui, id, value, copy_hint);
+        icon_gap(ui, true, gap, |ui| copy_button(ui, id, value, copy_hint));
     }
 
     // Same hover and selected look as list items; addresses also stay selected while
     // their menu is open.
     let context_id = id.with("context");
     let menu_open = egui::Popup::is_id_open(ui.ctx(), context_id);
-    let response = icon_gap(ui, rtl, gap, |ui| {
+    let response = icon_gap(ui, !rtl, gap, |ui| {
         ui.selectable_label(selected || menu_open, shown.as_str())
     })
     .on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -647,7 +649,7 @@ fn linked_value(ui: &mut Ui, value: &str, kind: LinkKind, selected: bool, chip: 
     }
 
     if !rtl {
-        icon_gap(ui, true, gap, |ui| copy_button(ui, id, value, copy_hint));
+        copy_button(ui, id, value, copy_hint);
         if chip {
             label_slot(ui, id, value, label.as_ref());
         }
@@ -860,7 +862,9 @@ pub fn copy_value(ui: &mut Ui, value: &str, hint: &str) {
     // Right to left (a right-aligned value): the icon first so it lands after the value.
     let rtl = ui.layout().prefer_right_to_left();
     if rtl {
-        copy_button(ui, id, value, hint);
+        icon_gap(ui, true, COPY_ICON_GAP, |ui| {
+            copy_button(ui, id, value, hint)
+        });
     }
     let room = ui.available_width()
         - if rtl {
@@ -869,21 +873,20 @@ pub fn copy_value(ui: &mut Ui, value: &str, hint: &str) {
             COPY_ICON_WIDTH + COPY_ICON_GAP
         };
     let shown = fit_text(ui, value, room);
-    let label = icon_gap(ui, rtl, COPY_ICON_GAP, |ui| {
+    let label = icon_gap(ui, !rtl, COPY_ICON_GAP, |ui| {
         ui.add(egui::Label::new(shown.as_str()).wrap_mode(egui::TextWrapMode::Extend))
     });
     if shown != value {
         label.on_hover_text(value);
     }
     if !rtl {
-        icon_gap(ui, true, COPY_ICON_GAP, |ui| {
-            copy_button(ui, id, value, hint)
-        });
+        copy_button(ui, id, value, hint);
     }
 }
 
-/// Adds `add` `gap` after the previous widget when `apply` (the value and its copy icon,
-/// whichever comes second in the row), else with the usual item spacing.
+/// Adds `add` with `gap` as the spacing after it when `apply` (the value and its copy
+/// icon, whichever comes first in the row: egui fixes the spacing after a widget when
+/// that widget is placed), else with the usual item spacing.
 fn icon_gap<R>(ui: &mut Ui, apply: bool, gap: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
     if !apply {
         return add(ui);
@@ -948,7 +951,7 @@ const COPY_ICON_SIZE: f32 = 11.0;
 const COPY_ICON_WIDTH: f32 = 8.0;
 /// Visible gap between a value's text and its copy icon, a little tighter than the usual
 /// item spacing.
-const COPY_ICON_GAP: f32 = 5.0;
+const COPY_ICON_GAP: f32 = 6.0;
 
 /// The copy icon, an outlined upright rectangle with rounded corners, or a check mark
 /// once copied. Brightens on hover.

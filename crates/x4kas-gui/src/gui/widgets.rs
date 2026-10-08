@@ -577,7 +577,7 @@ fn linked_value(ui: &mut Ui, value: &str, kind: LinkKind, selected: bool, chip: 
     } else {
         0.0
     };
-    let room = ui.available_width() - padding - COPY_ICON_WIDTH - gap - chip_room;
+    let room = ui.available_width() - padding - COPY_ICON_SIZE - gap - chip_room;
     let shown = fit_text(ui, value, room);
 
     // The gap goes after whichever of the icon and the value comes first in the row.
@@ -870,7 +870,7 @@ pub fn copy_value(ui: &mut Ui, value: &str, hint: &str) {
         - if rtl {
             0.0
         } else {
-            COPY_ICON_WIDTH + COPY_ICON_GAP
+            COPY_ICON_SIZE + COPY_ICON_GAP
         };
     let shown = fit_text(ui, value, room);
     let label = icon_gap(ui, !rtl, COPY_ICON_GAP, |ui| {
@@ -946,18 +946,18 @@ pub fn is_testnet(ctx: &egui::Context) -> bool {
     ctx.data(|d| d.get_temp(testnet_id())).unwrap_or(false)
 }
 
-/// Height of the copy icon, about that of a capital letter, and its width.
-const COPY_ICON_SIZE: f32 = 11.0;
-const COPY_ICON_WIDTH: f32 = 8.0;
+/// Side of the square copy icon, a little taller than a capital letter.
+const COPY_ICON_SIZE: f32 = 12.0;
 /// Visible gap between a value's text and its copy icon, a little tighter than the usual
 /// item spacing.
 const COPY_ICON_GAP: f32 = 6.0;
 
-/// The copy icon, an outlined upright rectangle with rounded corners, or a check mark
-/// once copied. Brightens on hover.
+/// The copy icon as on the web (Lucide's and Feather's "copy"): a rounded front sheet
+/// with the back sheet's top-left edge showing behind it, or a check mark once copied.
+/// Brightens on hover.
 fn copy_icon(ui: &mut Ui, copied: bool) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(
-        egui::vec2(COPY_ICON_WIDTH, COPY_ICON_SIZE),
+        egui::vec2(COPY_ICON_SIZE, COPY_ICON_SIZE),
         egui::Sense::click(),
     );
     let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -970,22 +970,39 @@ fn copy_icon(ui: &mut Ui, copied: bool) -> egui::Response {
     };
     let stroke = Stroke::new(1.2_f32, color);
     let painter = ui.painter();
-    let r = rect.shrink(0.5);
+    // The icon's 24-unit grid mapped onto the rect.
+    let unit = rect.width() / 24.0;
+    let at = |x: f32, y: f32| rect.min + egui::vec2(x * unit, y * unit);
 
     if copied {
-        painter.line(
-            vec![
-                pos2(r.left(), r.center().y),
-                pos2(r.left() + r.width() * 0.4, r.bottom() - 1.0),
-                pos2(r.right(), r.top() + 1.0),
-            ],
-            stroke,
-        );
+        painter.line(vec![at(4.0, 12.5), at(9.5, 18.0), at(20.0, 7.0)], stroke);
         return response;
     }
 
-    painter.rect_stroke(r, 2.0, stroke, egui::StrokeKind::Middle);
+    // Front sheet: a rounded square at the bottom right.
+    painter.rect_stroke(
+        egui::Rect::from_min_max(at(8.0, 8.0), at(22.0, 22.0)),
+        2.0 * unit,
+        stroke,
+        egui::StrokeKind::Middle,
+    );
+    // Back sheet: its left and top edges, rounded, ending where the front sheet starts.
+    let mut path = Vec::with_capacity(16);
+    arc(&mut path, at(4.0, 14.0), 2.0 * unit, 90.0, 180.0);
+    arc(&mut path, at(4.0, 4.0), 2.0 * unit, 180.0, 270.0);
+    arc(&mut path, at(14.0, 4.0), 2.0 * unit, 270.0, 360.0);
+    painter.add(egui::Shape::line(path, stroke));
     response
+}
+
+/// Appends a quarter arc of a circle to `path`, from `from` to `to` degrees (clockwise,
+/// 0 pointing right, screen coordinates).
+fn arc(path: &mut Vec<egui::Pos2>, center: egui::Pos2, radius: f32, from: f32, to: f32) {
+    const STEPS: usize = 4;
+    for i in 0..=STEPS {
+        let angle = (from + (to - from) * i as f32 / STEPS as f32).to_radians();
+        path.push(center + egui::vec2(angle.cos(), angle.sin()) * radius);
+    }
 }
 
 /// Greyed-out placeholder text, e.g. "Waiting for data…".

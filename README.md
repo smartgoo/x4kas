@@ -13,6 +13,11 @@ Built with [egui/eframe](https://github.com/emilk/egui) and [rusty-kaspa](https:
   - BlockDAG stats (DAA and blue score, sink, pruning point, tips, DAG width, block interval, blue block rate) and market data (CoinGecko)
   - Supply (incl. unspendable burn-address balance, block reward and next reduction), mining (difficulty, hashrate, unique miners) and node info
   - Chain analytics (direct node only): transactions per 10 minutes over 24h, transaction summary, mempool, transaction inspection (opcodes, covenants, protocols), fees, mining share by node version, top miners, top senders and receivers, each over a 1m / 1h / 24h window
+- **Addresses**: a watchlist with live balances, pending mempool activity, confirmed events and rule-based alerts (any activity, received/sent thresholds, balance crossings), fed by the node's `UtxosChanged` notifications; works through the resolver too when the node has `--utxoindex`
+  - **Address Info** from any address in the app: label, balance, balance history, transactions, counterparties, the likely-owner cluster and watch settings, backed by a local address index of the node's retention window (direct node only; see below)
+  - **Clustering**: addresses that spend together, and probable change outputs, are grouped into likely owners (with guards against merging labelled entities and L2 bridges), so an exchange's many deposit addresses read as one
+  - **Flow graph**: follow the money hop by hop from any address; click a node to expand it
+  - **Labels** from the public api.kaspa.org list (exchanges, pools, funds, bridges; bundled and refreshed daily) and your own, shown as chips wherever an address appears; opt-in per-address lookups on kas.fyi (API key) and KNS `.kas` names
 - **Mempool**: live transaction table; click a row for details
 - **RPC Cmds**: run any of 36 read-only RPC methods (with argument forms for those that take a hash, address or number) and inspect formatted responses
 - **Connection switcher**: connect to a node by URL or through the public resolver, from inside the app
@@ -92,17 +97,46 @@ x4kas-cli rpc get_balances_by_addresses kaspa:qa… kaspa:qb…   # lists: separ
 x4kas-cli rpc get_sink -n testnet-10 -u ws://127.0.0.1:17210 -t 5
 ```
 
+#### Addresses, index, watch and labels
+
+The GUI builds a local **address index** of everything the node still serves (its retention window, ~30 hours on mainnet; `kaspad --retention-period-days` keeps more) from the VSPC v2 stream it already reads for analytics, under `~/.x4kas/index/<network>/`. Six-hour slabs are dropped as the node prunes, so disk use is bounded by the window. `x4kas-cli index run` builds the same index headlessly on a server; the `address` commands read it without a node. The store has a single-writer lock, so a CLI query while the GUI (or `index run`) is writing it reports that the index is in use.
+
+```bash
+x4kas-cli index run --url ws://127.0.0.1:17110 --backfill-hours 0   # keep indexing until Ctrl+C (0 = everything the node has)
+x4kas-cli index status
+x4kas-cli address profile kaspa:qq…        # totals over the indexed window
+x4kas-cli address txs kaspa:qq… --limit 50 # newest first; pass `next` back as --before for the next page
+x4kas-cli address peers kaspa:qq… --top 20 # counterparties by volume
+x4kas-cli address cluster kaspa:qq…        # likely-owner cluster and a sample of members
+x4kas-cli address flows kaspa:qq… --hops 2 # follow the money as a graph (nodes and edges)
+x4kas-cli address balance kaspa:qq… --now <sompi>   # balance history from the index's deltas
+x4kas-cli address tx <txid>
+x4kas-cli watch kaspa:qq… kaspa:qz… --balances      # one JSON line per confirmed change and alert (needs --utxoindex on the node)
+x4kas-cli watch                              # the saved watchlist
+x4kas-cli labels get bybit                   # by address or by name
+x4kas-cli labels set kaspa:qq… "My cold wallet"
+x4kas-cli labels refresh                     # fetch the api.kaspa.org list now
+x4kas-cli labels key <kas.fyi api key>       # enable kas.fyi tag lookups (per address, opt-in)
+x4kas-cli labels kns on                      # enable .kas name resolution (per address, opt-in)
+x4kas-cli labels online kaspa:qq…            # ask the enabled online sources
+```
+
 ### Network Access
 
 Besides the node you connect to, x4kas contacts:
 
 - the CoinGecko API every 60s for market data ([data provided by CoinGecko](https://www.coingecko.com/en/api))
+- `api.kaspa.org/addresses/names` once a day for the public address labels (the whole list, so nothing about which addresses you look at leaves your machine)
+- `api.kas.fyi` and `api.knsdomains.org`, only if you enable them (Addresses tab → Label Sources) and only for the address you press "Look up" on; answers are cached for a week
 - the public Kaspa resolver, only when you choose it (or run `x4kas-cli` without `--url`)
 
 ### Files
 
 - `~/.x4kas/connection.toml`: last connection choice (URL, network, mode)
 - `~/.x4kas/analytics_cache.bin`: analytics cache, saved on exit
+- `~/.x4kas/index/<network>/`: the address index (dropped and rebuilt when its format changes)
+- `~/.x4kas/watchlist.toml`: watched addresses, names and alert rules
+- `~/.x4kas/labels/user.toml`: your address labels; `labels/kaspa_org.json`: the cached public list; `labels/settings.toml` and `labels/online_cache.json`: online lookup settings and answers
 
 ## Keyboard Shortcuts
 
@@ -110,7 +144,7 @@ Most actions are also available with the mouse.
 
 | Key | Action |
 |-----|--------|
-| `1` – `3` | Switch tab |
+| `1` – `4` | Switch tab |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous tab |
 | `p` | Pause / resume polling |
 | `` Ctrl+` `` | Show / hide the terminal |
@@ -124,12 +158,16 @@ Click into the terminal to type; app shortcuts are off until you click elsewhere
 ```
 crates/
   x4kas-core/src/       Shared library (no GUI): everything below the frontends
-    app.rs                Shared App state (Arc<RwLock<App>>), tabs (Dashboard, Mempool, RPC Cmds)
-    controller.rs         UiCommand handling: connections, RPC calls, shutdown
+    app.rs                Shared App state (Arc<RwLock<App>>), tabs (Dashboard, Addresses, Mempool, RPC Cmds)
+    controller.rs         UiCommand handling: connections, RPC calls, address lookups, watchlist, labels, shutdown
     config.rs             Saved connection choice (~/.x4kas/connection.toml)
     polling.rs            RPC creation and background polling tasks
+    chain_stream.rs       The VSPC v2 fetch loop feeding analytics and the index
     analytics.rs          Chain analytics aggregation
-    analytics_streaming.rs Analytics streaming task
+    analytics_streaming.rs The analytics engine as a chain-stream sink
+    index/                The address index (fjall store, writer, queries) and its writer task
+    watch.rs              Watchlist, UtxosChanged events and alert rules
+    labels.rs             Address labels (user, api.kaspa.org, bundled snapshot)
     emission.rs           Block reward schedule and burn address
     format.rs             Formatting helpers
     tx_inspect.rs         Per-transaction classification (scripts, opcodes, protocols)
@@ -144,6 +182,9 @@ crates/
     gui/
       mod.rs              GuiApp: frame loop, top bar, shortcuts, quit
       dashboard.rs        Dashboard tab: card layout and node-backed cards
+      addresses.rs        Addresses tab: watchlist, alerts, activity
+      address.rs          Address Info window
+      flows.rs            Flow graph window
       blockdag.rs         DAG visualizer, BlockDAG card, Block Info window
       analytics.rs        Dashboard's chain analytics cards and tx chart
       mempool.rs          Mempool tab
@@ -155,6 +196,8 @@ crates/
   x4kas-cli/src/        `x4kas-cli` binary
     main.rs               Entry point: global args, command dispatch
     rpc.rs                `rpc <method>` subcommands generated from the method catalog
+    address.rs index.rs   `address …` queries and the headless `index run` / `index status`
+    watch.rs labels.rs    `watch` event stream and `labels …`
 vendor/egui_term/       Terminal widget (alacritty_terminal), vendored with small patches
 ```
 

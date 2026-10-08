@@ -18,13 +18,12 @@ pub struct PollingHandles {
     /// Connects the RPC client, then polls node state.
     pub node: Option<JoinHandle<()>>,
     pub hashrate: Option<JoinHandle<()>>,
-    /// The chain stream (`chain_stream::run`), which feeds the sinks below.
-    pub analytics: Option<JoinHandle<()>>,
-    /// The analytics engine, fed by the chain stream.
-    pub analytics_sink: Option<JoinHandle<()>>,
-    /// The address index writer thread, fed by the chain stream. Not aborted: a blocking
-    /// thread can't be, and it must finish its batch and release the store's lock. It
-    /// exits once the stream (its sender) is gone; see [`Self::stop_index`].
+    /// The chain stream (`chain_stream::run`), which feeds the index writer.
+    pub stream: Option<JoinHandle<()>>,
+    /// The index writer thread (which also keeps the analytics engine), fed by the chain
+    /// stream. Not aborted: a blocking thread can't be, and it must finish its batch and
+    /// release the store's lock. It exits once the stream (its sender) is gone; see
+    /// [`Self::stop_index`].
     pub index: Option<JoinHandle<()>>,
     /// The watchlist's `UtxosChanged` subscription (`watch::start_watch`).
     pub watch: Option<JoinHandle<()>>,
@@ -45,8 +44,7 @@ impl PollingHandles {
         for handle in [
             &mut self.node,
             &mut self.hashrate,
-            &mut self.analytics,
-            &mut self.analytics_sink,
+            &mut self.stream,
             &mut self.watch,
         ] {
             if let Some(h) = handle.take() {
@@ -62,6 +60,15 @@ impl PollingHandles {
         if let Some(h) = self.index.take() {
             let _ = h.await;
         }
+    }
+
+    /// Stop the chain pipeline only (the stream, then the writer), leaving node polling,
+    /// hashrate and the watchlist running.
+    pub async fn stop_chain(&mut self) {
+        if let Some(h) = self.stream.take() {
+            h.abort();
+        }
+        self.stop_index().await;
     }
 }
 

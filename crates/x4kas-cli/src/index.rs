@@ -1,6 +1,7 @@
-//! `x4kas-cli index …`: the headless address indexer. `run` connects to a node and
-//! streams its chain into the index until interrupted, so a server can keep the index
-//! current without the GUI; `status` reads the index on disk.
+//! `x4kas-cli index …`: the headless chain pipeline. `run` connects to a node and
+//! streams its chain into the index (and the Dashboard's analytics, which live in it)
+//! until interrupted, so a server can keep the index current without the GUI; `status`
+//! reads the index on disk.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,7 +11,7 @@ use clap::Subcommand;
 use serde::Serialize;
 use tokio::sync::RwLock;
 
-use x4kas_core::app::{AnalyticsPhase, App, IndexPhase};
+use x4kas_core::app::{App, ChainPhase};
 use x4kas_core::chain_stream::{self, StreamStart};
 use x4kas_core::format::{format_number, now_ms};
 use x4kas_core::index::{self, IndexStore};
@@ -90,12 +91,7 @@ async fn run_indexer(
     let store = Arc::new(IndexStore::open(network)?);
     let labels = Arc::new(x4kas_core::labels::LabelBook::load());
     let sink = index::task::start_writer(store, labels, app.clone(), &mut handles)?;
-    let position = sink.position.map(|p| {
-        (
-            kaspa_rpc_core::RpcHash::from_bytes(p.chain_block),
-            std::time::UNIX_EPOCH.checked_add(Duration::from_millis(p.time_ms)),
-        )
-    });
+    let position = sink.stream_position();
 
     // Polling keeps the node's sync state and pruning point in the app, as in the GUI.
     let rpc = create_and_start_rpc(Some(url), network, &app, 1000, &mut handles)?;
@@ -133,13 +129,12 @@ async fn run_indexer(
 
 /// One line of progress: the stream's phase and the writer's counters.
 fn progress_line(app: &App) -> String {
-    let stream = &app.analytics.status;
-    let index = &app.index.status;
-    let phase = match (&stream.phase, &index.phase) {
-        (_, IndexPhase::Error(e)) => format!("index error: {e}"),
-        (AnalyticsPhase::Error(e), _) => format!("stream error: {e}"),
-        (AnalyticsPhase::Live, _) => "live".to_string(),
-        (AnalyticsPhase::CatchingUp, _) => {
+    let index = &app.chain;
+    let phase = match (&index.phase, &index.write_error) {
+        (_, Some(e)) => format!("write error: {e}"),
+        (ChainPhase::Error(e), _) => format!("stream error: {e}"),
+        (ChainPhase::Live, _) => "live".to_string(),
+        (ChainPhase::CatchingUp, _) => {
             let behind = index
                 .position
                 .map(|p| now_ms().saturating_sub(p.time_ms) / 1000)

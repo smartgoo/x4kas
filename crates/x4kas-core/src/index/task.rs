@@ -1,17 +1,21 @@
 //! The index writer as a background task: a blocking thread that drains the chain
-//! stream's batches into the store and reports progress in `app.index`.
+//! stream's batches into the store, publishes the analytics views the engine computes
+//! from them, and reports progress in `app.chain`.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
+use kaspa_rpc_core::RpcHash;
 use tokio::sync::{RwLock, mpsc};
 
 use super::writer::IndexWriter;
 use super::{IndexStore, Position};
-use crate::app::{App, IndexPhase};
+use crate::analytics::{AnalyticsEngine, coinbase_miners};
+use crate::app::App;
 use crate::chain_stream::{BatchSender, ChainBatch, SINK_QUEUE};
-use crate::labels::LabelBook;
+use crate::format::now_ms;
+use crate::labels::{LabelBook, MinerTally};
 use crate::polling::PollingHandles;
 
 /// Refresh disk usage in the status every this many batches (it walks the directory).
@@ -23,8 +27,21 @@ pub struct IndexSink {
     pub position: Option<Position>,
 }
 
+impl IndexSink {
+    /// The position as the chain stream wants it: the hash and when it was written.
+    pub fn stream_position(&self) -> Option<(RpcHash, Option<SystemTime>)> {
+        self.position.map(|p| {
+            (
+                RpcHash::from_bytes(p.chain_block),
+                SystemTime::UNIX_EPOCH.checked_add(Duration::from_millis(p.time_ms)),
+            )
+        })
+    }
+}
+
 /// Start the writer thread on `store`, tracked in `handles.index`. Batches sent to the
 /// returned sender are applied in order; the thread exits when the stream drops it.
+/// The analytics views (`app.analytics`) follow the first batch, like the counters.
 pub fn start_writer(
     store: Arc<IndexStore>,
     labels: Arc<LabelBook>,
@@ -48,9 +65,8 @@ fn run(
     let store = writer.store().clone();
     {
         let mut app = app.blocking_write();
-        let status = &mut app.index.status;
-        status.phase = IndexPhase::Indexing;
-        let manifest = writer.manifest();
+        let manifest = *writer.manifest();
+        let status = &mut app.chain;
         status.txs_indexed = manifest.txs_indexed;
         status.addresses = manifest.next_addr_id as u64;
         status.position = manifest.position;
@@ -60,6 +76,8 @@ fn run(
         app.mark_dirty();
     }
 
+    // Pools reveal themselves by mining many blocks; label them as they do.
+    let mut miners = MinerTally::default();
     let mut batches = 0u64;
     while let Some(batch) = receiver.blocking_recv() {
         // The latest labels for the clustering guard, and the node's pruning point
@@ -77,35 +95,60 @@ fn run(
             Some(floor) => store.prune_before(floor).unwrap_or(0),
             None => 0,
         };
+        let pool_labels: Vec<(String, String)> = coinbase_miners(&batch)
+            .into_iter()
+            .filter_map(|(address, tag)| {
+                let name = miners.observe(&address, tag.as_deref())?;
+                Some((address, name))
+            })
+            .collect();
 
         let mut app = app.blocking_write();
-        let status = &mut app.index.status;
         match result {
             Ok(report) => {
-                status.phase = IndexPhase::Indexing;
-                let manifest = writer.manifest();
+                let manifest = *writer.manifest();
+                let status = &mut app.chain;
+                status.write_error = None;
                 status.txs_indexed = manifest.txs_indexed;
                 status.addresses = manifest.next_addr_id as u64;
                 status.position = manifest.position;
-                status.record_batch(report.txs, started.elapsed());
-                if !report.unresolved_reorgs.is_empty() {
-                    status.unresolved_reorgs += report.unresolved_reorgs.len() as u64;
-                }
+                status.record_write(report.txs, started.elapsed());
+                status.unresolved_reorgs += report.unresolved_reorgs.len() as u64;
                 status.cluster_cap_hits += report.cluster_cap_hits;
+                if let Some(hash) = report.analytics_reorgs.first() {
+                    app.analytics.reorg_notification = Some(format!(
+                        "Reorg detected affecting finalized block {hash}. Analytics may be slightly inaccurate.",
+                    ));
+                }
+                publish_views(&mut app, writer.analytics());
             }
-            Err(e) => status.phase = IndexPhase::Error(format!("{e:#}")),
+            Err(e) => app.chain.write_error = Some(format!("{e:#}")),
         }
-        status.backlog = receiver.len();
+        app.chain.backlog = receiver.len();
         if pruned > 0 || batches % DISK_EVERY == 1 {
-            status.slabs = store.slabs().len();
-            status.coverage = store.coverage();
-            status.disk_bytes = store.disk_space();
+            app.chain.slabs = store.slabs().len();
+            app.chain.coverage = store.coverage();
+            app.chain.disk_bytes = store.disk_space();
+        }
+        if !pool_labels.is_empty() {
+            let mut book = (*app.labels).clone();
+            let mut changed = false;
+            for (address, name) in &pool_labels {
+                changed |= book.set_heuristic(address, name);
+            }
+            if changed {
+                app.labels = Arc::new(book);
+            }
         }
         app.mark_dirty();
     }
 
     let _ = store.persist();
-    let mut app = app.blocking_write();
-    app.index.status.phase = IndexPhase::Idle;
-    app.mark_dirty();
+}
+
+/// Recompute the Dashboard's views from `engine`.
+fn publish_views(app: &mut App, engine: &AnalyticsEngine) {
+    let now = now_ms();
+    app.analytics.cached_views = Some(engine.views(now));
+    app.analytics.tx_histogram = Some(engine.tx_histogram(now));
 }

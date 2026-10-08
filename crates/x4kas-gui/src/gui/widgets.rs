@@ -1033,8 +1033,24 @@ pub fn status_chip(
     color: egui::Color32,
     details: impl FnOnce(&mut Ui),
 ) {
+    status_chip_with(ui, id, text, color, details, |_| {});
+}
+
+/// [`status_chip`] with widgets (buttons, say) under the details grid. A tooltip with
+/// an interactive widget stays open while the pointer moves into it.
+pub fn status_chip_with(
+    ui: &mut Ui,
+    id: &str,
+    text: &str,
+    color: egui::Color32,
+    details: impl FnOnce(&mut Ui),
+    footer: impl FnOnce(&mut Ui),
+) {
     ui.label(RichText::new(text).color(color))
-        .on_hover_ui(|ui| kv_grid(ui, id, details));
+        .on_hover_ui(|ui| {
+            kv_grid(ui, id, details);
+            footer(ui);
+        });
 }
 
 /// Placeholder text for data that needs a direct node (a URL), not the resolver.

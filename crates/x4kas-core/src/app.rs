@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::analytics::{AggregatedView, AnalyticsEngine, TxHistogram};
+use crate::analytics::{AggregatedView, TxHistogram};
 use crate::emission::{BlockReward, Emission};
 use crate::index::query::{AddressProfile, ClusterInfo, FlowGraph, Page, Peer, TxRow};
 use crate::labels::{LabelBook, LabelSettings};
@@ -393,13 +393,15 @@ pub enum AnalyticsPanel {
 /// testnet-10.
 pub const DAA_SCORE_PER_SEC: f64 = 10.0;
 
-/// What the analytics streaming task is doing.
+/// What the chain pipeline is doing: the chain stream's phase. The index writer and the
+/// analytics engine it feeds follow it; a failed write is `ChainStatus::write_error`.
 #[derive(Debug, Clone, PartialEq, Default)]
-pub enum AnalyticsPhase {
-    /// No task running (not connected, or connected through the resolver).
+pub enum ChainPhase {
+    /// Nothing running (not connected, or connected through the resolver).
     #[default]
     Idle,
-    LoadingCache,
+    /// Opening the index store and loading the analytics it holds.
+    Opening,
     /// Waiting for the node to connect and finish syncing.
     WaitingForNode,
     /// Finding where to start: skipping chain blocks older than the 24h window.
@@ -408,38 +410,63 @@ pub enum AnalyticsPhase {
     CatchingUp,
     /// At the tip, fetching new chain blocks every second.
     Live,
-    /// The last request failed; the task retries.
+    /// The store couldn't be opened, or the last request failed and the stream retries.
     Error(String),
 }
 
-/// Where analytics started reading the chain.
+/// Where the chain stream started reading.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum StartPoint {
-    /// The last chain block in the saved cache, saved at the given time if known.
-    Cache(Option<std::time::SystemTime>),
+    /// The index's last chain block, written at the given time if known.
+    Index(Option<std::time::SystemTime>),
     PruningPoint,
-    /// Skipped ahead from the cache or pruning point to the start of the 24h window.
+    /// Skipped ahead from the index position or pruning point to the start of the 24h
+    /// window.
     LastDay,
 }
 
-/// Progress of the chain stream that feeds analytics and the address index, shown in
-/// the status bar and on the Dashboard tab.
+/// Progress of the chain pipeline (the VSPC stream, the index writer and the analytics
+/// it carries), shown in the status bar and on the Dashboard tab.
 #[derive(Debug, Clone, Default)]
-pub struct AnalyticsStatus {
-    pub phase: AnalyticsPhase,
+pub struct ChainStatus {
+    pub phase: ChainPhase,
+
+    // --- The stream ---
     pub started_from: Option<StartPoint>,
     /// DAA score of the first processed chain block.
     pub start_daa: Option<u64>,
     /// DAA score of the newest processed chain block.
     pub current_daa: Option<u64>,
-    /// Chain blocks processed since the task started.
+    /// Chain blocks fetched since the stream started.
     pub blocks_processed: u64,
     /// Smoothed catch-up speed in DAA score per second.
     pub daa_per_sec: Option<f64>,
     pub last_batch_at: Option<Instant>,
+
+    // --- The writer ---
+    pub txs_indexed: u64,
+    pub addresses: u64,
+    /// The last indexed chain block.
+    pub position: Option<crate::index::Position>,
+    pub disk_bytes: u64,
+    pub slabs: usize,
+    /// The time span the index covers, `(from_ms, to_ms)`.
+    pub coverage: Option<(u64, u64)>,
+    /// Smoothed write speed, in transactions per second of writer time.
+    pub tx_per_sec: Option<f64>,
+    /// Batches waiting for the writer.
+    pub backlog: usize,
+    /// Removed chain blocks the index didn't have (reorgs past its coverage).
+    pub unresolved_reorgs: u64,
+    /// Owner merges the cluster size cap refused this session: a heuristic failure
+    /// (a bridge or service whose spends pool strangers), never a discovery.
+    pub cluster_cap_hits: u64,
+    /// Why the last batch couldn't be written; the writer goes on with the next.
+    pub write_error: Option<String>,
+    pub last_write_at: Option<Instant>,
 }
 
-impl AnalyticsStatus {
+impl ChainStatus {
     /// Catch-up progress between the start point and `tip_daa`, in `0.0..=1.0`.
     pub fn fraction(&self, tip_daa: u64) -> Option<f32> {
         let (start, current) = (self.start_daa?, self.current_daa?);
@@ -483,13 +510,26 @@ impl AnalyticsStatus {
         }
         self.last_batch_at = Some(now);
     }
+
+    /// Record a written batch of `txs` transactions that took `elapsed`.
+    pub fn record_write(&mut self, txs: usize, elapsed: Duration) {
+        let secs = elapsed.as_secs_f64();
+        if txs > 0 && secs > 0.0 {
+            let rate = txs as f64 / secs;
+            self.tx_per_sec = Some(match self.tx_per_sec {
+                Some(r) => r * 0.8 + rate * 0.2,
+                None => rate,
+            });
+        }
+        self.last_write_at = Some(Instant::now());
+    }
 }
 
+/// The Dashboard's chain analytics: views computed by the index writer from the engine
+/// it keeps (`analytics::AnalyticsEngine`), and the windows the panels show.
 pub struct AnalyticsState {
-    pub engine: Option<Arc<tokio::sync::RwLock<AnalyticsEngine>>>,
     /// Each panel's time window, indexed by [`AnalyticsPanel`].
     pub windows: [TimeWindow; 6],
-    pub status: AnalyticsStatus,
     pub reorg_notification: Option<String>,
     /// One view per window, indexed by [`TimeWindow::index`].
     pub cached_views: Option<[AggregatedView; 3]>,
@@ -501,7 +541,6 @@ impl Default for AnalyticsState {
     fn default() -> Self {
         use TimeWindow::*;
         Self {
-            engine: None,
             // Same windows as the Kaspalytics home page
             windows: [
                 TwentyFourHour,
@@ -511,7 +550,6 @@ impl Default for AnalyticsState {
                 OneHour,
                 OneHour,
             ],
-            status: AnalyticsStatus::default(),
             reorg_notification: None,
             cached_views: None,
             tx_histogram: None,
@@ -531,64 +569,6 @@ impl AnalyticsState {
     pub fn view(&self, window: TimeWindow) -> Option<&AggregatedView> {
         self.cached_views.as_ref().map(|v| &v[window.index()])
     }
-}
-
-/// What the address index writer is doing.
-#[derive(Debug, Clone, PartialEq, Default)]
-pub enum IndexPhase {
-    /// No writer running (not connected, or connected through the resolver).
-    #[default]
-    Idle,
-    Opening,
-    /// Applying batches from the chain stream (whose phase says whether that's a
-    /// catch-up or live polling).
-    Indexing,
-    /// The last batch failed; the writer goes on with the next.
-    Error(String),
-}
-
-/// Progress of the address index, shown in the status bar.
-#[derive(Debug, Clone, Default)]
-pub struct IndexStatus {
-    pub phase: IndexPhase,
-    pub txs_indexed: u64,
-    pub addresses: u64,
-    /// The last indexed chain block.
-    pub position: Option<crate::index::Position>,
-    pub disk_bytes: u64,
-    pub slabs: usize,
-    /// The time span the index covers, `(from_ms, to_ms)`.
-    pub coverage: Option<(u64, u64)>,
-    /// Smoothed write speed, in transactions per second of writer time.
-    pub tx_per_sec: Option<f64>,
-    /// Batches waiting for the writer.
-    pub backlog: usize,
-    /// Removed chain blocks the index didn't have (reorgs past its coverage).
-    pub unresolved_reorgs: u64,
-    /// Owner merges the cluster size cap refused this session: a heuristic failure
-    /// (a bridge or service whose spends pool strangers), never a discovery.
-    pub cluster_cap_hits: u64,
-    pub last_batch_at: Option<Instant>,
-}
-
-impl IndexStatus {
-    /// Record a written batch of `txs` transactions that took `elapsed`.
-    pub fn record_batch(&mut self, txs: usize, elapsed: Duration) {
-        let secs = elapsed.as_secs_f64();
-        if txs > 0 && secs > 0.0 {
-            let rate = txs as f64 / secs;
-            self.tx_per_sec = Some(match self.tx_per_sec {
-                Some(r) => r * 0.8 + rate * 0.2,
-                None => rate,
-            });
-        }
-        self.last_batch_at = Some(Instant::now());
-    }
-}
-
-#[derive(Default)]
-pub struct IndexState {
-    pub status: IndexStatus,
 }
 
 /// What the watchlist task is doing.
@@ -865,7 +845,8 @@ pub struct App {
 
     pub node: NodeState,
     pub analytics: AnalyticsState,
-    pub index: IndexState,
+    /// The chain pipeline's progress (stream, index writer, analytics).
+    pub chain: ChainStatus,
     pub watch: WatchState,
     pub address: AddressState,
     /// Known address labels; replaced as a whole when a source changes.
@@ -916,12 +897,7 @@ impl App {
     /// Drop all data fetched from the current node, e.g. before switching nodes.
     pub fn clear_node_data(&mut self) {
         self.node = NodeState::default();
-        self.analytics.engine = None;
-        self.analytics.status = AnalyticsStatus::default();
-        self.analytics.cached_views = None;
-        self.analytics.tx_histogram = None;
-        self.analytics.reorg_notification = None;
-        self.index.status = IndexStatus::default();
+        self.clear_chain_data();
         self.watch.clear_node_data();
         self.address.close();
         self.address.flows.close();
@@ -931,6 +907,15 @@ impl App {
         self.dag_selection.block_loading = false;
         self.rpc_explorer.set_response(None);
         self.rpc_explorer.is_loading = false;
+    }
+
+    /// Forget everything the chain pipeline produced: its status and the Dashboard's
+    /// analytics views. Node data stays.
+    pub fn clear_chain_data(&mut self) {
+        self.chain = ChainStatus::default();
+        self.analytics.cached_views = None;
+        self.analytics.tx_histogram = None;
+        self.analytics.reorg_notification = None;
     }
 
     /// Open the detail window for the mempool entry at `index`, if it exists.
@@ -1014,20 +999,36 @@ mod tests {
     }
 
     #[test]
-    fn clear_node_data_resets_analytics_status() {
+    fn clear_node_data_resets_chain_status() {
         let mut app = App::default();
-        app.analytics.status.phase = AnalyticsPhase::Live;
-        app.analytics.status.blocks_processed = 10;
+        app.chain.phase = ChainPhase::Live;
+        app.chain.blocks_processed = 10;
+        app.chain.txs_indexed = 7;
         app.clear_node_data();
-        assert_eq!(app.analytics.status.phase, AnalyticsPhase::Idle);
-        assert_eq!(app.analytics.status.blocks_processed, 0);
+        assert_eq!(app.chain.phase, ChainPhase::Idle);
+        assert_eq!(app.chain.blocks_processed, 0);
+        assert_eq!(app.chain.txs_indexed, 0);
     }
 
-    // --- Analytics status ---
+    #[test]
+    fn clear_chain_data_keeps_node_data() {
+        let mut app = App::default();
+        app.chain.phase = ChainPhase::Live;
+        app.analytics.tx_histogram = Some(TxHistogram::default());
+        app.analytics.reorg_notification = Some("reorg".into());
+        app.node.hashrate = Some(1.0);
+        app.clear_chain_data();
+        assert_eq!(app.chain.phase, ChainPhase::Idle);
+        assert!(app.analytics.tx_histogram.is_none());
+        assert!(app.analytics.reorg_notification.is_none());
+        assert_eq!(app.node.hashrate, Some(1.0));
+    }
+
+    // --- Chain status ---
 
     #[test]
-    fn analytics_status_fraction_is_relative_to_start() {
-        let mut s = AnalyticsStatus::default();
+    fn chain_status_fraction_is_relative_to_start() {
+        let mut s = ChainStatus::default();
         assert_eq!(s.fraction(2_000), None);
         let t0 = Instant::now();
         s.record_batch(5, 1_000, t0);
@@ -1040,8 +1041,8 @@ mod tests {
     }
 
     #[test]
-    fn analytics_status_behind_tip() {
-        let mut s = AnalyticsStatus::default();
+    fn chain_status_behind_tip() {
+        let mut s = ChainStatus::default();
         assert_eq!(s.behind(2_000), None);
         s.record_batch(1, 1_000, Instant::now());
         assert_eq!(s.behind(1_600), Some((600, Duration::from_secs(60))));
@@ -1049,8 +1050,8 @@ mod tests {
     }
 
     #[test]
-    fn analytics_status_rate_and_eta() {
-        let mut s = AnalyticsStatus::default();
+    fn chain_status_rate_and_eta() {
+        let mut s = ChainStatus::default();
         let t0 = Instant::now();
         s.record_batch(3, 1_000, t0);
         assert_eq!(s.daa_per_sec, None);
@@ -1065,8 +1066,20 @@ mod tests {
     }
 
     #[test]
-    fn analytics_status_empty_batch_keeps_progress() {
-        let mut s = AnalyticsStatus::default();
+    fn chain_status_write_speed_is_smoothed() {
+        let mut s = ChainStatus::default();
+        s.record_write(0, Duration::from_secs(1));
+        assert_eq!(s.tx_per_sec, None);
+        s.record_write(100, Duration::from_secs(1));
+        assert_eq!(s.tx_per_sec, Some(100.0));
+        s.record_write(300, Duration::from_secs(1));
+        assert!((s.tx_per_sec.unwrap() - 140.0).abs() < 1e-9);
+        assert!(s.last_write_at.is_some());
+    }
+
+    #[test]
+    fn chain_status_empty_batch_keeps_progress() {
+        let mut s = ChainStatus::default();
         let t0 = Instant::now();
         s.record_batch(2, 1_000, t0);
         s.record_batch(0, 0, t0 + Duration::from_secs(1));

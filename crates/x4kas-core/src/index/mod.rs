@@ -6,11 +6,13 @@
 //! Every data keyspace is partitioned into six-hour slabs (`tx_<n>`, `atx_<n>`, …), so
 //! pruning behind the node's pruning point drops whole keyspaces instead of scanning, and
 //! an address's totals are the sum of at most a few per-slab records. Only the address
-//! interning tables and the manifest are global.
+//! interning tables, the clusters, the Dashboard's analytics buckets (`analytics`, see
+//! [`analytics`]) and the manifest are global.
 //!
 //! The store is synchronous: the writer runs on its own blocking thread, and queries are
 //! called inside `spawn_blocking`. Nothing here touches the GUI thread.
 
+pub mod analytics;
 pub mod cluster;
 pub mod export;
 pub mod peel;
@@ -33,7 +35,7 @@ use records::{AddrId, Hash32, SLAB_MS, addr_key, decode, encode, parse_addr_key,
 
 /// Bumped when the on-disk layout or the meaning of stored data changes; an index with
 /// another format is discarded and rebuilt from the node.
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;
 
 /// Block cache shared by all keyspaces.
 const CACHE_BYTES: u64 = 256 * 1024 * 1024;
@@ -45,6 +47,18 @@ const LOCK_RETRY: Duration = Duration::from_secs(5);
 /// Where the index for `network` lives.
 pub fn index_dir(network: &str) -> PathBuf {
     config::data_dir().join("index").join(network)
+}
+
+/// Delete the index of `network` from disk (nothing to do when there is none), so the
+/// next [`IndexStore::open`] starts from scratch. Close the store first: a writer
+/// holding it would keep writing into files that no longer have a directory.
+pub fn discard(network: &str) -> Result<()> {
+    let path = index_dir(network);
+    match std::fs::remove_dir_all(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("discard {}", path.display())),
+    }
 }
 
 /// Where the chain stream should resume: the last indexed chain block.
@@ -110,6 +124,8 @@ pub struct IndexStore {
     /// `addr_id → address`
     str_by_id: Keyspace,
     clusters: cluster::ClusterKeyspaces,
+    /// The analytics engine's buckets and recent blocks (`analytics`).
+    analytics: Keyspace,
     slabs: RwLock<BTreeMap<u64, Slab>>,
 }
 
@@ -168,6 +184,7 @@ impl IndexStore {
             size: db.keyspace("cl_size", KeyspaceCreateOptions::default)?,
             member: db.keyspace("cl_member", KeyspaceCreateOptions::default)?,
         };
+        let analytics = db.keyspace("analytics", KeyspaceCreateOptions::default)?;
 
         // Reopen the slabs that exist on disk.
         let mut slabs = BTreeMap::new();
@@ -182,6 +199,7 @@ impl IndexStore {
             addr_by_str,
             str_by_id,
             clusters,
+            analytics,
             slabs: RwLock::new(slabs),
         })
     }
@@ -233,6 +251,10 @@ impl IndexStore {
 
     pub fn clusters(&self) -> &cluster::ClusterKeyspaces {
         &self.clusters
+    }
+
+    pub fn analytics_keyspace(&self) -> &Keyspace {
+        &self.analytics
     }
 
     /// The id of an address already in the index.

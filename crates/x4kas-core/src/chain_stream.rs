@@ -1,11 +1,11 @@
 //! The VSPC v2 chain stream: one fetch loop per connection that hands every response
-//! to its sinks (the analytics engine, the address index) over bounded channels, so a
-//! slow sink slows the fetch instead of piling up memory. Progress is reported in
-//! `app.analytics.status`, which the status bar and the Dashboard show.
+//! to its sinks (the index writer, which also carries the analytics engine) over bounded
+//! channels, so a slow sink slows the fetch instead of piling up memory. Progress is
+//! reported in `app.chain`, which the status bar and the Dashboard show.
 //!
-//! The stream starts from the oldest position its sinks remember (or the pruning
-//! point), skipped ahead to the backfill window, and then polls the tip every second.
-//! Sinks skip what they've already seen, so an overlap is harmless.
+//! The stream starts from the position the index remembers (or the pruning point),
+//! skipped ahead to the backfill window, and then polls the tip every second. The writer
+//! skips chain blocks it has already seen, so an overlap is harmless.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime};
 use kaspa_rpc_core::{GetVirtualChainFromBlockV2Response, RpcHash};
 use tokio::sync::{RwLock, mpsc};
 
-use crate::app::{AnalyticsPhase, App, ConnectionStatus, StartPoint, TimeWindow};
+use crate::app::{App, ChainPhase, ConnectionStatus, StartPoint, TimeWindow};
 use crate::format::now_ms;
 use crate::polling::PollingHandles;
 use crate::rpc::client::RpcManager;
@@ -34,21 +34,20 @@ const RETRY_DELAY: Duration = Duration::from_secs(5);
 const NODE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// How often the task polls in `phase`, for display.
-pub fn poll_interval(phase: &AnalyticsPhase) -> Option<Duration> {
+pub fn poll_interval(phase: &ChainPhase) -> Option<Duration> {
     match phase {
-        AnalyticsPhase::WaitingForNode => Some(NODE_CHECK_INTERVAL),
-        AnalyticsPhase::CatchingUp => Some(CATCH_UP_INTERVAL),
-        AnalyticsPhase::Live => Some(LIVE_INTERVAL),
-        AnalyticsPhase::Error(_) => Some(RETRY_DELAY),
-        AnalyticsPhase::Idle | AnalyticsPhase::LoadingCache | AnalyticsPhase::Seeking => None,
+        ChainPhase::WaitingForNode => Some(NODE_CHECK_INTERVAL),
+        ChainPhase::CatchingUp => Some(CATCH_UP_INTERVAL),
+        ChainPhase::Live => Some(LIVE_INTERVAL),
+        ChainPhase::Error(_) => Some(RETRY_DELAY),
+        ChainPhase::Idle | ChainPhase::Opening | ChainPhase::Seeking => None,
     }
 }
 
 /// Where to start streaming.
 #[derive(Debug, Clone, Default)]
 pub struct StreamStart {
-    /// The last chain block a sink has processed, with when it was saved if known. The
-    /// oldest of the sinks' positions, so none misses anything.
+    /// The last chain block the index has written, with when it was written if known.
     pub position: Option<(RpcHash, Option<SystemTime>)>,
     /// Skip ahead from the position (or pruning point) to this far back from now.
     /// `None` keeps everything the node has.
@@ -62,7 +61,7 @@ impl StreamStart {
     }
 }
 
-/// Start the stream task, tracked in `handles.analytics`.
+/// Start the stream task, tracked in `handles.stream`.
 pub fn start_chain_stream(
     rpc: &Arc<RpcManager>,
     app: &Arc<RwLock<App>>,
@@ -70,7 +69,7 @@ pub fn start_chain_stream(
     start: StreamStart,
     sinks: Vec<BatchSender>,
 ) {
-    handles.analytics = Some(tokio::spawn(run(rpc.clone(), app.clone(), start, sinks)));
+    handles.stream = Some(tokio::spawn(run(rpc.clone(), app.clone(), start, sinks)));
 }
 
 /// The stream loop, also used directly by the CLI's headless indexer.
@@ -101,7 +100,7 @@ pub async fn run(
                 continue;
             }
             Err(e) => {
-                set_phase(&app, AnalyticsPhase::Error(e.to_string())).await;
+                set_phase(&app, ChainPhase::Error(e.to_string())).await;
                 tokio::time::sleep(RETRY_DELAY).await;
                 continue;
             }
@@ -134,12 +133,12 @@ pub async fn run(
 
         {
             let mut app = app.write().await;
-            let status = &mut app.analytics.status;
+            let status = &mut app.chain;
             status.record_batch(block_count, newest_daa, Instant::now());
             status.phase = if synced {
-                AnalyticsPhase::Live
+                ChainPhase::Live
             } else {
-                AnalyticsPhase::CatchingUp
+                ChainPhase::CatchingUp
             };
             app.mark_dirty();
         }
@@ -154,7 +153,7 @@ pub async fn run(
     }
 }
 
-/// Pick the chain block to stream from and report it in the status: the saved position
+/// Pick the chain block to stream from and report it in the status: the index position
 /// if given, otherwise the pruning point, skipped ahead to the backfill window. Retries
 /// until the node answers; a position the node has pruned falls back to the pruning
 /// point.
@@ -164,7 +163,7 @@ async fn resolve_start(
     mut position: Option<(RpcHash, Option<SystemTime>)>,
     backfill: Option<Duration>,
 ) -> RpcHash {
-    set_phase(app, AnalyticsPhase::Seeking).await;
+    set_phase(app, ChainPhase::Seeking).await;
     loop {
         wait_for_node(app).await;
         let found = match position {
@@ -178,25 +177,25 @@ async fn resolve_start(
             Ok((hash, skipped)) => {
                 let started_from = match position {
                     _ if skipped => StartPoint::LastDay,
-                    Some((_, saved_at)) => StartPoint::Cache(saved_at),
+                    Some((_, saved_at)) => StartPoint::Index(saved_at),
                     None => StartPoint::PruningPoint,
                 };
                 let mut app = app.write().await;
-                let status = &mut app.analytics.status;
+                let status = &mut app.chain;
                 status.started_from = Some(started_from);
                 // Progress and speed restart from the new position.
                 status.start_daa = None;
                 status.current_daa = None;
                 status.daa_per_sec = None;
-                status.phase = AnalyticsPhase::CatchingUp;
+                status.phase = ChainPhase::CatchingUp;
                 app.mark_dirty();
                 return hash;
             }
             Err(e) if position.is_some() && is_out_of_retention(&e) => position = None,
             Err(e) => {
-                set_phase(app, AnalyticsPhase::Error(format!("{e:#}"))).await;
+                set_phase(app, ChainPhase::Error(format!("{e:#}"))).await;
                 tokio::time::sleep(RETRY_DELAY).await;
-                set_phase(app, AnalyticsPhase::Seeking).await;
+                set_phase(app, ChainPhase::Seeking).await;
             }
         }
     }
@@ -233,10 +232,10 @@ async fn skip_to_window(
     Ok((current, current != start))
 }
 
-pub(crate) async fn set_phase(app: &RwLock<App>, phase: AnalyticsPhase) {
+pub(crate) async fn set_phase(app: &RwLock<App>, phase: ChainPhase) {
     let mut app = app.write().await;
-    if app.analytics.status.phase != phase {
-        app.analytics.status.phase = phase;
+    if app.chain.phase != phase {
+        app.chain.phase = phase;
         app.mark_dirty();
     }
 }
@@ -252,8 +251,8 @@ async fn wait_for_node(app: &RwLock<App>) {
             if ready && !app.paused {
                 return;
             }
-            if !ready && app.analytics.status.phase != AnalyticsPhase::WaitingForNode {
-                app.analytics.status.phase = AnalyticsPhase::WaitingForNode;
+            if !ready && app.chain.phase != ChainPhase::WaitingForNode {
+                app.chain.phase = ChainPhase::WaitingForNode;
                 app.mark_dirty();
             }
         }

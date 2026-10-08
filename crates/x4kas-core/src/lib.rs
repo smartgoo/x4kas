@@ -2,7 +2,6 @@
 //! the `x4kas` GUI and the `x4kas-cli` binary, and free of GUI and CLI-parsing code.
 
 pub mod analytics;
-pub mod analytics_streaming;
 pub mod app;
 pub mod chain_stream;
 pub mod config;

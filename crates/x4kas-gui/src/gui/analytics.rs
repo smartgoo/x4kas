@@ -10,7 +10,7 @@ use super::widgets::{
     or_dash, placeholder, section_title, subheader,
 };
 use x4kas_core::analytics::{AggregatedView, InspectionCounts, ScriptClassCounts};
-use x4kas_core::app::{AnalyticsPanel, AnalyticsPhase, App, TimeWindow};
+use x4kas_core::app::{AnalyticsPanel, App, ChainPhase, TimeWindow};
 use x4kas_core::format::{format_kas, format_number};
 use x4kas_core::tx_inspect::TransactionProtocol;
 
@@ -18,29 +18,26 @@ use x4kas_core::tx_inspect::TransactionProtocol;
 const TABLE_MAX_HEIGHT: f32 = 200.0;
 
 /// Shown instead of an empty list while analytics catches up, when its counts are partial.
-const SYNCING: &str = "Analytics sync in progress…";
+const SYNCING: &str = "DAG sync in progress…";
 
 /// A count from `view`, or a dash without one (while syncing), never a partial `0`.
 fn count(view: Option<&AggregatedView>, f: impl FnOnce(&AggregatedView) -> u64) -> String {
     or_dash(view.map(f), format_number)
 }
 
-/// Catch-up progress in `0.0..=1.0` while analytics is syncing to the tip.
+/// Catch-up progress in `0.0..=1.0` while the chain stream is syncing to the tip.
 fn sync_fraction(app: &App) -> Option<f32> {
-    let status = &app.analytics.status;
+    let status = &app.chain;
     let tip = app.node.server_info.as_ref()?.virtual_daa_score;
-    matches!(
-        status.phase,
-        AnalyticsPhase::Seeking | AnalyticsPhase::CatchingUp
-    )
-    .then(|| status.fraction(tip).unwrap_or(0.0))
+    matches!(status.phase, ChainPhase::Seeking | ChainPhase::CatchingUp)
+        .then(|| status.fraction(tip).unwrap_or(0.0))
 }
 
 /// One pulse of [`sync_dot`], in seconds.
 const PULSE_SECS: f64 = 1.6;
 
-/// A pulsing orange dot while analytics catches up to the tip, the same color as the
-/// status bar's analytics indicator. The progress shows on hover. Goes in a card header.
+/// A pulsing orange dot while the chain stream catches up to the tip, the same color as
+/// the status bar's chain indicator. The progress shows on hover. Goes in a card header.
 pub(super) fn sync_dot(ui: &mut Ui, app: &App) {
     let Some(fraction) = sync_fraction(app) else {
         return;
@@ -54,7 +51,7 @@ pub(super) fn sync_dot(ui: &mut Ui, app: &App) {
         size * 0.25,
         theme::WARN.gamma_multiply(0.3 + 0.7 * pulse),
     );
-    response.on_hover_text(format!("Analytics syncing ({:.1}%)", fraction * 100.0));
+    response.on_hover_text(format!("DAG syncing ({:.1}%)", fraction * 100.0));
     // Animate only while syncing; the frame loop otherwise repaints once a second.
     ui.ctx()
         .request_repaint_after(std::time::Duration::from_millis(50));

@@ -1,8 +1,10 @@
 //! Turns VSPC v2 responses into index writes: one atomic batch per response, with
 //! reorg undo and already-indexed chain blocks skipped, so re-applying a response after
-//! a crash or a restart from an older position changes nothing.
+//! a crash or a restart from an older position changes nothing. The same batch carries
+//! the analytics engine's changes (`super::analytics`), so the Dashboard's metrics and
+//! the index always agree on the position.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -14,7 +16,9 @@ use super::records::{
     AddrId, AddrStats, Hash32, IndexedTx, PeerStats, TxInput, TxOutput, addr_key, addr_tx_key,
     block_tx_key, decode, encode, encode_delta, peer_key,
 };
-use super::{IndexStore, Manifest, Position, Slab};
+use super::{IndexStore, Manifest, Position, Slab, analytics};
+use crate::analytics::AnalyticsEngine;
+use crate::format::now_ms;
 use crate::labels::LabelBook;
 use crate::tx_inspect::{detect_protocol, redeem_script_opcodes};
 use kaspa_addresses::Version;
@@ -40,6 +44,9 @@ pub struct BatchReport {
     /// Unions the cluster size cap refused.
     pub cluster_cap_hits: u64,
     pub newest: Option<Position>,
+    /// Removed chain blocks the analytics engine had already finalized into buckets,
+    /// which can't be unwound (its counts are then slightly off).
+    pub analytics_reorgs: Vec<String>,
 }
 
 pub struct IndexWriter {
@@ -48,6 +55,8 @@ pub struct IndexWriter {
     intern_cache: HashMap<String, AddrId>,
     /// Entity labels, for the clustering guard.
     labels: Arc<LabelBook>,
+    /// The Dashboard's metrics, persisted with every batch.
+    analytics: AnalyticsEngine,
 }
 
 /// A converted transaction with what clustering needs to know about it.
@@ -118,18 +127,26 @@ impl Overlay {
 }
 
 impl IndexWriter {
+    /// A writer on `store`, with the analytics engine the store holds.
     pub fn new(store: Arc<IndexStore>, labels: Arc<LabelBook>) -> Result<Self> {
         let manifest = store.manifest()?;
+        let analytics = analytics::load(&store)?;
         Ok(Self {
             store,
             manifest,
             intern_cache: HashMap::new(),
             labels,
+            analytics,
         })
     }
 
     pub fn manifest(&self) -> &Manifest {
         &self.manifest
+    }
+
+    /// The analytics engine as of the last applied batch.
+    pub fn analytics(&self) -> &AnalyticsEngine {
+        &self.analytics
     }
 
     pub fn store(&self) -> &Arc<IndexStore> {
@@ -143,13 +160,15 @@ impl IndexWriter {
     }
 
     /// Apply one VSPC v2 response atomically: undo its removed chain blocks, index its
-    /// added ones, advance the manifest.
+    /// added ones, fold them into the analytics engine, advance the manifest.
     pub fn apply(&mut self, response: &GetVirtualChainFromBlockV2Response) -> Result<BatchReport> {
         let result = self.apply_inner(response);
         if result.is_err() {
-            // Ids handed out for this batch were never committed: forget them.
+            // Ids handed out and metrics counted for this batch were never committed:
+            // forget them.
             self.intern_cache.clear();
             self.manifest = self.store.manifest()?;
+            self.analytics = analytics::load(&self.store)?;
         }
         result
     }
@@ -163,6 +182,8 @@ impl IndexWriter {
         let store = self.store.clone();
         let mut clusters = Clusters::new(store.clusters());
         let mut report = BatchReport::default();
+        // Chain blocks already indexed, which analytics must not count twice either.
+        let mut seen = HashSet::new();
 
         for hash in response.removed_chain_block_hashes.iter() {
             if self.undo_block(&mut batch, &mut overlay, hash)? {
@@ -188,6 +209,7 @@ impl IndexWriter {
             report.chain_blocks += 1;
             if slab.block_tx.prefix(block).next().is_some() {
                 report.skipped_blocks += 1;
+                seen.insert(hash.to_string());
                 continue;
             }
             for tx in &chain_block.accepted_transactions {
@@ -211,6 +233,9 @@ impl IndexWriter {
         overlay.flush(&mut batch)?;
         report.cluster_cap_hits = clusters.cap_hits;
         clusters.flush(&mut batch);
+        let ingest = self.analytics.ingest(response, &seen, now_ms());
+        analytics::write(&mut batch, &store, &self.analytics, &ingest)?;
+        report.analytics_reorgs = ingest.unresolved_reorgs;
         if let Some(newest) = report.newest {
             self.manifest.position = Some(newest);
         }
@@ -785,6 +810,39 @@ mod tests {
         let a1 = w.store().lookup(&address(1).to_string()).unwrap().unwrap();
         assert_eq!(query::stats(w.store(), a1).unwrap().tx_count, 1);
         assert_eq!(w.manifest().txs_indexed, 1);
+    }
+
+    #[test]
+    fn analytics_are_written_with_the_batch_and_reloaded() {
+        let tw = writer();
+        let store = tw._store.store.clone();
+        let mut w = tw.writer;
+        // Recent enough to stay inside the windows, old enough to be finalized.
+        let r = response(
+            vec![],
+            vec![chain_block(
+                1,
+                now_ms() - 120_000,
+                vec![tx(1, &[(1, 100)], &[(2, 90)]), tx(2, &[], &[(3, 500)])],
+            )],
+        );
+        w.apply(&r).unwrap();
+        // A replay counts nothing twice.
+        let report = w.apply(&r).unwrap();
+        assert_eq!(report.skipped_blocks, 1);
+        let ten = &w.analytics().ten_minute_buckets;
+        assert_eq!(ten.len(), 1);
+        assert_eq!(ten[0].metrics.chain_blocks, 1);
+        assert_eq!(ten[0].metrics.tx_count, 1);
+        assert_eq!(ten[0].metrics.mined_blocks, 1);
+
+        // A fresh writer on the same store starts from the stored engine.
+        drop(w);
+        let again = IndexWriter::new(store, Arc::new(LabelBook::base())).unwrap();
+        let ten = &again.analytics().ten_minute_buckets;
+        assert_eq!(ten.len(), 1);
+        assert_eq!(ten[0].metrics.tx_count, 1);
+        assert_eq!(again.analytics().minute_buckets.len(), 1);
     }
 
     #[test]

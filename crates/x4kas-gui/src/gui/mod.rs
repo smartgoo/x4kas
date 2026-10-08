@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use eframe::egui::{self, Button, Event, Key, Modifiers, RichText, Stroke, ViewportCommand};
+use eframe::egui::{self, Event, Key, Modifiers, RichText, Stroke, ViewportCommand};
 use tokio::sync::{RwLock, oneshot};
 
 use crate::Args;
@@ -32,10 +32,8 @@ use settings::SettingsPage;
 use terminal::TerminalPane;
 use toasts::Toasts;
 use widgets::kv;
-use x4kas_core::analytics_streaming;
-use x4kas_core::app::{
-    ActiveConnection, AnalyticsPhase, App, ConnectionStatus, IndexPhase, StartPoint, Tab,
-};
+use x4kas_core::app::{ActiveConnection, App, ChainPhase, ConnectionStatus, StartPoint, Tab};
+use x4kas_core::chain_stream;
 use x4kas_core::chain_stream::StreamStart;
 use x4kas_core::config::{ConnectionKind, ConnectionSettings};
 use x4kas_core::controller::{self, CommandSender, ControllerArgs, RemoteTarget, UiCommand};
@@ -88,7 +86,11 @@ pub fn run(rt: &tokio::runtime::Runtime, args: Args) -> Result<()> {
             // the top bar. No effect on other platforms.
             .with_fullsize_content_view(true)
             .with_titlebar_shown(false)
-            .with_title_shown(false),
+            .with_title_shown(false)
+            // macOS: a window with a background draws its frame's light highlight line
+            // along the top edge, over our top bar. Transparent windows don't; the
+            // content stays opaque (`GuiApp::clear_color`).
+            .with_transparent(true),
         ..Default::default()
     };
 
@@ -181,6 +183,11 @@ impl GuiApp {
 }
 
 impl eframe::App for GuiApp {
+    /// Opaque: the window is transparent only to lose macOS's frame highlight.
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        theme::BG.to_normalized_gamma_f32()
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_close(ctx);
 
@@ -217,7 +224,9 @@ impl eframe::App for GuiApp {
         // Added before the terminal so it stays at the very bottom, below it.
         egui::TopBottomPanel::bottom("status_bar")
             .frame(bar_frame())
-            .show(ctx, |ui| status_bar(ui, &mut app, &mut self.connection));
+            .show(ctx, |ui| {
+                status_bar(ui, &mut app, &mut self.connection, &self.cmd_tx)
+            });
         self.terminal.show(ctx);
         if self.terminal.has_focus() {
             // Esc belongs to the shell (vim etc.), not the popups drawn below.
@@ -385,15 +394,18 @@ fn top_bar(
         brand(ui);
         ui.add_space(12.0);
 
-        ui.spacing_mut().item_spacing.x = 2.0;
+        ui.spacing_mut().item_spacing.x = 4.0;
         for (i, tab) in Tab::all().iter().enumerate() {
+            if i > 0 {
+                ui.label(RichText::new("|").color(theme::BORDER_HI));
+            }
             let selected = app.active_tab == *tab && !settings.open;
             // Alerts raised while the Monitoring tab wasn't on show.
             let badge = match tab {
                 Tab::Monitoring if !selected => app.watch.unread_alerts,
                 _ => 0,
             };
-            if tab_button(ui, i + 1, tab.label(), selected, badge)
+            if tab_button(ui, tab.label(), selected, badge)
                 .on_hover_text(format!("Shortcut: {}", i + 1))
                 .clicked()
             {
@@ -433,35 +445,49 @@ fn brand(ui: &mut egui::Ui) {
     ui.label(RichText::new("kas").color(theme::TEXT_BRIGHT).size(15.0));
 }
 
-/// A tab in the strip: the shortcut number, then the name, then a count (unread alerts)
-/// when `badge` is non-zero. The active tab is inverted.
-fn tab_button(
-    ui: &mut egui::Ui,
-    number: usize,
-    label: &str,
-    selected: bool,
-    badge: usize,
-) -> egui::Response {
-    let (num_color, text_color, fill) = if selected {
-        (theme::BG_DEEP, theme::BG_DEEP, theme::ACCENT)
-    } else {
-        (theme::ACCENT, theme::TEXT, egui::Color32::TRANSPARENT)
-    };
-    let badge = if badge > 0 {
-        RichText::new(format!(" {badge}")).color(theme::WARN)
-    } else {
-        RichText::new("")
-    };
-    ui.add(
-        Button::new((
-            RichText::new(number.to_string()).color(num_color),
-            RichText::new(label).color(text_color),
-            badge,
-        ))
-        .fill(fill)
-        .stroke(Stroke::NONE)
-        .frame_when_inactive(selected),
-    )
+/// A tab in the strip: the name, then a count (unread alerts) when `badge` is non-zero.
+/// The active tab is inverted; a hovered one is raised on a lighter surface.
+fn tab_button(ui: &mut egui::Ui, label: &str, selected: bool, badge: usize) -> egui::Response {
+    let padding = egui::vec2(6.0, 2.0);
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let text = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), font.clone(), theme::TEXT);
+    let badge = (badge > 0).then(|| {
+        ui.painter()
+            .layout_no_wrap(format!(" {badge}"), font, theme::WARN)
+    });
+    let text_width = text.size().x;
+    let badge_width = badge.as_ref().map_or(0.0, |b| b.size().x);
+    let size = egui::vec2(text_width + badge_width, text.size().y) + 2.0 * padding;
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::SelectableLabel,
+            ui.is_enabled(),
+            selected,
+            label,
+        )
+    });
+    if ui.is_rect_visible(rect) {
+        let (fill, color) = if selected {
+            (theme::ACCENT, theme::BG_DEEP)
+        } else if response.hovered() {
+            (theme::SURFACE_HI, theme::TEXT_BRIGHT)
+        } else {
+            (egui::Color32::TRANSPARENT, theme::TEXT)
+        };
+        let painter = ui.painter();
+        if fill != egui::Color32::TRANSPARENT {
+            painter.rect_filled(rect, 2.0, fill);
+        }
+        let pos = rect.min + padding;
+        painter.galley_with_override_text_color(pos, text, color);
+        if let Some(badge) = badge {
+            painter.galley(pos + egui::vec2(text_width, 0.0), badge, theme::WARN);
+        }
+    }
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 /// One decimal under 10s (a healthy node is usually under a second behind), whole seconds above.
@@ -523,63 +549,71 @@ fn node_chip(ui: &mut egui::Ui, app: &App) {
     });
 }
 
-/// Analytics task indicator; details (start point, progress, speed) on hover.
-fn analytics_chip(ui: &mut egui::Ui, app: &App) {
+/// The chain pipeline indicator ("DAG …"): the stream's phase and catch-up progress,
+/// with the stream's and the index writer's details (position, coverage, speed, disk)
+/// and a Resync button on hover.
+fn chain_chip(ui: &mut egui::Ui, app: &App, cmd_tx: &CommandSender) {
     match app.connection {
         ActiveConnection::None => return,
         ActiveConnection::Resolver => {
             widgets::divider(ui);
-            widgets::status_chip(
-                ui,
-                "analytics_status",
-                "○ Analytics n/a",
-                theme::TEXT_DIM,
-                |ui| kv(ui, "Status", "Needs a direct node (URL), not the resolver"),
-            );
+            widgets::status_chip(ui, "chain_status", "○ DAG n/a", theme::TEXT_DIM, |ui| {
+                kv(ui, "Status", "Needs a direct node (URL), not the resolver")
+            });
             return;
         }
         ActiveConnection::Url(_) => {}
     }
 
-    let status = &app.analytics.status;
+    let status = &app.chain;
     let tip = app.node.server_info.as_ref().map(|s| s.virtual_daa_score);
     let fraction = tip.and_then(|tip| status.fraction(tip));
     let (text, color, summary) = match status.phase {
-        AnalyticsPhase::Idle => return,
-        _ if app.paused => ("⏸ Analytics paused".into(), theme::TEXT_DIM, "Paused"),
-        AnalyticsPhase::LoadingCache => (
-            "◌ Analytics loading".into(),
+        ChainPhase::Idle => return,
+        _ if app.paused => ("⏸ DAG paused".into(), theme::TEXT_DIM, "Paused"),
+        ChainPhase::Opening => (
+            "◌ DAG opening".into(),
             theme::TEXT_DIM,
-            "Loading the saved cache",
+            "Opening the index store",
         ),
-        AnalyticsPhase::WaitingForNode => (
-            "◌ Analytics waiting".into(),
+        ChainPhase::WaitingForNode => (
+            "◌ DAG waiting".into(),
             theme::TEXT_DIM,
             "Waiting for the node to connect and sync",
         ),
-        AnalyticsPhase::Seeking => (
-            "◐ Analytics seeking".into(),
+        ChainPhase::Seeking => (
+            "◐ DAG seeking".into(),
             theme::WARN,
             "Skipping to the last 24 hours",
         ),
-        AnalyticsPhase::CatchingUp => (
+        ChainPhase::CatchingUp => (
             match fraction {
-                Some(f) => format!("◐ Analytics {:.0}%", f * 100.0),
-                None => "◐ Analytics".into(),
+                Some(f) => format!("◐ DAG {:.0}%", f * 100.0),
+                None => "◐ DAG".into(),
             },
             theme::WARN,
             "Catching up to the DAG tip",
         ),
-        AnalyticsPhase::Live => ("● Analytics synced".into(), theme::OK, "Up to date"),
-        AnalyticsPhase::Error(_) => (
-            "× Analytics error".into(),
+        ChainPhase::Live if status.backlog > 0 => (
+            "● DAG writing".into(),
+            theme::OK,
+            "Up to date; writing the latest batches",
+        ),
+        ChainPhase::Live => ("● DAG synced".into(), theme::OK, "Up to date"),
+        ChainPhase::Error(_) => (
+            "× DAG error".into(),
             theme::ERROR,
             "Request failed, retrying",
         ),
     };
+    let (text, color) = match status.write_error {
+        Some(_) => ("× DAG write error".to_string(), theme::ERROR),
+        None => (text, color),
+    };
 
     widgets::divider(ui);
-    widgets::status_chip(ui, "analytics_status", &text, color, |ui| {
+    let can_resync = !matches!(status.phase, ChainPhase::Opening);
+    let details = |ui: &mut egui::Ui| {
         // Distance to the tip once known, otherwise what the task is doing.
         match tip.and_then(|tip| status.behind(tip)) {
             Some((daa, time)) => kv(
@@ -596,7 +630,7 @@ fn analytics_chip(ui: &mut egui::Ui, app: &App) {
         let frequency = if app.paused {
             Some("Paused".to_string())
         } else {
-            analytics_streaming::poll_interval(&status.phase).map(|d| {
+            chain_stream::poll_interval(&status.phase).map(|d| {
                 if d < Duration::from_secs(1) {
                     format!("Every {} ms", d.as_millis())
                 } else {
@@ -607,24 +641,27 @@ fn analytics_chip(ui: &mut egui::Ui, app: &App) {
         if let Some(frequency) = frequency {
             kv(ui, "Poll frequency", frequency);
         }
-        if let AnalyticsPhase::Error(ref err) = status.phase {
+        if let ChainPhase::Error(ref err) = status.phase {
             kv(ui, "Error", RichText::new(err).color(theme::ERROR));
         }
+        if let Some(ref err) = status.write_error {
+            kv(ui, "Write error", RichText::new(err).color(theme::ERROR));
+        }
         match status.started_from {
-            Some(StartPoint::Cache(Some(saved))) => {
+            Some(StartPoint::Index(Some(saved))) => {
                 let age = saved.elapsed().unwrap_or_default();
                 kv(
                     ui,
                     "Started from",
-                    format!("cache (saved {} ago)", format_duration(age)),
+                    format!("index position (written {} ago)", format_duration(age)),
                 );
             }
-            Some(StartPoint::Cache(None)) => kv(ui, "Started from", "cache"),
+            Some(StartPoint::Index(None)) => kv(ui, "Started from", "index position"),
             Some(StartPoint::PruningPoint) => kv(ui, "Started from", "pruning point"),
             Some(StartPoint::LastDay) => kv(ui, "Started from", "24 hours ago"),
             None => {}
         }
-        if status.phase == AnalyticsPhase::CatchingUp {
+        if status.phase == ChainPhase::CatchingUp {
             if let Some(rate) = status.daa_per_sec {
                 kv(ui, "Speed", format!("{} DAA/s", format_number(rate as u64)));
             }
@@ -633,41 +670,9 @@ fn analytics_chip(ui: &mut egui::Ui, app: &App) {
             }
         }
         kv(ui, "Chain blocks", format_number(status.blocks_processed));
-    });
-}
 
-/// Address index indicator; details (position, coverage, speed, disk) on hover.
-fn index_chip(ui: &mut egui::Ui, app: &App) {
-    if !app.connection.is_direct() {
-        return;
-    }
-    let status = &app.index.status;
-    let (text, color, summary) = match status.phase {
-        IndexPhase::Idle => return,
-        IndexPhase::Opening => (
-            "◌ Index opening".to_string(),
-            theme::TEXT_DIM,
-            "Opening the store",
-        ),
-        IndexPhase::Indexing if status.backlog > 0 => (
-            "◐ Index writing".to_string(),
-            theme::WARN,
-            "Writing batches from the chain stream",
-        ),
-        IndexPhase::Indexing => (
-            "● Index".to_string(),
-            theme::OK,
-            "Up to date with the stream",
-        ),
-        IndexPhase::Error(_) => (
-            "× Index error".to_string(),
-            theme::ERROR,
-            "The last batch failed",
-        ),
-    };
-    widgets::divider(ui);
-    widgets::status_chip(ui, "index_status", &text, color, |ui| {
-        kv(ui, "Status", summary);
+        widgets::subheader(ui, "Index");
+        ui.end_row();
         kv(ui, "Transactions", format_number(status.txs_indexed));
         kv(ui, "Addresses", format_number(status.addresses));
         if let Some(pos) = status.position {
@@ -725,8 +730,18 @@ fn index_chip(ui: &mut egui::Ui, app: &App) {
                 format_number(status.cluster_cap_hits),
             );
         }
-        if let IndexPhase::Error(ref err) = status.phase {
-            kv(ui, "Error", RichText::new(err).color(theme::ERROR));
+    };
+    widgets::status_chip_with(ui, "chain_status", &text, color, details, |ui| {
+        ui.add_space(6.0);
+        if ui
+            .add_enabled(can_resync, widgets::primary_button("Resync"))
+            .on_hover_text(
+                "Delete the index and the analytics and rebuild them from the node, \
+                 from scratch",
+            )
+            .clicked()
+        {
+            let _ = cmd_tx.send(UiCommand::Resync);
         }
     });
 }
@@ -761,7 +776,12 @@ fn connection_summary(app: &App) -> String {
 }
 
 /// Connection (click to change), network, DAA score, poll latency and pause.
-fn status_bar(ui: &mut egui::Ui, app: &mut App, connection: &mut ConnectionWindow) {
+fn status_bar(
+    ui: &mut egui::Ui,
+    app: &mut App,
+    connection: &mut ConnectionWindow,
+    cmd_tx: &CommandSender,
+) {
     ui.horizontal(|ui| {
         let (_, color) = theme::connection_status(&app.node.connection_status);
         if ui
@@ -775,8 +795,7 @@ fn status_bar(ui: &mut egui::Ui, app: &mut App, connection: &mut ConnectionWindo
             connection.toggle();
         }
         node_chip(ui, app);
-        analytics_chip(ui, app);
-        index_chip(ui, app);
+        chain_chip(ui, app, cmd_tx);
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let pause_label = if app.paused {

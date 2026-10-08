@@ -1,6 +1,6 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::hash::Hash;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
 use kaspa_rpc_core::{GetVirtualChainFromBlockV2Response, RpcOptionalTransaction};
@@ -350,34 +350,111 @@ const MAX_MINUTE_BUCKETS: usize = 60;
 const MAX_TEN_MINUTE_BUCKETS: usize = 144;
 const MAX_ADDRESSES_PER_BUCKET: usize = 100;
 const TOP_ADDRESSES: usize = 20;
-/// Written before the engine in the cache file; bump when the format or the meaning of
-/// its data changes (e.g. full instead of shortened addresses) so
-/// an old cache is discarded instead of misread.
-const CACHE_MAGIC: u64 = 0x7475_6934_6b61_7304;
 
+/// The two bucket resolutions: one-minute buckets back the 1h window, ten-minute
+/// buckets the 24h window (and the transaction histogram).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum BucketWidth {
+    Minute,
+    TenMinute,
+}
+
+impl BucketWidth {
+    pub const ALL: [BucketWidth; 2] = [BucketWidth::Minute, BucketWidth::TenMinute];
+
+    pub fn ms(self) -> u64 {
+        match self {
+            BucketWidth::Minute => ONE_MINUTE_MS,
+            BucketWidth::TenMinute => TEN_MINUTES_MS,
+        }
+    }
+
+    fn window(self) -> TimeWindow {
+        match self {
+            BucketWidth::Minute => TimeWindow::OneHour,
+            BucketWidth::TenMinute => TimeWindow::TwentyFourHour,
+        }
+    }
+
+    fn max_buckets(self) -> usize {
+        match self {
+            BucketWidth::Minute => MAX_MINUTE_BUCKETS,
+            BucketWidth::TenMinute => MAX_TEN_MINUTE_BUCKETS,
+        }
+    }
+}
+
+/// A bucket's identity: its width and start time.
+pub type BucketKey = (BucketWidth, u64);
+
+/// What [`AnalyticsEngine::ingest`] changed, so a store can persist exactly that: the
+/// recent blocks always change, buckets only when blocks are finalized or pruned.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Ingest {
+    /// Whether the recent blocks changed (blocks added, removed or finalized).
+    pub recent_changed: bool,
+    /// Buckets that gained blocks (new or updated).
+    pub touched: BTreeSet<BucketKey>,
+    /// Buckets pruned out of their window.
+    pub removed: BTreeSet<BucketKey>,
+    /// Removed chain blocks that were already finalized into buckets, which can't be
+    /// unwound; the user should be told (`AnalyticsState::reorg_notification`).
+    pub unresolved_reorgs: Vec<String>,
+}
+
+/// Rolling chain metrics: the last minute of blocks, then 1-minute and 10-minute
+/// buckets for the 1h and 24h windows. Kept by the index writer, which persists it in
+/// the index store (`index::analytics`) with every batch.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AnalyticsEngine {
     pub recent_blocks: IndexMap<String, BlockSummary>,
     pub minute_buckets: VecDeque<TimeBucket>,
     pub ten_minute_buckets: VecDeque<TimeBucket>,
-    pub last_known_chain_block: Option<String>,
 }
 
 impl AnalyticsEngine {
     pub fn add_block(&mut self, summary: BlockSummary) {
-        self.last_known_chain_block = Some(summary.hash.clone());
         self.recent_blocks.insert(summary.hash.clone(), summary);
     }
 
     /// Remove a block from the recent cache (reorg handling). Returns `false` if the
-    /// block was already finalized into time buckets, which can't be unwound; the caller
-    /// should then tell the user (`AnalyticsState::reorg_notification`).
+    /// block was already finalized into time buckets, which can't be unwound.
     pub fn remove_block(&mut self, hash: &str) -> bool {
         self.recent_blocks.swap_remove(hash).is_some()
     }
 
-    /// Move blocks older than 1 minute from recent cache into time buckets.
-    pub fn finalize_old_blocks(&mut self, now_ms: u64) {
+    /// Fold one VSPC v2 response in: undo its removed chain blocks, add the rest
+    /// (except `skip`, chain blocks already seen), then finalize and prune by `now_ms`.
+    pub fn ingest(
+        &mut self,
+        response: &GetVirtualChainFromBlockV2Response,
+        skip: &HashSet<String>,
+        now_ms: u64,
+    ) -> Ingest {
+        let (summaries, removed) = summarize_chain_blocks(response);
+        let mut ingest = Ingest::default();
+        for hash in removed {
+            if self.remove_block(&hash) {
+                ingest.recent_changed = true;
+            } else {
+                ingest.unresolved_reorgs.push(hash);
+            }
+        }
+        for summary in summaries {
+            if !skip.contains(&summary.hash) {
+                self.add_block(summary);
+                ingest.recent_changed = true;
+            }
+        }
+        ingest.touched = self.finalize_old_blocks(now_ms);
+        ingest.recent_changed |= !ingest.touched.is_empty();
+        ingest.removed = self.prune_buckets(now_ms);
+        ingest
+    }
+
+    /// Move blocks older than 1 minute from the recent cache into time buckets.
+    /// Returns the buckets that changed.
+    pub fn finalize_old_blocks(&mut self, now_ms: u64) -> BTreeSet<BucketKey> {
         let cutoff = now_ms.saturating_sub(ONE_MINUTE_MS);
 
         let to_finalize: Vec<String> = self
@@ -387,31 +464,60 @@ impl AnalyticsEngine {
             .map(|(hash, _)| hash.clone())
             .collect();
 
+        let mut touched = BTreeSet::new();
         for hash in to_finalize {
             if let Some(block) = self.recent_blocks.swap_remove(&hash) {
-                add_to_bucket(&mut self.minute_buckets, ONE_MINUTE_MS, &block);
-                add_to_bucket(&mut self.ten_minute_buckets, TEN_MINUTES_MS, &block);
+                for width in BucketWidth::ALL {
+                    let start = add_to_bucket(self.buckets_mut(width), width.ms(), &block);
+                    touched.insert((width, start));
+                }
             }
+        }
+        touched
+    }
+
+    /// Prune buckets older than their window (and beyond the count caps). Returns the
+    /// buckets dropped.
+    pub fn prune_buckets(&mut self, now_ms: u64) -> BTreeSet<BucketKey> {
+        let mut removed = BTreeSet::new();
+        for width in BucketWidth::ALL {
+            let cutoff = now_ms.saturating_sub(width.window().duration_ms());
+            let buckets = self.buckets_mut(width);
+            let keep_from = buckets.partition_point(|b| b.bucket_start_ms < cutoff);
+            let over_cap = buckets.len().saturating_sub(width.max_buckets());
+            for bucket in buckets.drain(..keep_from.max(over_cap)) {
+                removed.insert((width, bucket.bucket_start_ms));
+            }
+        }
+        removed
+    }
+
+    pub fn buckets(&self, width: BucketWidth) -> &VecDeque<TimeBucket> {
+        match width {
+            BucketWidth::Minute => &self.minute_buckets,
+            BucketWidth::TenMinute => &self.ten_minute_buckets,
         }
     }
 
-    /// Prune old buckets and cap address maps.
-    pub fn prune_buckets(&mut self, now_ms: u64) {
-        let hour_cutoff = now_ms.saturating_sub(TimeWindow::OneHour.duration_ms());
-        self.minute_buckets
-            .retain(|b| b.bucket_start_ms >= hour_cutoff);
-
-        let day_cutoff = now_ms.saturating_sub(TimeWindow::TwentyFourHour.duration_ms());
-        self.ten_minute_buckets
-            .retain(|b| b.bucket_start_ms >= day_cutoff);
-
-        // Enforce max bucket counts
-        while self.minute_buckets.len() > MAX_MINUTE_BUCKETS {
-            self.minute_buckets.pop_front();
+    fn buckets_mut(&mut self, width: BucketWidth) -> &mut VecDeque<TimeBucket> {
+        match width {
+            BucketWidth::Minute => &mut self.minute_buckets,
+            BucketWidth::TenMinute => &mut self.ten_minute_buckets,
         }
-        while self.ten_minute_buckets.len() > MAX_TEN_MINUTE_BUCKETS {
-            self.ten_minute_buckets.pop_front();
-        }
+    }
+
+    /// The bucket of `width` starting at `start_ms`, if any.
+    pub fn bucket(&self, width: BucketWidth, start_ms: u64) -> Option<&TimeBucket> {
+        let buckets = self.buckets(width);
+        let at = buckets.partition_point(|b| b.bucket_start_ms < start_ms);
+        buckets.get(at).filter(|b| b.bucket_start_ms == start_ms)
+    }
+
+    /// Put a stored bucket back, keeping the deque sorted (for `index::analytics::load`).
+    pub fn insert_bucket(&mut self, width: BucketWidth, bucket: TimeBucket) {
+        let buckets = self.buckets_mut(width);
+        let at = buckets.partition_point(|b| b.bucket_start_ms < bucket.bucket_start_ms);
+        buckets.insert(at, bucket);
     }
 
     /// Transactions per 10-minute interval over the last 24h, for the Dashboard's bar
@@ -476,24 +582,56 @@ impl AnalyticsEngine {
             );
         build_aggregated_view(window, now_ms, items)
     }
+}
 
-    // --- Persistence ---
+// --- Legacy cache ---
 
-    pub fn save(&self, path: &Path) -> anyhow::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let data = bincode::serialize(&(CACHE_MAGIC, self))?;
-        std::fs::write(path, data)?;
-        Ok(())
-    }
+/// Where earlier versions saved the engine between runs; now imported into the index
+/// store on first launch (`index::analytics::import_legacy_cache`) and removed.
+pub fn legacy_cache_path() -> PathBuf {
+    crate::config::data_dir().join("analytics_cache.bin")
+}
 
-    pub fn load(path: &Path) -> anyhow::Result<Self> {
-        let data = std::fs::read(path)?;
-        let (magic, engine): (u64, Self) = bincode::deserialize(&data)?;
-        anyhow::ensure!(magic == CACHE_MAGIC, "outdated analytics cache");
-        Ok(engine)
-    }
+/// The magic written before the engine in the legacy cache file.
+const LEGACY_CACHE_MAGIC: u64 = 0x7475_6934_6b61_7304;
+
+/// The legacy cache file's layout.
+#[derive(Serialize, Deserialize)]
+struct LegacyCache {
+    recent_blocks: IndexMap<String, BlockSummary>,
+    minute_buckets: VecDeque<TimeBucket>,
+    ten_minute_buckets: VecDeque<TimeBucket>,
+    last_known_chain_block: Option<String>,
+}
+
+/// Read a legacy cache file: the engine and the hex hash of its last chain block.
+pub fn load_legacy_cache(path: &Path) -> anyhow::Result<(AnalyticsEngine, Option<String>)> {
+    let data = std::fs::read(path)?;
+    let (magic, cache): (u64, LegacyCache) = bincode::deserialize(&data)?;
+    anyhow::ensure!(magic == LEGACY_CACHE_MAGIC, "outdated analytics cache");
+    let engine = AnalyticsEngine {
+        recent_blocks: cache.recent_blocks,
+        minute_buckets: cache.minute_buckets,
+        ten_minute_buckets: cache.ten_minute_buckets,
+    };
+    Ok((engine, cache.last_known_chain_block))
+}
+
+/// Write a cache file in the legacy layout (for tests of the import).
+#[cfg(test)]
+pub(crate) fn save_legacy_cache(
+    path: &Path,
+    engine: &AnalyticsEngine,
+    last_chain_block: Option<String>,
+) -> anyhow::Result<()> {
+    let cache = LegacyCache {
+        recent_blocks: engine.recent_blocks.clone(),
+        minute_buckets: engine.minute_buckets.clone(),
+        ten_minute_buckets: engine.ten_minute_buckets.clone(),
+        last_known_chain_block: last_chain_block,
+    };
+    std::fs::write(path, bincode::serialize(&(LEGACY_CACHE_MAGIC, cache))?)?;
+    Ok(())
 }
 
 /// Transaction counts per fixed interval, oldest first, from
@@ -508,9 +646,9 @@ pub struct TxHistogram {
     pub counts: Vec<Option<u64>>,
 }
 
-/// Merge a block into the bucket covering its timestamp. Chain blocks arrive
-/// nearly in time order, so only the last few buckets are searched.
-fn add_to_bucket(buckets: &mut VecDeque<TimeBucket>, width_ms: u64, block: &BlockSummary) {
+/// Merge a block into the bucket covering its timestamp and return that bucket's start.
+/// Chain blocks arrive nearly in time order, so only the last few buckets are searched.
+fn add_to_bucket(buckets: &mut VecDeque<TimeBucket>, width_ms: u64, block: &BlockSummary) -> u64 {
     let start = block.timestamp_ms / width_ms * width_ms;
     if let Some(bucket) = buckets
         .iter_mut()
@@ -519,13 +657,14 @@ fn add_to_bucket(buckets: &mut VecDeque<TimeBucket>, width_ms: u64, block: &Bloc
         .find(|b| b.bucket_start_ms == start)
     {
         bucket.merge_block(block);
-        return;
+        return start;
     }
     let mut bucket = TimeBucket::new(start);
     bucket.merge_block(block);
     // Keep buckets sorted so pruning from the front stays correct.
     let at = buckets.partition_point(|b| b.bucket_start_ms < start);
     buckets.insert(at, bucket);
+    start
 }
 
 fn build_aggregated_view<'a>(
@@ -833,35 +972,111 @@ mod tests {
     }
 
     #[test]
-    fn last_known_chain_block_tracks_last_added() {
+    fn finalize_reports_touched_buckets_and_prune_the_removed() {
         let mut engine = AnalyticsEngine::default();
-        engine.add_block(make_block("first", 1000, 1, 10));
-        assert_eq!(engine.last_known_chain_block, Some("first".to_string()));
-        engine.add_block(make_block("second", 2000, 1, 10));
-        assert_eq!(engine.last_known_chain_block, Some("second".to_string()));
+        let now = 10 * ONE_HOUR_MS;
+        // Two blocks in the same minute, one in another ten-minute bucket, one recent.
+        engine.add_block(make_block("a", now - 2 * ONE_MINUTE_MS, 1, 10));
+        engine.add_block(make_block("b", now - 2 * ONE_MINUTE_MS + 5, 1, 10));
+        engine.add_block(make_block("c", now - 30 * ONE_MINUTE_MS, 1, 10));
+        engine.add_block(make_block("d", now, 1, 10));
+        let touched = engine.finalize_old_blocks(now);
+        let minute = |t: u64| (BucketWidth::Minute, t / ONE_MINUTE_MS * ONE_MINUTE_MS);
+        let ten = |t: u64| (BucketWidth::TenMinute, t / TEN_MINUTES_MS * TEN_MINUTES_MS);
+        assert_eq!(
+            touched,
+            BTreeSet::from([
+                minute(now - 2 * ONE_MINUTE_MS),
+                minute(now - 30 * ONE_MINUTE_MS),
+                ten(now - 2 * ONE_MINUTE_MS),
+                ten(now - 30 * ONE_MINUTE_MS),
+            ])
+        );
+        assert_eq!(engine.recent_blocks.len(), 1);
+        assert_eq!(
+            engine
+                .bucket(BucketWidth::Minute, now - 2 * ONE_MINUTE_MS)
+                .map(|b| b.metrics.tx_count),
+            Some(2)
+        );
+        assert!(engine.bucket(BucketWidth::Minute, now).is_none());
+
+        // An hour later the minute buckets are out of their window, the ten-minute
+        // buckets are not.
+        let removed = engine.prune_buckets(now + ONE_HOUR_MS);
+        assert_eq!(
+            removed,
+            BTreeSet::from([
+                minute(now - 2 * ONE_MINUTE_MS),
+                minute(now - 30 * ONE_MINUTE_MS)
+            ])
+        );
+        assert!(engine.minute_buckets.is_empty());
+        assert_eq!(engine.ten_minute_buckets.len(), 2);
     }
 
     #[test]
-    fn persistence_round_trip() {
+    fn prune_enforces_the_bucket_cap() {
+        let mut engine = AnalyticsEngine::default();
+        let now = 100 * ONE_HOUR_MS;
+        // Future-dated buckets never age out; the cap drops the oldest.
+        for i in 0..(MAX_MINUTE_BUCKETS as u64 + 5) {
+            engine.insert_bucket(
+                BucketWidth::Minute,
+                TimeBucket::new(now + i * ONE_MINUTE_MS),
+            );
+        }
+        let removed = engine.prune_buckets(now);
+        assert_eq!(removed.len(), 5);
+        assert_eq!(removed.iter().next(), Some(&(BucketWidth::Minute, now)));
+        assert_eq!(engine.minute_buckets.len(), MAX_MINUTE_BUCKETS);
+        assert_eq!(
+            engine.minute_buckets[0].bucket_start_ms,
+            now + 5 * ONE_MINUTE_MS
+        );
+    }
+
+    #[test]
+    fn insert_bucket_keeps_order() {
+        let mut engine = AnalyticsEngine::default();
+        engine.insert_bucket(BucketWidth::TenMinute, TimeBucket::new(3 * TEN_MINUTES_MS));
+        engine.insert_bucket(BucketWidth::TenMinute, TimeBucket::new(TEN_MINUTES_MS));
+        engine.insert_bucket(BucketWidth::TenMinute, TimeBucket::new(2 * TEN_MINUTES_MS));
+        let starts: Vec<u64> = engine
+            .ten_minute_buckets
+            .iter()
+            .map(|b| b.bucket_start_ms)
+            .collect();
+        assert_eq!(
+            starts,
+            vec![TEN_MINUTES_MS, 2 * TEN_MINUTES_MS, 3 * TEN_MINUTES_MS]
+        );
+        assert!(
+            engine
+                .bucket(BucketWidth::TenMinute, 2 * TEN_MINUTES_MS)
+                .is_some()
+        );
+        assert!(engine.bucket(BucketWidth::TenMinute, 0).is_none());
+    }
+
+    #[test]
+    fn legacy_cache_round_trip() {
         let mut engine = AnalyticsEngine::default();
         engine.add_block(make_block("b1", 1000, 5, 100));
         engine.add_block(make_block_with("b2", 2000, |m| {
             m.protocols.insert(TransactionProtocol::Krc, 1);
         }));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("analytics_cache.bin");
+        save_legacy_cache(&path, &engine, Some("b2".to_string())).unwrap();
 
-        let dir = std::env::temp_dir().join("x4kas_test_analytics");
-        let path = dir.join("test_cache.bin");
-        engine.save(&path).unwrap();
-
-        let loaded = AnalyticsEngine::load(&path).unwrap();
+        let (loaded, last) = load_legacy_cache(&path).unwrap();
         assert_eq!(loaded.recent_blocks.len(), 2);
-        assert_eq!(loaded.last_known_chain_block, Some("b2".to_string()));
+        assert_eq!(last, Some("b2".to_string()));
 
         // A cache written in another format is rejected
         std::fs::write(&path, bincode::serialize(&(1u64, 2u64)).unwrap()).unwrap();
-        assert!(AnalyticsEngine::load(&path).is_err());
-
-        let _ = std::fs::remove_dir_all(dir);
+        assert!(load_legacy_cache(&path).is_err());
     }
 
     #[test]

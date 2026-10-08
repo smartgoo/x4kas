@@ -10,8 +10,8 @@ use std::time::Duration;
 use anyhow::{Result, anyhow};
 use tokio::sync::{RwLock, mpsc, oneshot};
 
-use crate::analytics_streaming;
-use crate::app::{ActiveConnection, AddressView, App, ConnectionStatus, IndexPhase};
+use crate::analytics;
+use crate::app::{ActiveConnection, AddressView, App, ChainPhase, ConnectionStatus};
 use crate::chain_stream::{self, StreamStart};
 use crate::index::export::{self, ExportFormat};
 use crate::index::query::{self, Cursor, FlowGraph};
@@ -64,6 +64,9 @@ pub enum UiCommand {
     LookupLabelOnline(String),
     /// Save the online label settings.
     SetLabelSettings(labels::LabelSettings),
+    /// Discard the index store (and with it the Dashboard's analytics) and rebuild it
+    /// from the node, from scratch. Only with a direct node.
+    Resync,
     /// Tear everything down; the sender is notified once state has been saved.
     Shutdown(oneshot::Sender<()>),
 }
@@ -161,6 +164,7 @@ impl Controller {
                 UiCommand::RefreshLabels => self.refresh_labels(),
                 UiCommand::LookupLabelOnline(address) => self.lookup_label_online(address),
                 UiCommand::SetLabelSettings(settings) => self.set_label_settings(settings).await,
+                UiCommand::Resync => self.resync().await,
                 UiCommand::Shutdown(done) => {
                     self.stop_all().await;
                     let _ = done.send(());
@@ -223,70 +227,93 @@ impl Controller {
         }
     }
 
-    /// Start the analytics sink, the address index writer and the chain stream that
-    /// feeds both. The index is optional: if its store can't be opened (another x4kas
-    /// process holds it), analytics still runs and the status says why.
+    /// Open the index store (importing the analytics cache of earlier versions on first
+    /// launch), start the writer thread, which also carries the analytics engine, and the
+    /// chain stream that feeds it from the index position. If the store can't be opened
+    /// (another x4kas process holds it), nothing runs and the status says why.
     async fn start_chain_stream(&mut self, rpc: &Arc<RpcManager>, network: &str) {
-        let analytics =
-            analytics_streaming::start_analytics_sink(&self.app, &mut self.polling).await;
-        let mut sinks = vec![analytics.sender];
-        let mut position = analytics.position;
-
         {
             let mut app = self.app.write().await;
-            app.index.status.phase = IndexPhase::Opening;
+            app.chain.phase = ChainPhase::Opening;
             app.mark_dirty();
         }
         let network_owned = network.to_string();
-        let opened = tokio::task::spawn_blocking(move || IndexStore::open(&network_owned))
-            .await
-            .map_err(|e| anyhow!("index open task: {e}"))
-            .and_then(|r| r);
-        match opened {
-            Ok(store) => {
-                let store = Arc::new(store);
-                let labels = self.app.read().await.labels.clone();
-                match index::task::start_writer(
-                    store.clone(),
-                    labels,
-                    self.app.clone(),
-                    &mut self.polling,
-                ) {
-                    Ok(sink) => {
-                        // The index saves its position with every batch, the analytics
-                        // cache only at shutdown, so the index position is never older
-                        // when both exist: stream from it. The analytics engine prunes
-                        // anything outside its windows, so an overlap is harmless.
-                        if let Some(pos) = sink.position {
-                            let hash = kaspa_rpc_core::RpcHash::from_bytes(pos.chain_block);
-                            let saved_at = std::time::UNIX_EPOCH
-                                .checked_add(Duration::from_millis(pos.time_ms));
-                            position = Some((hash, saved_at));
-                        }
-                        sinks.push(sink.sender);
-                        self.index = Some(store);
-                    }
-                    Err(e) => self.index_failed(e).await,
-                }
-            }
-            Err(e) => self.index_failed(e).await,
-        }
+        let opened = tokio::task::spawn_blocking(move || {
+            let store = IndexStore::open(&network_owned)?;
+            // Best effort: a cache that can't be imported is just stale.
+            let _ = index::analytics::import_legacy_cache(&store, &analytics::legacy_cache_path());
+            Ok::<_, anyhow::Error>(store)
+        })
+        .await
+        .map_err(|e| anyhow!("index open task: {e}"))
+        .and_then(|r| r);
+        let store = match opened {
+            Ok(store) => Arc::new(store),
+            Err(e) => return self.chain_failed(e).await,
+        };
+        let labels = self.app.read().await.labels.clone();
+        let sink = match index::task::start_writer(
+            store.clone(),
+            labels,
+            self.app.clone(),
+            &mut self.polling,
+        ) {
+            Ok(sink) => sink,
+            Err(e) => return self.chain_failed(e).await,
+        };
+        self.index = Some(store);
 
         chain_stream::start_chain_stream(
             rpc,
             &self.app,
             &mut self.polling,
             StreamStart {
-                position,
+                position: sink.stream_position(),
                 backfill: self.backfill,
             },
-            sinks,
+            vec![sink.sender],
         );
     }
 
-    async fn index_failed(&mut self, e: anyhow::Error) {
+    /// Stop the chain pipeline, delete the index from disk and start the pipeline again,
+    /// so it rebuilds from the pruning point with nothing carried over. Node polling, the
+    /// hashrate and the watchlist keep running.
+    async fn resync(&mut self) {
+        let Some(rpc) = self.rpc.clone() else {
+            return;
+        };
+        let Some(network) = self
+            .remote
+            .as_ref()
+            .filter(|r| r.url.is_some())
+            .map(|r| r.network.clone())
+        else {
+            return;
+        };
+        self.polling.stop_chain().await;
+        self.index = None;
+        {
+            let mut app = self.app.write().await;
+            app.clear_chain_data();
+            app.chain.phase = ChainPhase::Opening;
+            app.mark_dirty();
+        }
+        let discarded = {
+            let network = network.clone();
+            tokio::task::spawn_blocking(move || index::discard(&network))
+                .await
+                .map_err(|e| anyhow!("index discard task: {e}"))
+                .and_then(|r| r)
+        };
+        if let Err(e) = discarded {
+            return self.chain_failed(e).await;
+        }
+        self.start_chain_stream(&rpc, &network).await;
+    }
+
+    async fn chain_failed(&mut self, e: anyhow::Error) {
         let mut app = self.app.write().await;
-        app.index.status.phase = IndexPhase::Error(format!("{e:#}"));
+        app.chain.phase = ChainPhase::Error(format!("{e:#}"));
         app.mark_dirty();
     }
 
@@ -302,7 +329,6 @@ impl Controller {
         }
 
         let mut app = self.app.write().await;
-        save_analytics_cache(&app);
         app.clear_node_data();
         app.connection = ActiveConnection::None;
         app.mark_dirty();
@@ -598,13 +624,4 @@ impl Controller {
 /// An error as a JSON object, for views that show JSON responses.
 fn error_json(e: &anyhow::Error) -> String {
     serde_json::to_string_pretty(&serde_json::json!({ "error": e.to_string() })).unwrap_or_default()
-}
-
-/// Persist the analytics cache (best-effort; the streaming task is aborted, not stopped).
-fn save_analytics_cache(app: &App) {
-    if let Some(ref engine) = app.analytics.engine
-        && let Ok(eng) = engine.try_read()
-    {
-        let _ = eng.save(&analytics_streaming::cache_path());
-    }
 }

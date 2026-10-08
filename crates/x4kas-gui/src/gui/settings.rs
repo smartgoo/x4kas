@@ -120,38 +120,36 @@ impl SettingsPage {
     /// The public list: its count, where it comes from and how its fetch is going.
     fn sources(&mut self, ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
         let book = app.labels.clone();
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(
-                    !app.label_refresh.fetching,
-                    egui::Button::new("Refresh public list"),
-                )
-                .clicked()
-            {
-                let _ = cmd_tx.send(UiCommand::RefreshLabels);
-            }
-            ui.label(format!(
-                "{} public labels",
-                format_number(book.public_len() as u64)
-            ));
-        });
-        ui.add_space(4.0);
         kv_grid(ui, "label_sources", |ui| {
+            // Right to left: the button sits rightmost, then the fetch frequency, the
+            // count and the fetch state.
             kv_with(ui, "api.kaspa.org", |ui| {
-                ui.label("/addresses/names, fetched on launch and hourly");
+                if ui
+                    .add_enabled(!app.label_refresh.fetching, egui::Button::new("Refresh"))
+                    .on_hover_text("Fetch the public list again now")
+                    .clicked()
+                {
+                    let _ = cmd_tx.send(UiCommand::RefreshLabels);
+                }
+                ui.label(RichText::new("fetched on launch and hourly").weak());
+                dot(ui);
+                ui.label(format!(
+                    "{} addresses",
+                    format_number(book.public_len() as u64)
+                ));
+                dot(ui);
                 if app.label_refresh.fetching {
-                    ui.spinner();
                     ui.label(RichText::new("fetching…").weak());
+                    ui.spinner();
                 } else if let Some(err) = &app.label_refresh.last_error {
                     ui.label(RichText::new(format!("fetch failed: {err}")).color(theme::ERROR));
                 } else if let Some(at) = book.kaspa_org_refreshed {
-                    ui.label(
-                        RichText::new(format!(
-                            "fetched {} ago",
-                            format_duration(at.elapsed().unwrap_or_default())
-                        ))
-                        .weak(),
-                    );
+                    ui.label(format!(
+                        "fetched {} ago",
+                        format_duration(at.elapsed().unwrap_or_default())
+                    ));
+                } else {
+                    ui.label(RichText::new("not fetched yet").weak());
                 }
             });
         });
@@ -237,6 +235,11 @@ struct LabelRow {
 }
 
 /// How a label's source reads in the table: "manual" for the user's own.
+/// A dim separator between the items of a row.
+fn dot(ui: &mut Ui) {
+    ui.label(RichText::new("·").weak());
+}
+
 fn source_name(source: LabelSource) -> &'static str {
     match source {
         LabelSource::User => "manual",
@@ -249,6 +252,9 @@ fn source_name(source: LabelSource) -> &'static str {
 fn labels_table(ui: &mut Ui, rows: &[LabelRow]) {
     ui.push_id("known_labels", |ui| {
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+        // A solid scroll bar beside the rows: the default floating one lies over the
+        // last column and takes the pointer from its buttons (and their tooltips).
+        ui.style_mut().spacing.scroll = egui::style::ScrollStyle::solid();
         // Room for the clickable cells, as in `wide_table`.
         let row_height =
             ui.spacing().interact_size.y + 2.0 * ui.visuals().widgets.hovered.expansion;

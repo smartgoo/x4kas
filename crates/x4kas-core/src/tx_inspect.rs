@@ -300,17 +300,35 @@ const MAX_VERSION_LEN: usize = 32;
 /// Layout: blue score (u64), subsidy (u64), script version (u16), script length
 /// (u8), the miner's script, then extra data `"<version>/<miner info>"`.
 pub fn coinbase_node_version(payload: &[u8]) -> Option<String> {
+    let extra = coinbase_extra(payload)?;
+    let version = extra.split('/').next().unwrap_or_default().trim();
+    Some(version.chars().take(MAX_VERSION_LEN).collect())
+}
+
+/// The miner's tag from a coinbase payload: the extra data after the node version,
+/// e.g. `"kaspa-miner/pool"` for `"1.0.1/kaspa-miner/pool"`. Pools and miner software
+/// put their names here. `None` if the payload isn't a coinbase payload or there is no
+/// tag.
+pub fn coinbase_miner_tag(payload: &[u8]) -> Option<String> {
+    let extra = coinbase_extra(payload)?;
+    let (_, tag) = extra.split_once('/')?;
+    let tag: String = tag.chars().filter(|c| !c.is_control()).collect();
+    Some(tag.trim().to_string()).filter(|t| !t.is_empty())
+}
+
+/// The extra data of a coinbase payload, byte per char; `None` if the payload isn't one.
+fn coinbase_extra(payload: &[u8]) -> Option<String> {
     let script_len = *payload.get(18)? as usize;
     let script = payload.get(19..19 + script_len)?;
     if script.first().is_none_or(|&b| b == OP_BLAKE2B) {
         return None;
     }
-    let extra: String = payload[19 + script_len..]
-        .iter()
-        .map(|&b| b as char)
-        .collect();
-    let version = extra.split('/').next().unwrap_or_default().trim();
-    Some(version.chars().take(MAX_VERSION_LEN).collect())
+    Some(
+        payload[19 + script_len..]
+            .iter()
+            .map(|&b| b as char)
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -527,7 +545,16 @@ mod tests {
         let script = [OP_DATA_32; 34];
         let payload = coinbase_payload(&script, b"1.0.1/kaspa-miner/pool");
         assert_eq!(coinbase_node_version(&payload).as_deref(), Some("1.0.1"));
+        assert_eq!(
+            coinbase_miner_tag(&payload).as_deref(),
+            Some("kaspa-miner/pool")
+        );
+        assert_eq!(
+            coinbase_miner_tag(&coinbase_payload(&script, b"1.0.1/ \x00")),
+            None
+        );
         let bare = coinbase_payload(&script, b"0.17.2");
+        assert_eq!(coinbase_miner_tag(&bare), None);
         assert_eq!(coinbase_node_version(&bare).as_deref(), Some("0.17.2"));
         let empty = coinbase_payload(&script, b"");
         assert_eq!(coinbase_node_version(&empty).as_deref(), Some(""));

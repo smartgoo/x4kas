@@ -274,6 +274,12 @@ fn header(
                     .desired_width(180.0),
             );
             if let Some(known) = app.labels.get(addr) {
+                if let Some(link) = &known.link {
+                    ui.hyperlink_to("↗", link).on_hover_text(link);
+                }
+                if !known.categories.is_empty() {
+                    ui.label(RichText::new(known.categories.join(", ")).weak());
+                }
                 ui.label(
                     RichText::new(format!("{} ({})", known.name, known.source.label()))
                         .color(theme::ACCENT_BRIGHT),

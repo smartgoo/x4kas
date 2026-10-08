@@ -17,7 +17,7 @@ Built with [egui/eframe](https://github.com/emilk/egui) and [rusty-kaspa](https:
   - **Address Info** from any address in the app: label, balance, balance history, transactions, counterparties, the likely-owner cluster and watch settings, backed by a local address index of the node's retention window (direct node only; see below)
   - **Clustering**: addresses that spend together, and probable change outputs, are grouped into likely owners (with guards against merging labelled entities and L2 bridges), so an exchange's many deposit addresses read as one
   - **Flow graph**: follow the money hop by hop from any address; click a node to expand it
-  - **Labels** from the public api.kaspa.org list (exchanges, pools, funds, bridges; bundled and refreshed daily) and your own, shown as chips wherever an address appears; opt-in per-address lookups on kas.fyi (API key) and KNS `.kas` names
+  - **Labels** from the public api.kaspa.org list (exchanges, pools, funds, bridges; bundled and refreshed daily) and your own, shown as chips wherever an address appears; opt-in per-address lookups on kas.fyi (API key, with the entity's link and categories) and KNS `.kas` names; pools that mine many blocks are labelled from their coinbase tags as the chain streams in
 - **Mempool**: live transaction table; click a row for details
 - **RPC Cmds**: run any of 36 read-only RPC methods (with argument forms for those that take a hash, address or number) and inspect formatted responses
 - **Connection switcher**: connect to a node by URL or through the public resolver, from inside the app
@@ -167,7 +167,7 @@ crates/
     analytics_streaming.rs The analytics engine as a chain-stream sink
     index/                The address index (fjall store, writer, queries) and its writer task
     watch.rs              Watchlist, UtxosChanged events and alert rules
-    labels.rs             Address labels (user, api.kaspa.org, bundled snapshot)
+    labels.rs             Address labels (user, kas.fyi, api.kaspa.org, KNS, bundled snapshot, heuristics)
     emission.rs           Block reward schedule and burn address
     format.rs             Formatting helpers
     tx_inspect.rs         Per-transaction classification (scripts, opcodes, protocols)

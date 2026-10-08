@@ -431,7 +431,11 @@ Everything in Phases 0–5 is built, with these deviations from the proposal:
   fires once a previous activity is known (`last_activity_ms`, kept in the watchlist
   file), so the first event after adding an address never counts as "after idle".
 - **Online labels:** kas.fyi and KNS lookups are on demand ("Look up" per address),
-  never automatic, and cached with negative answers for a week.
+  never automatic, and cached with negative answers for a week. The opt-in toggles live
+  on the Addresses tab (Label Sources), not in the connection window.
+- **Heuristic labels** are the burn address of every network and "Mining pool (<tag>)"
+  for a payout address once the analytics sink has seen it mine 25 coinbases; they are
+  per session (not saved) and sit below every other source.
 - **Live validation** against a real node was not possible in the build session (no
   node was reachable); the pipeline is covered by synthetic-response tests
   (indexing, replay idempotence, reorg undo, slab pruning, clustering, flows).

@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::app::TimeWindow;
 use crate::tx_inspect::{
-    OpcodeUsage, ScriptClass, TransactionProtocol, coinbase_node_version, detect_protocol,
-    output_script_opcodes, redeem_script_opcodes, script_class,
+    OpcodeUsage, ScriptClass, TransactionProtocol, coinbase_miner_tag, coinbase_node_version,
+    detect_protocol, output_script_opcodes, redeem_script_opcodes, script_class,
 };
 
 // --- Metrics ---
@@ -172,6 +172,31 @@ pub fn summarize_chain_blocks(
         .collect();
 
     (summaries, removed)
+}
+
+/// The coinbases a VSPC v2 response adds: each miner's payout address (the coinbase's
+/// first output) and the miner tag from its payload. Feeds `labels::MinerTally`.
+pub fn coinbase_miners(
+    response: &GetVirtualChainFromBlockV2Response,
+) -> Vec<(String, Option<String>)> {
+    response
+        .chain_block_accepted_transactions
+        .iter()
+        .flat_map(|chain_block| chain_block.accepted_transactions.iter())
+        .filter(|tx| tx.inputs.is_empty())
+        .filter_map(|tx| {
+            let miner = tx
+                .outputs
+                .first()?
+                .verbose_data
+                .as_ref()?
+                .script_public_key_address
+                .as_ref()?
+                .to_string();
+            let tag = tx.payload.as_deref().and_then(coinbase_miner_tag);
+            Some((miner, tag))
+        })
+        .collect()
 }
 
 /// Count one accepted transaction into a chain block's metrics.

@@ -5,7 +5,7 @@ use anyhow::Result;
 use clap::Subcommand;
 use serde::Serialize;
 
-use x4kas_core::labels::{self, LabelBook, LabelSettings, LabelSource};
+use x4kas_core::labels::{self, Label, LabelBook, LabelSettings, LabelSource};
 
 #[derive(Subcommand, Debug, Clone, PartialEq)]
 pub enum LabelsCommand {
@@ -38,6 +38,22 @@ struct Row<'a> {
     address: &'a str,
     name: &'a str,
     source: LabelSource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    link: Option<&'a str>,
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    categories: &'a [String],
+}
+
+impl<'a> Row<'a> {
+    fn new(address: &'a str, label: &'a Label) -> Self {
+        Self {
+            address,
+            name: &label.name,
+            source: label.source,
+            link: label.link.as_deref(),
+            categories: &label.categories,
+        }
+    }
 }
 
 pub async fn run(cmd: LabelsCommand) -> Result<()> {
@@ -45,19 +61,11 @@ pub async fn run(cmd: LabelsCommand) -> Result<()> {
     let out = match cmd {
         LabelsCommand::Get { query } => {
             let rows: Vec<Row> = match book.get(&query) {
-                Some(label) => vec![Row {
-                    address: &query,
-                    name: &label.name,
-                    source: label.source,
-                }],
+                Some(label) => vec![Row::new(&query, label)],
                 None => book
                     .search(&query)
                     .into_iter()
-                    .map(|(a, l)| Row {
-                        address: a,
-                        name: &l.name,
-                        source: l.source,
-                    })
+                    .map(|(a, l)| Row::new(a, l))
                     .collect(),
             };
             serde_json::to_string_pretty(&rows)?
@@ -66,11 +74,7 @@ pub async fn run(cmd: LabelsCommand) -> Result<()> {
             let rows: Vec<Row> = book
                 .all()
                 .into_iter()
-                .map(|(a, l)| Row {
-                    address: a,
-                    name: &l.name,
-                    source: l.source,
-                })
+                .map(|(a, l)| Row::new(a, l))
                 .collect();
             serde_json::to_string_pretty(&rows)?
         }

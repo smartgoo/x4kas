@@ -9,11 +9,12 @@ use std::time::SystemTime;
 use kaspa_rpc_core::RpcHash;
 use tokio::sync::{RwLock, mpsc};
 
-use crate::analytics::{AnalyticsEngine, summarize_chain_blocks};
+use crate::analytics::{AnalyticsEngine, coinbase_miners, summarize_chain_blocks};
 use crate::app::{AnalyticsPhase, App};
 use crate::chain_stream::{BatchSender, ChainBatch, SINK_QUEUE};
 use crate::config;
 use crate::format::now_ms;
+use crate::labels::MinerTally;
 use crate::polling::PollingHandles;
 
 pub use crate::chain_stream::poll_interval;
@@ -69,8 +70,17 @@ async fn run(
     mut receiver: mpsc::Receiver<Arc<ChainBatch>>,
     app: Arc<RwLock<App>>,
 ) {
+    // Pools reveal themselves by mining many blocks; label them as they do.
+    let mut miners = MinerTally::default();
     while let Some(response) = receiver.recv().await {
         let (summaries, removed) = summarize_chain_blocks(&response);
+        let pool_labels: Vec<(String, String)> = coinbase_miners(&response)
+            .into_iter()
+            .filter_map(|(address, tag)| {
+                let name = miners.observe(&address, tag.as_deref())?;
+                Some((address, name))
+            })
+            .collect();
 
         // Process blocks and compute views under the engine write lock.
         let (reorg_msg, cached_views, tx_histogram) = {
@@ -103,6 +113,16 @@ async fn run(
         }
         app.analytics.cached_views = Some(cached_views);
         app.analytics.tx_histogram = Some(tx_histogram);
+        if !pool_labels.is_empty() {
+            let mut book = (*app.labels).clone();
+            let mut changed = false;
+            for (address, name) in &pool_labels {
+                changed |= book.set_heuristic(address, name);
+            }
+            if changed {
+                app.labels = Arc::new(book);
+            }
+        }
         app.mark_dirty();
     }
 }

@@ -3,7 +3,9 @@
 //! (exchanges, pools, funds, bridges; refreshed daily and cached at
 //! `~/.x4kas/labels/kaspa_org.json`), and a snapshot of that list bundled with the app
 //! so labels show offline. The kaspa.org list is fetched in bulk, so looking up an
-//! address never tells anyone which one.
+//! address never tells anyone which one. Below all of these sit heuristics: the burn
+//! address of every network, and mining pools detected from the coinbases the chain
+//! stream sees ([`MinerTally`]).
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -16,6 +18,7 @@ use tokio::sync::RwLock;
 
 use crate::app::App;
 use crate::config;
+use crate::emission;
 
 const KASPA_ORG_NAMES_URL: &str = "https://api.kaspa.org/addresses/names";
 /// Snapshot of the kaspa.org list, so labels show before (and without) a refresh.
@@ -32,6 +35,8 @@ pub enum LabelSource {
     /// A `.kas` name from the KNS indexer (opt-in).
     Kns,
     Bundled,
+    /// Derived locally: the burn address, a pool seen mining many blocks.
+    Heuristic,
 }
 
 impl LabelSource {
@@ -42,6 +47,7 @@ impl LabelSource {
             Self::KaspaOrg => "api.kaspa.org",
             Self::Kns => "KNS",
             Self::Bundled => "bundled list",
+            Self::Heuristic => "heuristic",
         }
     }
 
@@ -54,6 +60,7 @@ impl LabelSource {
             Self::KasFyi => 4,
             Self::KaspaOrg | Self::Bundled => 3,
             Self::Kns => 2,
+            Self::Heuristic => 1,
         }
     }
 }
@@ -100,6 +107,12 @@ impl LabelSettings {
 pub struct OnlineEntry {
     pub source: LabelSource,
     pub name: Option<String>,
+    /// The entity's web page, when the source gives one (kas.fyi).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<String>,
+    /// Categories such as `exchange` or `pool` (kas.fyi).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub categories: Vec<String>,
     pub fetched_at_ms: u64,
 }
 
@@ -146,9 +159,33 @@ impl OnlineCache {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Label {
     pub name: String,
     pub source: LabelSource,
+    /// The entity's web page, when the source gives one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link: Option<String>,
+    /// Categories such as `exchange` or `pool`, when the source gives them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub categories: Vec<String>,
+}
+
+impl Default for Label {
+    fn default() -> Self {
+        Self::new("", LabelSource::Heuristic)
+    }
+}
+
+impl Label {
+    pub fn new(name: &str, source: LabelSource) -> Self {
+        Self {
+            name: name.to_string(),
+            source,
+            link: None,
+            categories: Vec::new(),
+        }
+    }
 }
 
 /// One entry of the kaspa.org list.
@@ -199,6 +236,9 @@ fn kaspa_org_cache_path() -> PathBuf {
 pub struct LabelBook {
     map: HashMap<String, Label>,
     user: UserLabels,
+    /// Labels derived locally (burn addresses, detected pools); the weakest source,
+    /// kept across rebuilds like the user's labels but not saved.
+    heuristic: BTreeMap<String, String>,
     /// When the kaspa.org list was last fetched (from the cache file's age on load).
     pub kaspa_org_refreshed: Option<SystemTime>,
 }
@@ -210,30 +250,52 @@ impl Default for LabelBook {
 }
 
 impl LabelBook {
-    /// The bundled snapshot only.
+    /// The bundled snapshot and the burn address of every network.
     pub fn bundled() -> Self {
         let mut book = Self {
             map: HashMap::new(),
             user: UserLabels::default(),
+            heuristic: BTreeMap::new(),
             kaspa_org_refreshed: None,
         };
         if let Ok(list) = serde_json::from_str::<Vec<AddressName>>(BUNDLED) {
             book.apply_list(&list, LabelSource::Bundled);
         }
+        for network in config::valid_networks() {
+            if let Some(burn) = emission::burn_address(network) {
+                book.heuristic
+                    .insert(burn.to_string(), "Burn address".to_string());
+            }
+        }
+        book.apply_heuristic();
         book
     }
 
-    /// The bundled snapshot, the cached kaspa.org list if any, and the user's labels.
+    /// The bundled snapshot, the cached kaspa.org list if any, the fresh online
+    /// answers, and the user's labels.
     pub fn load() -> Self {
         let mut book = Self::bundled();
-        if let Ok((list, saved_at)) = load_kaspa_org_cache() {
-            book.apply_list(&list, LabelSource::KaspaOrg);
-            book.kaspa_org_refreshed = saved_at;
-        }
-        book.apply_online_cache(&OnlineCache::load(), crate::format::now_ms());
         book.user = UserLabels::load().unwrap_or_default();
-        book.apply_user();
+        book.rebuild();
         book
+    }
+
+    /// Reapply every source over a fresh bundled book, keeping the user's and the
+    /// heuristic labels: how a removed label falls back to the next source.
+    fn rebuild(&mut self) {
+        let mut rebuilt = Self::bundled();
+        if let Ok((list, saved_at)) = load_kaspa_org_cache() {
+            rebuilt.apply_list(&list, LabelSource::KaspaOrg);
+            rebuilt.kaspa_org_refreshed = saved_at;
+        }
+        rebuilt.apply_online_cache(&OnlineCache::load(), crate::format::now_ms());
+        rebuilt
+            .heuristic
+            .extend(std::mem::take(&mut self.heuristic));
+        rebuilt.apply_heuristic();
+        rebuilt.user = std::mem::take(&mut self.user);
+        rebuilt.apply_user();
+        *self = rebuilt;
     }
 
     pub fn get(&self, address: &str) -> Option<&Label> {
@@ -294,16 +356,23 @@ impl LabelBook {
         }
         self.user.save()?;
         // Rebuild so a removed user label falls back to the public one.
-        let mut rebuilt = Self::bundled();
-        if let Ok((list, saved_at)) = load_kaspa_org_cache() {
-            rebuilt.apply_list(&list, LabelSource::KaspaOrg);
-            rebuilt.kaspa_org_refreshed = saved_at;
-        }
-        rebuilt.apply_online_cache(&OnlineCache::load(), crate::format::now_ms());
-        rebuilt.user = std::mem::take(&mut self.user);
-        rebuilt.apply_user();
-        *self = rebuilt;
+        self.rebuild();
         Ok(())
+    }
+
+    /// Add a locally derived label (the weakest source). Returns whether the label
+    /// shown for the address changed, so callers can skip republishing the book.
+    pub fn set_heuristic(&mut self, address: &str, name: &str) -> bool {
+        self.heuristic.insert(address.to_string(), name.to_string());
+        let before = self.map.get(address).cloned();
+        self.apply_one(address, Label::new(name, LabelSource::Heuristic));
+        self.map.get(address) != before.as_ref()
+    }
+
+    fn apply_heuristic(&mut self) {
+        for (address, name) in &self.heuristic.clone() {
+            self.apply_one(address, Label::new(name, LabelSource::Heuristic));
+        }
     }
 
     /// Apply a freshly fetched kaspa.org list.
@@ -315,32 +384,34 @@ impl LabelBook {
 
     fn apply_list(&mut self, list: &[AddressName], source: LabelSource) {
         for entry in list {
-            self.apply_one(&entry.address, &entry.name, source);
+            self.apply_one(&entry.address, Label::new(&entry.name, source));
         }
     }
 
     /// Set a label unless a stronger source already names the address.
-    fn apply_one(&mut self, address: &str, name: &str, source: LabelSource) {
+    fn apply_one(&mut self, address: &str, label: Label) {
         if self
             .map
             .get(address)
-            .is_some_and(|l| l.source.rank() > source.rank())
+            .is_some_and(|l| l.source.rank() > label.source.rank())
         {
             return;
         }
-        self.map.insert(
-            address.to_string(),
-            Label {
-                name: name.to_string(),
-                source,
-            },
-        );
+        self.map.insert(address.to_string(), label);
     }
 
     /// Apply an online answer (kas.fyi or KNS).
     pub fn apply_online(&mut self, address: &str, entry: &OnlineEntry) {
         if let Some(name) = &entry.name {
-            self.apply_one(address, name, entry.source);
+            self.apply_one(
+                address,
+                Label {
+                    name: name.clone(),
+                    source: entry.source,
+                    link: entry.link.clone(),
+                    categories: entry.categories.clone(),
+                },
+            );
         }
     }
 
@@ -357,15 +428,53 @@ impl LabelBook {
 
     fn apply_user(&mut self) {
         for (address, name) in &self.user.labels {
-            self.map.insert(
-                address.clone(),
-                Label {
-                    name: name.clone(),
-                    source: LabelSource::User,
-                },
-            );
+            self.map
+                .insert(address.clone(), Label::new(name, LabelSource::User));
         }
     }
+}
+
+/// A pool seen mining this many blocks earns a heuristic "Mining pool" label.
+pub const POOL_MIN_BLOCKS: u64 = 25;
+
+/// Longest miner tag (the part of a coinbase's extra data after the node version) kept.
+const MAX_MINER_TAG_LEN: usize = 40;
+
+/// Coinbases per payout address, as the chain stream sees them, to label pools:
+/// an address that mines [`POOL_MIN_BLOCKS`] blocks is almost certainly a pool
+/// (or a very large solo miner), and its coinbase tag often names it.
+#[derive(Debug, Default)]
+pub struct MinerTally {
+    blocks: HashMap<String, (u64, Option<String>)>,
+}
+
+impl MinerTally {
+    /// Count one coinbase paid to `address` with the miner tag `tag`. Returns the
+    /// label to give the address the moment it crosses the threshold, once.
+    pub fn observe(&mut self, address: &str, tag: Option<&str>) -> Option<String> {
+        let entry = self.blocks.entry(address.to_string()).or_insert((0, None));
+        entry.0 += 1;
+        if entry.1.is_none()
+            && let Some(tag) = tag.map(clean_miner_tag).filter(|t| !t.is_empty())
+        {
+            entry.1 = Some(tag);
+        }
+        (entry.0 == POOL_MIN_BLOCKS).then(|| match &entry.1 {
+            Some(tag) => format!("Mining pool ({tag})"),
+            None => "Mining pool".to_string(),
+        })
+    }
+}
+
+/// Printable, trimmed, capped miner tag.
+fn clean_miner_tag(tag: &str) -> String {
+    tag.chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>()
+        .trim()
+        .chars()
+        .take(MAX_MINER_TAG_LEN)
+        .collect()
 }
 
 fn load_kaspa_org_cache() -> Result<(Vec<AddressName>, Option<SystemTime>)> {
@@ -377,10 +486,16 @@ fn load_kaspa_org_cache() -> Result<(Vec<AddressName>, Option<SystemTime>)> {
 
 /// Whether the cached kaspa.org list is missing or older than [`REFRESH_AFTER`].
 pub fn kaspa_org_cache_is_stale() -> bool {
-    std::fs::metadata(kaspa_org_cache_path())
+    let saved_at = std::fs::metadata(kaspa_org_cache_path())
         .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.elapsed().ok())
+        .ok();
+    is_stale(saved_at, SystemTime::now())
+}
+
+/// Whether a list saved at `saved_at` (none: never) needs fetching again at `now`.
+pub fn is_stale(saved_at: Option<SystemTime>, now: SystemTime) -> bool {
+    saved_at
+        .map(|t| now.duration_since(t).unwrap_or_default())
         .is_none_or(|age| age > REFRESH_AFTER)
 }
 
@@ -432,19 +547,18 @@ pub async fn lookup_online(settings: &LabelSettings, address: &str) -> Result<Ve
                 .send()
                 .await
                 .context("kas.fyi")?;
-            let name = match response.status().as_u16() {
-                404 => None,
+            let entry = match response.status().as_u16() {
+                404 => OnlineEntry {
+                    source: LabelSource::KasFyi,
+                    name: None,
+                    link: None,
+                    categories: Vec::new(),
+                    fetched_at_ms: now,
+                },
                 _ => {
                     let body: serde_json::Value = response.error_for_status()?.json().await?;
-                    body.pointer("/tag/name")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string)
+                    kas_fyi_entry(&body, now)
                 }
-            };
-            let entry = OnlineEntry {
-                source: LabelSource::KasFyi,
-                name,
-                fetched_at_ms: now,
             };
             cache.put(address, entry.clone());
             learned.push(entry);
@@ -467,6 +581,8 @@ pub async fn lookup_online(settings: &LabelSettings, address: &str) -> Result<Ve
             let entry = OnlineEntry {
                 source: LabelSource::Kns,
                 name: kns_name(&body),
+                link: None,
+                categories: Vec::new(),
                 fetched_at_ms: now,
             };
             cache.put(address, entry.clone());
@@ -476,6 +592,35 @@ pub async fn lookup_online(settings: &LabelSettings, address: &str) -> Result<Ve
 
     let _ = cache.save();
     Ok(learned)
+}
+
+/// A kas.fyi tag response, `{tag: {address, name, link, labels[]}}`.
+fn kas_fyi_entry(body: &serde_json::Value, now_ms: u64) -> OnlineEntry {
+    let text = |pointer: &str| {
+        body.pointer(pointer)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    OnlineEntry {
+        source: LabelSource::KasFyi,
+        name: text("/tag/name"),
+        link: text("/tag/link").filter(|l| l.starts_with("http")),
+        categories: body
+            .pointer("/tag/labels")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .map(|s| s.trim().to_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        fetched_at_ms: now_ms,
+    }
 }
 
 /// The first `.kas` name in a KNS assets response, whatever field it sits in.
@@ -553,6 +698,8 @@ mod tests {
         let kns = OnlineEntry {
             source: LabelSource::Kns,
             name: Some("burn.kas".into()),
+            link: None,
+            categories: Vec::new(),
             fetched_at_ms: 0,
         };
         // KNS is weaker than the bundled list; kas.fyi is stronger.
@@ -563,6 +710,8 @@ mod tests {
             &OnlineEntry {
                 source: LabelSource::KasFyi,
                 name: Some("Burn (kas.fyi)".into()),
+                link: None,
+                categories: Vec::new(),
                 fetched_at_ms: 0,
             },
         );
@@ -572,6 +721,8 @@ mod tests {
             &OnlineEntry {
                 source: LabelSource::Kns,
                 name: None,
+                link: None,
+                categories: Vec::new(),
                 fetched_at_ms: 0,
             },
         );
@@ -599,6 +750,99 @@ mod tests {
             None
         );
         assert!(!LabelSettings::default().any_enabled());
+    }
+
+    #[test]
+    fn kas_fyi_answers_carry_link_and_categories() {
+        let body = serde_json::json!({
+            "tag": {
+                "address": "kaspa:q",
+                "name": "Bybit",
+                "link": "https://www.bybit.com",
+                "labels": ["Exchange", " cex "]
+            }
+        });
+        let entry = kas_fyi_entry(&body, 7);
+        assert_eq!(entry.name.as_deref(), Some("Bybit"));
+        assert_eq!(entry.link.as_deref(), Some("https://www.bybit.com"));
+        assert_eq!(entry.categories, ["exchange", "cex"]);
+        let mut book = LabelBook::bundled();
+        book.apply_online("kaspa:q", &entry);
+        let label = book.get("kaspa:q").unwrap();
+        assert_eq!(label.link.as_deref(), Some("https://www.bybit.com"));
+        assert_eq!(label.categories, ["exchange", "cex"]);
+        // A cache written before these fields existed still loads.
+        let old: OnlineEntry =
+            serde_json::from_str(r#"{"source":"Kns","name":"a.kas","fetched_at_ms":1}"#).unwrap();
+        assert_eq!(old.link, None);
+        assert!(old.categories.is_empty());
+    }
+
+    #[test]
+    fn heuristics_are_the_weakest_source() {
+        let mut book = LabelBook::bundled();
+        // The mainnet burn address is on the public list, which wins; the testnet one
+        // is only known by heuristic.
+        let burn = "kaspa:qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqkx9awp4e";
+        assert_eq!(book.get(burn).unwrap().source, LabelSource::Bundled);
+        let testnet_burn = emission::burn_address("testnet-10").unwrap().to_string();
+        assert_eq!(book.name(&testnet_burn), Some("Burn address"));
+        assert_eq!(
+            book.get(&testnet_burn).unwrap().source,
+            LabelSource::Heuristic
+        );
+
+        assert!(book.set_heuristic("kaspa:qpool", "Mining pool (x)"));
+        assert_eq!(book.name("kaspa:qpool"), Some("Mining pool (x)"));
+        // Nothing changes when the same heuristic is set again, or for a listed address.
+        assert!(!book.set_heuristic("kaspa:qpool", "Mining pool (x)"));
+        assert!(!book.set_heuristic(burn, "Mining pool"));
+        assert_eq!(book.get(burn).unwrap().source, LabelSource::Bundled);
+        // Every other source overrides it.
+        book.apply_kaspa_org(
+            &[AddressName {
+                address: "kaspa:qpool".into(),
+                name: "Pool X".into(),
+            }],
+            SystemTime::now(),
+        );
+        assert_eq!(book.name("kaspa:qpool"), Some("Pool X"));
+        assert!(!book.search("burn address").is_empty());
+    }
+
+    #[test]
+    fn miner_tally_labels_a_pool_once() {
+        let mut tally = MinerTally::default();
+        for i in 1..POOL_MIN_BLOCKS {
+            assert_eq!(tally.observe("kaspa:qa", Some("")), None, "block {i}");
+        }
+        assert_eq!(
+            tally
+                .observe("kaspa:qa", Some(" 2miners.com\u{0}"))
+                .as_deref(),
+            Some("Mining pool (2miners.com)")
+        );
+        assert_eq!(tally.observe("kaspa:qa", Some("other")), None);
+        let mut tally = MinerTally::default();
+        let last = (0..POOL_MIN_BLOCKS)
+            .filter_map(|_| tally.observe("kaspa:qb", None))
+            .last();
+        assert_eq!(last.as_deref(), Some("Mining pool"));
+        let long = "x".repeat(100);
+        assert_eq!(clean_miner_tag(&long).len(), MAX_MINER_TAG_LEN);
+    }
+
+    #[test]
+    fn kaspa_org_cache_expiry() {
+        let now = SystemTime::now();
+        assert!(is_stale(None, now));
+        assert!(!is_stale(Some(now - Duration::from_secs(60)), now));
+        assert!(is_stale(
+            Some(now - REFRESH_AFTER - Duration::from_secs(1)),
+            now
+        ));
+        // A file from the future (clock change) is not stale.
+        assert!(!is_stale(Some(now + Duration::from_secs(60)), now));
     }
 
     #[test]

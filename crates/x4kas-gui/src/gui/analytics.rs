@@ -383,7 +383,7 @@ pub(super) fn addresses(ui: &mut Ui, entries: Option<&[(String, u64)]>, kind: &s
 /// columns are right-aligned, so values sit against the right edge of the card. The body
 /// is always [`TABLE_MAX_HEIGHT`] tall (scrolling beyond), with `empty` in its first row
 /// while there are no rows, so the card keeps its size as rows arrive.
-fn wide_table<const N: usize>(
+pub fn wide_table<const N: usize>(
     ui: &mut Ui,
     id: &str,
     headers: [&str; N],

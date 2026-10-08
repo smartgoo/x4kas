@@ -1,9 +1,12 @@
 //! egui/eframe desktop frontend.
 
+mod address;
+mod addresses;
 mod analytics;
 mod blockdag;
 mod connection;
 mod dashboard;
+mod flows;
 mod help;
 mod mempool;
 mod rpc_explorer;
@@ -19,14 +22,21 @@ use eframe::egui::{self, Button, Event, Key, Modifiers, RichText, Stroke, Viewpo
 use tokio::sync::{RwLock, oneshot};
 
 use crate::Args;
+use address::AddressWindowUi;
+use addresses::AddressesTab;
 use connection::ConnectionWindow;
+use flows::FlowWindowUi;
 use terminal::TerminalPane;
 use widgets::kv;
 use x4kas_core::analytics_streaming;
-use x4kas_core::app::{ActiveConnection, AnalyticsPhase, App, ConnectionStatus, StartPoint, Tab};
+use x4kas_core::app::{
+    ActiveConnection, AnalyticsPhase, App, ConnectionStatus, IndexPhase, StartPoint, Tab,
+};
+use x4kas_core::chain_stream::StreamStart;
 use x4kas_core::config::{ConnectionKind, ConnectionSettings};
 use x4kas_core::controller::{self, CommandSender, ControllerArgs, RemoteTarget, UiCommand};
 use x4kas_core::format::{format_duration, format_number, now_ms};
+use x4kas_core::labels;
 use x4kas_core::rpc::market;
 
 /// Start background tasks on `rt` and run the GUI on the current (main) thread.
@@ -53,12 +63,14 @@ pub fn run(rt: &tokio::runtime::Runtime, args: Args) -> Result<()> {
     let cmd_tx = {
         let _guard = rt.enter();
         market::start_market_polling(app.clone(), Duration::from_secs(60));
+        labels::start_label_refresh(app.clone());
         controller::spawn(
             rt.handle(),
             app.clone(),
             ControllerArgs {
                 remote,
                 refresh_interval_ms: args.refresh_interval_ms,
+                backfill: Some(StreamStart::default_backfill()),
             },
         )
     };
@@ -98,6 +110,9 @@ struct GuiApp {
     show_help: bool,
     connection: ConnectionWindow,
     terminal: TerminalPane,
+    addresses: AddressesTab,
+    address_window: AddressWindowUi,
+    flow_window: FlowWindowUi,
 }
 
 impl GuiApp {
@@ -110,6 +125,9 @@ impl GuiApp {
             show_help: false,
             connection,
             terminal: TerminalPane::new(),
+            addresses: AddressesTab::default(),
+            address_window: AddressWindowUi::default(),
+            flow_window: FlowWindowUi::default(),
         }
     }
 
@@ -158,6 +176,7 @@ impl eframe::App for GuiApp {
             .as_ref()
             .is_some_and(|s| s.network_id.contains("testnet"));
         widgets::set_testnet(ctx, testnet);
+        widgets::set_labels(ctx, app.labels.clone());
 
         egui::TopBottomPanel::top("top_bar")
             .frame(bar_frame())
@@ -177,6 +196,7 @@ impl eframe::App for GuiApp {
 
         egui::CentralPanel::default().show(ctx, |ui| match app.active_tab {
             Tab::Dashboard => dashboard::show(ui, &mut app),
+            Tab::Addresses => self.addresses.show(ui, &mut app, &self.cmd_tx),
             Tab::Mempool => mempool::show(ui, &mut app),
             Tab::RpcExplorer => rpc_explorer::show(ui, &mut app, &self.cmd_tx),
         });
@@ -188,6 +208,13 @@ impl eframe::App for GuiApp {
             let _ = self.cmd_tx.send(UiCommand::LookupBlock(hash));
         }
         blockdag::block_window(ctx, &mut app);
+        // Likewise any address opens Address Info.
+        if let Some(address) = widgets::take_address_request(ctx) {
+            app.address.request(address.clone());
+            let _ = self.cmd_tx.send(UiCommand::LookupAddress(address));
+        }
+        self.address_window.show(ctx, &mut app, &self.cmd_tx);
+        self.flow_window.show(ctx, &mut app, &self.cmd_tx);
 
         self.connection.show(ctx, &mut app, &self.cmd_tx);
         help::show(ctx, &mut self.show_help);
@@ -215,7 +242,7 @@ fn handle_shortcuts(
     show_help: &mut bool,
     terminal: &mut TerminalPane,
 ) {
-    const TAB_KEYS: [Key; 3] = [Key::Num1, Key::Num2, Key::Num3];
+    const TAB_KEYS: [Key; 4] = [Key::Num1, Key::Num2, Key::Num3, Key::Num4];
 
     // Works even while the terminal or a text field has focus.
     if ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, Key::Backtick)) {
@@ -522,6 +549,94 @@ fn analytics_chip(ui: &mut egui::Ui, app: &App) {
     });
 }
 
+/// Address index indicator; details (position, coverage, speed, disk) on hover.
+fn index_chip(ui: &mut egui::Ui, app: &App) {
+    if !app.connection.is_direct() {
+        return;
+    }
+    let status = &app.index.status;
+    let (text, color, summary) = match status.phase {
+        IndexPhase::Idle => return,
+        IndexPhase::Opening => (
+            "◌ Index opening".to_string(),
+            theme::TEXT_DIM,
+            "Opening the store",
+        ),
+        IndexPhase::Indexing if status.backlog > 0 => (
+            "◐ Index writing".to_string(),
+            theme::WARN,
+            "Writing batches from the chain stream",
+        ),
+        IndexPhase::Indexing => (
+            "● Index".to_string(),
+            theme::OK,
+            "Up to date with the stream",
+        ),
+        IndexPhase::Error(_) => (
+            "× Index error".to_string(),
+            theme::ERROR,
+            "The last batch failed",
+        ),
+    };
+    widgets::divider(ui);
+    widgets::status_chip(ui, "index_status", &text, color, |ui| {
+        kv(ui, "Status", summary);
+        kv(ui, "Transactions", format_number(status.txs_indexed));
+        kv(ui, "Addresses", format_number(status.addresses));
+        if let Some(pos) = status.position {
+            kv(
+                ui,
+                "Position",
+                format!(
+                    "DAA {} ({} ago)",
+                    format_number(pos.daa_score),
+                    format_duration(Duration::from_millis(now_ms().saturating_sub(pos.time_ms)))
+                ),
+            );
+        }
+        if let Some((from, to)) = status.coverage {
+            kv(
+                ui,
+                "Covers",
+                format!(
+                    "{} → {} ago",
+                    format_duration(Duration::from_millis(now_ms().saturating_sub(from))),
+                    format_duration(Duration::from_millis(
+                        now_ms().saturating_sub(to.min(now_ms()))
+                    ))
+                ),
+            );
+        }
+        if let Some(rate) = status.tx_per_sec {
+            kv(
+                ui,
+                "Write speed",
+                format!("{} tx/s", format_number(rate as u64)),
+            );
+        }
+        kv(ui, "Queued batches", status.backlog.to_string());
+        kv(
+            ui,
+            "On disk",
+            format!(
+                "{} MB in {} slabs",
+                status.disk_bytes / (1024 * 1024),
+                status.slabs
+            ),
+        );
+        if status.unresolved_reorgs > 0 {
+            kv(
+                ui,
+                "Reorgs past coverage",
+                format_number(status.unresolved_reorgs),
+            );
+        }
+        if let IndexPhase::Error(ref err) = status.phase {
+            kv(ui, "Error", RichText::new(err).color(theme::ERROR));
+        }
+    });
+}
+
 /// Hover text for the connection button: the node URL, then what a click does.
 fn connection_tooltip(app: &App) -> String {
     // The resolver's node URL is only known once connected.
@@ -567,6 +682,7 @@ fn status_bar(ui: &mut egui::Ui, app: &mut App, connection: &mut ConnectionWindo
         }
         node_chip(ui, app);
         analytics_chip(ui, app);
+        index_chip(ui, app);
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let pause_label = if app.paused {

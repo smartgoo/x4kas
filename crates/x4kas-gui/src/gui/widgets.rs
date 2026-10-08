@@ -1,12 +1,16 @@
 //! Small building blocks shared by the tab views.
 
+use std::sync::Arc;
+
 use eframe::egui::{
     self, Button, FontId, Margin, RichText, Stroke, TextEdit, Ui, WidgetText, pos2, text::CCursor,
 };
 
+pub use super::analytics::wide_table;
 use super::theme;
 use x4kas_core::app::{ActiveConnection, App};
 use x4kas_core::format::{explorer_address_url, kaspa_stream_address_url, shorten_middle};
+use x4kas_core::labels::LabelBook;
 use x4kas_core::rpc::hash_links::HashLink;
 
 /// Vertical space between stacked cards.
@@ -513,6 +517,18 @@ fn linked_value(ui: &mut Ui, value: &str, kind: LinkKind, selected: bool) -> boo
         LinkKind::Block => "Copy hash",
     };
 
+    // A known address shows its label first (see [`set_labels`]).
+    let rtl = ui.layout().prefer_right_to_left();
+    let label = match kind {
+        LinkKind::Address => labels(ui.ctx()).and_then(|book| book.name(value).map(str::to_string)),
+        LinkKind::Block => None,
+    };
+    if let Some(ref name) = label
+        && !rtl
+    {
+        label_chip(ui, name);
+    }
+
     // Leave room for the label's padding and the copy icon.
     let padding = 2.0 * ui.spacing().button_padding.x;
     let room = ui.available_width() - padding - COPY_ICON_SIZE - COPY_ICON_GAP;
@@ -520,7 +536,6 @@ fn linked_value(ui: &mut Ui, value: &str, kind: LinkKind, selected: bool) -> boo
 
     // In a right-to-left row (a right-aligned value) the first widget lands rightmost, so
     // add the icon first to keep it after the value.
-    let rtl = ui.layout().prefer_right_to_left();
     if rtl {
         copy_button(ui, id, value, copy_hint);
     }
@@ -534,7 +549,7 @@ fn linked_value(ui: &mut Ui, value: &str, kind: LinkKind, selected: bool) -> boo
     })
     .on_hover_cursor(egui::CursorIcon::PointingHand);
     let hint = match kind {
-        LinkKind::Address => None,
+        LinkKind::Address => Some("Click for address info"),
         LinkKind::Block => Some("Click for block info"),
     };
     let response = match (shown != value, hint) {
@@ -548,6 +563,9 @@ fn linked_value(ui: &mut Ui, value: &str, kind: LinkKind, selected: bool) -> boo
     match kind {
         LinkKind::Address => {
             egui::Popup::menu(&response).id(menu_id).show(|ui| {
+                if ui.button("Address info").clicked() {
+                    request_address(ui.ctx(), value);
+                }
                 for (name, url) in [
                     ("Open in Kaspa Explorer", explorer_address_url(value)),
                     ("Open in Kaspa Stream", kaspa_stream_address_url(value)),
@@ -569,7 +587,57 @@ fn linked_value(ui: &mut Ui, value: &str, kind: LinkKind, selected: bool) -> boo
     if !rtl {
         icon_gap(ui, true, |ui| copy_button(ui, id, value, copy_hint));
     }
+    if let Some(ref name) = label
+        && rtl
+    {
+        label_chip(ui, name);
+    }
     get_block
+}
+
+/// A known address's label, as a small accent chip before the address.
+fn label_chip(ui: &mut Ui, name: &str) {
+    egui::Frame::new()
+        .fill(theme::ACCENT_DIM)
+        .corner_radius(3)
+        .inner_margin(Margin::symmetric(4, 1))
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new(name)
+                    .color(theme::ACCENT_BRIGHT)
+                    .size(theme::SMALL_FONT_SIZE),
+            );
+        })
+        .response
+        .on_hover_text("Known address (see Address Info for the source)");
+}
+
+fn address_request_id() -> egui::Id {
+    egui::Id::new("address_lookup_request")
+}
+
+/// Ask for the Address Info window for `address`, from any tab. The GUI frame loop picks
+/// it up with [`take_address_request`] and sends the lookup.
+pub fn request_address(ctx: &egui::Context, address: &str) {
+    ctx.data_mut(|d| d.insert_temp(address_request_id(), address.trim().to_string()));
+}
+
+/// The address requested this frame, if any.
+pub fn take_address_request(ctx: &egui::Context) -> Option<String> {
+    ctx.data_mut(|d| d.remove_temp::<String>(address_request_id()))
+}
+
+fn labels_id() -> egui::Id {
+    egui::Id::new("address_labels")
+}
+
+/// Make the app's labels available to [`address`] widgets anywhere; set once per frame.
+pub fn set_labels(ctx: &egui::Context, book: Arc<LabelBook>) {
+    ctx.data_mut(|d| d.insert_temp(labels_id(), book));
+}
+
+fn labels(ctx: &egui::Context) -> Option<Arc<LabelBook>> {
+    ctx.data(|d| d.get_temp(labels_id()))
 }
 
 /// `value` as plain text, fitted like [`fit_label`], followed by a copy icon.

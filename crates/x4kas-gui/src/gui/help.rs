@@ -6,7 +6,7 @@ use super::theme;
 use super::widgets::{modal_window, section_title};
 
 const SHORTCUTS: &[(&str, &str)] = &[
-    ("1 – 3", "Switch tab"),
+    ("1 – 4", "Switch tab"),
     ("Ctrl+Tab / Ctrl+Shift+Tab", "Next / previous tab"),
     ("P", "Pause / resume polling"),
     ("Ctrl+`", "Show / hide the terminal"),
@@ -24,6 +24,7 @@ pub fn show(ctx: &egui::Context, open: &mut bool) {
         ui.label(
             RichText::new(
                 "Click the connection status in the status bar to switch nodes. \
+                     Click any address for its info, history and watch settings. \
                      Shortcuts are ignored while a text field or the terminal has focus; \
                      click outside the terminal to leave it.",
             )

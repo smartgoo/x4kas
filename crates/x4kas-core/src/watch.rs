@@ -57,7 +57,6 @@ impl Default for AlertRules {
 #[serde(default)]
 pub struct WatchEntry {
     pub address: String,
-    pub name: Option<String>,
     pub network: String,
     pub enabled: bool,
     pub rules: AlertRules,
@@ -71,7 +70,6 @@ impl Default for WatchEntry {
     fn default() -> Self {
         Self {
             address: String::new(),
-            name: None,
             network: "mainnet".to_string(),
             enabled: true,
             rules: AlertRules::default(),
@@ -87,10 +85,6 @@ impl WatchEntry {
             network: network.to_string(),
             ..Default::default()
         }
-    }
-
-    pub fn display_name(&self) -> &str {
-        self.name.as_deref().unwrap_or(&self.address)
     }
 }
 

@@ -146,10 +146,6 @@ impl MonitoringTab {
                     .sum();
                 [
                     e.address.clone(),
-                    e.name
-                        .clone()
-                        .or_else(|| app.labels.name(&e.address).map(str::to_string))
-                        .unwrap_or_default(),
                     balance
                         .map(|b| format_kas(b as f64, 2))
                         .unwrap_or_else(|| "—".into()),
@@ -162,13 +158,7 @@ impl MonitoringTab {
         wide_table_with_lead(
             ui,
             "watchlist",
-            [
-                "Address",
-                "Name",
-                "Balance (KAS)",
-                "24h change",
-                "Last activity",
-            ],
+            ["Address", "Balance (KAS)", "24h change", "Last activity"],
             rows,
             "No watched addresses yet. Paste one above and press Watch.",
             address,
@@ -288,14 +278,8 @@ fn activity(ui: &mut Ui, app: &mut App, fill: bool) {
                 EventKind::Received => "+",
                 EventKind::Sent => "-",
             };
-            let name = app
-                .watch
-                .entry(&e.address)
-                .and_then(|w| w.name.clone())
-                .unwrap_or_default();
             [
                 e.address.clone(),
-                name,
                 format!("{sign}{}", format_kas(e.amount as f64, 8)),
                 if e.is_coinbase {
                     "coinbase".into()
@@ -328,7 +312,7 @@ fn activity(ui: &mut Ui, app: &mut App, fill: bool) {
     wide_table_with_lead(
         ui,
         "activity",
-        ["Address", "Name", "Amount (KAS)", "", "When"],
+        ["Address", "Amount (KAS)", "", "When"],
         rows,
         "No confirmed activity yet",
         address,

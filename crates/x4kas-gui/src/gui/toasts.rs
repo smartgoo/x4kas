@@ -58,11 +58,7 @@ impl Toasts {
             .show(ctx, |ui| {
                 ui.set_width(WIDTH);
                 for (i, (event, _)) in self.items.iter().enumerate() {
-                    let who = app
-                        .watch
-                        .entry(&event.address)
-                        .and_then(|w| w.name.clone())
-                        .or_else(|| app.labels.name(&event.address).map(str::to_string));
+                    let who = app.labels.name(&event.address);
                     egui::Frame::new()
                         .fill(theme::SURFACE_HI)
                         .stroke(Stroke::new(1.0_f32, theme::WARN))
@@ -72,7 +68,7 @@ impl Toasts {
                             ui.set_width(WIDTH - 16.0);
                             ui.horizontal(|ui| {
                                 ui.label(RichText::new("⚠").color(theme::WARN));
-                                let title = who.as_deref().unwrap_or("Watched address");
+                                let title = who.unwrap_or("Watched address");
                                 if ui
                                     .link(RichText::new(title).color(theme::TEXT_BRIGHT))
                                     .on_hover_text("Show address info")

@@ -166,8 +166,8 @@ impl AddressForms {
         });
     }
 
-    /// The watchlist entry for this address: on/off, name and alert rules (the body of
-    /// a "Watch" card).
+    /// The watchlist entry for this address: on/off and alert rules (the body of a
+    /// "Watch" card).
     pub fn watch_settings(&mut self, ui: &mut Ui, app: &App, addr: &str, cmd_tx: &CommandSender) {
         let watched = app.watch.entry(addr).is_some();
         let mut changed = false;
@@ -179,15 +179,6 @@ impl AddressForms {
                 return;
             }
             changed |= ui.checkbox(&mut self.watch.enabled, "Alerts on").changed();
-            ui.label(RichText::new("Name:").color(theme::LABEL));
-            let mut name = self.watch.name.clone().unwrap_or_default();
-            if ui
-                .add(TextEdit::singleline(&mut name).desired_width(160.0))
-                .lost_focus()
-            {
-                self.watch.name = Some(name.trim().to_string()).filter(|n| !n.is_empty());
-                changed = true;
-            }
             if ui.button("Remove").clicked() {
                 let mut list = app.watch.list.clone();
                 list.entries.retain(|e| e.address != addr);

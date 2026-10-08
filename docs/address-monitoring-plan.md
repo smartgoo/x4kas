@@ -424,8 +424,14 @@ Everything in Phases 0–5 is built, with these deviations from the proposal:
   whole retention window.
 - **Stats layout:** per-address stats and counterparties are slabbed too, so dropping
   a slab removes exactly its contribution; no lazy correction is needed.
-- **Peel chains** are not collapsed in the graph yet; a node's hop count and edge
-  amounts show them.
+- **Peel chains** are followed by outpoint (`index/peel.rs`), not by change score alone:
+  backwards through each link's spent `prev_txid`, forwards by finding the link-shaped
+  spend of either output; only the unspent last remainder is picked by its change score.
+  The flow graph folds any pass-through address (one flow in, one out), not just peel
+  links, into a dashed hop-counted edge; the fold is a toggle, on by default.
+- **Export** writes to `~/.x4kas/exports/` (no file dialog, so the CLI and a headless
+  server behave the same) and shows the path to copy; the CLI prints the same CSV/JSON
+  to stdout. Exports stop at 250,000 transactions.
 - **Alerts** are in-app (toasts over any tab, an unread count on the Addresses tab, the
   Alerts feed) and on the CLI's JSON stream; no OS notifications. The idle rule only
   fires once a previous activity is known (`last_activity_ms`, kept in the watchlist

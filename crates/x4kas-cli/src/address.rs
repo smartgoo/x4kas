@@ -6,6 +6,7 @@ use anyhow::{Result, anyhow};
 use clap::{Args, Subcommand};
 use serde::Serialize;
 
+use x4kas_core::index::export::{self, ExportFormat};
 use x4kas_core::index::query::{self, Cursor};
 use x4kas_core::index::{IndexStore, parse_hex};
 use x4kas_core::labels::LabelBook;
@@ -24,6 +25,13 @@ pub enum AddressCommand {
         /// Continue from a previous page's `next` cursor
         #[arg(short, long)]
         before: Option<Cursor>,
+        /// Every indexed transaction instead of one page (an export; at most 250,000 rows)
+        #[arg(long, conflicts_with = "before")]
+        all: bool,
+        /// Output format: json, or csv (one row per transaction; with a page, the `next`
+        /// cursor goes to stderr)
+        #[arg(long, default_value = "json")]
+        format: ExportFormat,
     },
     /// Who an address transacts with, by volume
     Peers {
@@ -51,6 +59,13 @@ pub enum AddressCommand {
         /// Counterparties followed per address
         #[arg(long, default_value = "12")]
         top: usize,
+        /// Fold addresses that only pass money on (peel chains) into one edge each,
+        /// listing them in `via`
+        #[arg(long)]
+        collapse: bool,
+        /// Output format: json (nodes and edges), or csv (one row per edge, with labels)
+        #[arg(long, default_value = "json")]
+        format: ExportFormat,
     },
     /// A stored transaction with its addresses resolved
     Tx {
@@ -104,12 +119,31 @@ pub fn run(network: &str, cmd: AddressCommand) -> Result<()> {
             address,
             limit,
             before,
+            all,
+            format,
         } => {
             let id = known(&store, &address.address)?;
-            to_json(&Txs {
-                address: address.address,
-                page: query::transactions(&store, id, before, limit)?,
-            })?
+            let page = if all {
+                query::Page {
+                    items: export::all_transactions(&store, id, export::EXPORT_MAX_ROWS)?,
+                    next: None,
+                }
+            } else {
+                query::transactions(&store, id, before, limit)?
+            };
+            match format {
+                ExportFormat::Json => to_json(&Txs {
+                    address: address.address,
+                    page,
+                })?,
+                ExportFormat::Csv => {
+                    if let Some(next) = page.next {
+                        eprintln!("next: {next}");
+                    }
+                    let csv = export::transactions_csv(&address.address, &page.items);
+                    csv.trim_end_matches('\n').to_string()
+                }
+            }
         }
         AddressCommand::Peers { address, top } => {
             let id = known(&store, &address.address)?;
@@ -123,9 +157,24 @@ pub fn run(network: &str, cmd: AddressCommand) -> Result<()> {
             let labels = LabelBook::load();
             to_json(&query::cluster(&store, &labels, id, limit)?)?
         }
-        AddressCommand::Flows { address, hops, top } => {
+        AddressCommand::Flows {
+            address,
+            hops,
+            top,
+            collapse,
+            format,
+        } => {
             let id = known(&store, &address.address)?;
-            to_json(&query::flows(&store, &[id], hops, top)?)?
+            let mut graph = query::flows(&store, &[id], hops, top)?;
+            if collapse {
+                graph = graph.collapse_chains();
+            }
+            match format {
+                ExportFormat::Json => to_json(&graph)?,
+                ExportFormat::Csv => export::flows_csv(&graph, &LabelBook::load())
+                    .trim_end_matches('\n')
+                    .to_string(),
+            }
         }
         AddressCommand::Tx { txid } => {
             let txid = parse_hex(&txid).ok_or_else(|| anyhow!("txid must be 64 hex chars"))?;
@@ -159,4 +208,84 @@ fn known(store: &IndexStore, address: &str) -> Result<u32> {
 
 fn to_json<T: Serialize>(value: &T) -> Result<String> {
     Ok(serde_json::to_string_pretty(value)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+    use crate::{Args, Command};
+
+    fn address_command(args: &[&str]) -> AddressCommand {
+        let args = Args::try_parse_from(["x4kas-cli", "address"].iter().chain(args)).unwrap();
+        match args.command {
+            Command::Address { cmd } => cmd,
+            other => panic!("not an address command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn txs_takes_a_format_and_all() {
+        let cmd = address_command(&["txs", "kaspa:qq1", "--all", "--format", "csv"]);
+        let AddressCommand::Txs {
+            all, format, limit, ..
+        } = cmd
+        else {
+            panic!("{cmd:?}");
+        };
+        assert!(all);
+        assert_eq!(format, ExportFormat::Csv);
+        assert_eq!(limit, 50);
+        // Paging and --all contradict each other; unknown formats are refused.
+        assert!(
+            Args::try_parse_from([
+                "x4kas-cli",
+                "address",
+                "txs",
+                "kaspa:qq1",
+                "--all",
+                "--before",
+                "5:00"
+            ])
+            .is_err()
+        );
+        assert!(
+            Args::try_parse_from([
+                "x4kas-cli",
+                "address",
+                "txs",
+                "kaspa:qq1",
+                "--format",
+                "xml"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn flows_defaults_to_json_without_collapsing() {
+        let cmd = address_command(&["flows", "kaspa:qq1"]);
+        let AddressCommand::Flows {
+            collapse,
+            format,
+            hops,
+            ..
+        } = cmd
+        else {
+            panic!("{cmd:?}");
+        };
+        assert!(!collapse);
+        assert_eq!(format, ExportFormat::Json);
+        assert_eq!(hops, 2);
+        let cmd = address_command(&["flows", "kaspa:qq1", "--collapse", "--format", "CSV"]);
+        assert!(matches!(
+            cmd,
+            AddressCommand::Flows {
+                collapse: true,
+                format: ExportFormat::Csv,
+                ..
+            }
+        ));
+    }
 }

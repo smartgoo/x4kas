@@ -12,6 +12,8 @@
 //! called inside `spawn_blocking`. Nothing here touches the GUI thread.
 
 pub mod cluster;
+pub mod export;
+pub mod peel;
 pub mod query;
 pub mod records;
 pub mod task;

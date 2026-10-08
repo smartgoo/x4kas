@@ -7,11 +7,13 @@ use std::collections::HashMap;
 
 use eframe::egui::{self, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2, pos2, vec2};
 
+use super::address::export_status;
 use super::theme;
-use super::widgets::{modal_window, placeholder, request_address};
+use super::widgets::{address, modal_window, placeholder, request_address};
 use x4kas_core::app::App;
-use x4kas_core::controller::{CommandSender, UiCommand};
+use x4kas_core::controller::{CommandSender, ExportRequest, UiCommand};
 use x4kas_core::format::{format_kas, shorten_middle};
+use x4kas_core::index::export::ExportFormat;
 use x4kas_core::index::query::FlowGraph;
 use x4kas_core::index::records::AddrId;
 
@@ -49,6 +51,7 @@ impl FlowWindowUi {
     }
 
     fn contents(&mut self, ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
+        let mut collapse = app.address.flows.collapse;
         let flows = &app.address.flows;
         ui.horizontal(|ui| {
             if flows.loading {
@@ -58,24 +61,55 @@ impl FlowWindowUi {
                 ui.label(
                     RichText::new(format!(
                         "{} addresses, {} flows. Click a node to expand it, right-click for its info, drag to arrange.",
-                        flows.graph.nodes.len(),
-                        flows.graph.edges.len()
+                        flows.shown().nodes.len(),
+                        flows.shown().edges.len()
                     ))
                     .weak(),
                 );
             }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                for format in [ExportFormat::Json, ExportFormat::Csv] {
+                    if ui
+                        .add_enabled(
+                            !flows.shown().edges.is_empty(),
+                            egui::Button::new(format.extension().to_ascii_uppercase()).small(),
+                        )
+                        .on_hover_text(format!(
+                            "Export the graph as shown as {} to ~/.x4kas/exports",
+                            format.extension().to_ascii_uppercase()
+                        ))
+                        .clicked()
+                    {
+                        let _ = cmd_tx.send(UiCommand::Export(ExportRequest::Flows {
+                            graph: flows.shown().clone(),
+                            roots: flows.roots.clone(),
+                            format,
+                        }));
+                    }
+                }
+                ui.label(RichText::new("Export").weak().small());
+                ui.separator();
+                ui.checkbox(&mut collapse, "Collapse chains")
+                    .on_hover_text(
+                        "Fold addresses that only pass money on (one flow in, one out), such \
+                         as peel chains, into a single dashed arrow with a hop count",
+                    );
+            });
         });
         if let Some(ref err) = flows.error {
             ui.label(RichText::new(err).color(theme::ERROR));
         }
-        if flows.graph.nodes.is_empty() {
+        export_status(ui, &app.address.export);
+        let flows = &mut app.address.flows;
+        flows.collapse = collapse;
+        if flows.shown().nodes.is_empty() {
             if !flows.loading {
                 placeholder(ui, "Nothing indexed for this address yet");
             }
             return;
         }
 
-        let graph = flows.graph.clone();
+        let graph = flows.shown().clone();
         let roots = flows.roots.clone();
         let labels = app.labels.clone();
         let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
@@ -119,7 +153,19 @@ impl FlowWindowUi {
                 theme::DAG_EDGE
             };
             let width = if hovered { 2.0_f32 } else { 1.0_f32 };
-            painter.line_segment([start, end], Stroke::new(width, color));
+            let stroke = Stroke::new(width, color);
+            if edge.via.is_empty() {
+                painter.line_segment([start, end], stroke);
+            } else {
+                painter.add(egui::Shape::dashed_line(&[start, end], stroke, 6.0, 4.0));
+                painter.text(
+                    (start + end.to_vec2()) / 2.0 + vec2(0.0, 4.0),
+                    egui::Align2::CENTER_TOP,
+                    format!("{} hops", edge.hops()),
+                    egui::FontId::monospace(theme::SMALL_FONT_SIZE),
+                    theme::TEXT_DIM,
+                );
+            }
             let side = dir.rot90();
             painter.add(egui::Shape::convex_polygon(
                 vec![
@@ -142,6 +188,21 @@ impl FlowWindowUi {
                     egui::FontId::monospace(theme::SMALL_FONT_SIZE),
                     theme::TEXT_BRIGHT,
                 );
+                if !edge.via.is_empty() {
+                    response.clone().on_hover_ui_at_pointer(|ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "Passes through {} address{}",
+                                edge.via.len(),
+                                if edge.via.len() == 1 { "" } else { "es" }
+                            ))
+                            .weak(),
+                        );
+                        for via in &edge.via {
+                            address(ui, via);
+                        }
+                    });
+                }
             }
         }
 

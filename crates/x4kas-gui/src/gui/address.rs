@@ -11,12 +11,13 @@ use super::widgets::{
     address, block_hash, copy_value, is_testnet, kv, kv_columns, kv_grid, kv_with, modal_window,
     or_dash, placeholder, primary_button, section_title, subheader,
 };
-use x4kas_core::app::{AddressView, AddressWindow, App};
-use x4kas_core::controller::{CommandSender, UiCommand};
+use x4kas_core::app::{AddressView, AddressWindow, App, ExportStatus};
+use x4kas_core::controller::{CommandSender, ExportRequest, UiCommand};
 use x4kas_core::format::{
     explorer_address_url, format_duration, format_kas, format_number, kaspa_stream_address_url,
     now_ms,
 };
+use x4kas_core::index::export::ExportFormat;
 use x4kas_core::index::query::TxRow;
 use x4kas_core::labels::LabelSource;
 use x4kas_core::watch::{AlertRules, WatchEntry};
@@ -112,8 +113,10 @@ impl AddressWindowUi {
                 transactions(left, &window.address, view, window.loading_more, cmd_tx);
                 counterparties(right, view);
             });
+            export_status(ui, &app.address.export);
             ui.add_space(6.0);
             cluster(ui, view);
+            peel_chain(ui, view);
             ui.add_space(6.0);
             if ui
                 .add(primary_button("Open flow graph"))
@@ -410,7 +413,30 @@ fn transactions(
     loading_more: bool,
     cmd_tx: &CommandSender,
 ) {
-    subheader(ui, "Transactions (newest first)");
+    ui.horizontal(|ui| {
+        subheader(ui, "Transactions (newest first)");
+        if view.page.items.is_empty() {
+            return;
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            for format in [ExportFormat::Json, ExportFormat::Csv] {
+                if ui
+                    .small_button(format.extension().to_ascii_uppercase())
+                    .on_hover_text(format!(
+                        "Export every indexed transaction as {} to ~/.x4kas/exports",
+                        format.extension().to_ascii_uppercase()
+                    ))
+                    .clicked()
+                {
+                    let _ = cmd_tx.send(UiCommand::Export(ExportRequest::Transactions {
+                        address: addr.to_string(),
+                        format,
+                    }));
+                }
+            }
+            ui.label(RichText::new("Export").weak().small());
+        });
+    });
     let rows: &[TxRow] = &view.page.items;
     if rows.is_empty() {
         placeholder(ui, "No indexed transactions");
@@ -529,6 +555,84 @@ fn cluster(ui: &mut Ui, view: &AddressView) {
             .small(),
         );
     }
+}
+
+/// The outcome of the last export, if any: a spinner, the file written or the error.
+pub(super) fn export_status(ui: &mut Ui, status: &ExportStatus) {
+    if status.running {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label(RichText::new("Exporting…").weak());
+        });
+        return;
+    }
+    match &status.last {
+        Some(Ok(path)) => {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Saved").color(theme::OK));
+                copy_value(ui, &path.display().to_string(), "Copy path");
+            });
+        }
+        Some(Err(e)) => {
+            ui.label(RichText::new(format!("Export failed: {e}")).color(theme::ERROR));
+        }
+        None => {}
+    }
+}
+
+/// The peel chain the address is a link of: its position, and what each spend peeled
+/// off and carried on.
+fn peel_chain(ui: &mut Ui, view: &AddressView) {
+    let Some(chain) = &view.profile.peel_chain else {
+        return;
+    };
+    ui.add_space(6.0);
+    subheader(ui, "Peel chain");
+    let carried = chain.links.last().map(|l| l.carried).unwrap_or(0);
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(format!("Link {} of {}", chain.position, chain.len() + 1))
+                .color(theme::WARN),
+        )
+        .on_hover_text(
+            "A run of single-input, two-output spends, each spending the previous one's \
+             remainder and paying a slice off to the side. The index follows it as far as \
+             it holds both ends.",
+        );
+        ui.label(
+            RichText::new(format!(
+                "{} spends · {} KAS peeled off · {} KAS carried at the end",
+                chain.len(),
+                format_kas(chain.peeled_total as f64, 2),
+                format_kas(carried as f64, 2)
+            ))
+            .weak()
+            .small(),
+        );
+    });
+    egui::ScrollArea::vertical()
+        .id_salt("peel_links")
+        .max_height(120.0)
+        .show(ui, |ui| {
+            kv_grid(ui, "peel_links", |ui| {
+                for (i, link) in chain.links.iter().enumerate() {
+                    let label = format!(
+                        "{}. {} KAS peeled to",
+                        i + 1,
+                        format_kas(link.peeled as f64, 2)
+                    );
+                    kv_with(ui, &label, |ui| {
+                        address(ui, &link.peeled_to);
+                        ui.label(
+                            RichText::new(format!("{} KAS on", format_kas(link.carried as f64, 2)))
+                                .weak()
+                                .small(),
+                        )
+                        .on_hover_text(format!("txid {}", link.txid));
+                    });
+                }
+            });
+        });
 }
 
 fn counterparties(ui: &mut Ui, view: &AddressView) {

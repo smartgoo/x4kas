@@ -2,6 +2,7 @@
 //! commands sent from the frontend.
 
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use std::time::Duration;
@@ -12,7 +13,8 @@ use tokio::sync::{RwLock, mpsc, oneshot};
 use crate::analytics_streaming;
 use crate::app::{ActiveConnection, AddressView, App, ConnectionStatus, IndexPhase};
 use crate::chain_stream::{self, StreamStart};
-use crate::index::query::{self, Cursor};
+use crate::index::export::{self, ExportFormat};
+use crate::index::query::{self, Cursor, FlowGraph};
 use crate::index::{self, IndexStore};
 use crate::labels;
 use crate::polling::{PollingHandles, create_and_start_rpc, start_hashrate_polling};
@@ -46,6 +48,9 @@ pub enum UiCommand {
     /// Expand the flow graph from `address` by `hops` counterparties (merged into
     /// `app.address.flows`).
     AddressFlows { address: String, hops: u8 },
+    /// Write an export under `~/.x4kas/exports/`; the outcome lands in
+    /// `app.address.export`.
+    Export(ExportRequest),
     /// Replace the watchlist: saved to disk, then the subscription restarts.
     WatchSet(Watchlist),
     /// Set (or with `None` remove) the user's label for an address.
@@ -64,6 +69,22 @@ pub enum UiCommand {
 }
 
 pub type CommandSender = mpsc::UnboundedSender<UiCommand>;
+
+/// What `UiCommand::Export` writes.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExportRequest {
+    /// Every indexed transaction of an address (up to `export::EXPORT_MAX_ROWS`).
+    Transactions {
+        address: String,
+        format: ExportFormat,
+    },
+    /// A flow graph as the frontend shows it (collapsed or not), named after its roots.
+    Flows {
+        graph: FlowGraph,
+        roots: Vec<String>,
+        format: ExportFormat,
+    },
+}
 
 /// A node reached over the network: a wRPC URL or the public resolver.
 #[derive(Debug, Clone, PartialEq)]
@@ -134,6 +155,7 @@ impl Controller {
                 UiCommand::LookupAddress(address) => self.lookup_address(address).await,
                 UiCommand::AddressPage { address, before } => self.address_page(address, before),
                 UiCommand::AddressFlows { address, hops } => self.address_flows(address, hops),
+                UiCommand::Export(request) => self.export(request).await,
                 UiCommand::WatchSet(list) => self.set_watchlist(list).await,
                 UiCommand::SetLabel { address, name } => self.set_label(address, name).await,
                 UiCommand::RefreshLabels => self.refresh_labels(),
@@ -427,6 +449,60 @@ impl Controller {
                     .set_result(result.map_err(|e| format!("{e:#}")));
             },
         );
+    }
+
+    /// Write the export in a blocking task (the store and the disk are synchronous).
+    async fn export(&mut self, request: ExportRequest) {
+        let store = self.index.clone();
+        let labels = {
+            let mut app = self.app.write().await;
+            app.address.export.start();
+            app.mark_dirty();
+            app.labels.clone()
+        };
+        let app = self.app.clone();
+        self.polling.spawn_request(async move {
+            let result = tokio::task::spawn_blocking(move || -> Result<PathBuf> {
+                let (path, contents) = match request {
+                    ExportRequest::Transactions { address, format } => {
+                        let store = store.ok_or_else(|| anyhow!("no address index"))?;
+                        let id = store
+                            .lookup(&address)?
+                            .ok_or_else(|| anyhow!("address not seen in the indexed window"))?;
+                        let rows = export::all_transactions(&store, id, export::EXPORT_MAX_ROWS)?;
+                        let stem = format!("{}-txs", export::address_stem(&address));
+                        let contents = match format {
+                            ExportFormat::Csv => export::transactions_csv(&address, &rows),
+                            ExportFormat::Json => export::transactions_json(&address, &rows)?,
+                        };
+                        (export::export_path(&stem, format), contents)
+                    }
+                    ExportRequest::Flows {
+                        graph,
+                        roots,
+                        format,
+                    } => {
+                        let root = roots.first().map(String::as_str).unwrap_or("flows");
+                        let stem = format!("{}-flows", export::address_stem(root));
+                        let contents = match format {
+                            ExportFormat::Csv => export::flows_csv(&graph, &labels),
+                            ExportFormat::Json => export::flows_json(&graph)?,
+                        };
+                        (export::export_path(&stem, format), contents)
+                    }
+                };
+                export::write(&path, &contents)?;
+                Ok(path)
+            })
+            .await
+            .map_err(|e| anyhow!("export task: {e}"))
+            .and_then(|r| r);
+            let mut app = app.write().await;
+            app.address
+                .export
+                .finish(result.map_err(|e| format!("{e:#}")));
+            app.mark_dirty();
+        });
     }
 
     /// Save the new watchlist and restart the subscription with it.

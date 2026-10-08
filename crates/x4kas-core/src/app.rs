@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -674,14 +675,34 @@ pub struct AddressView {
 }
 
 /// The flow graph window: money followed hop by hop from one or more addresses.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FlowState {
     pub open: bool,
     /// The addresses the graph was started from.
     pub roots: Vec<String>,
+    /// Everything fetched so far.
     pub graph: FlowGraph,
+    /// `graph` with pass-through chains folded (`FlowGraph::collapse_chains`), kept in
+    /// step with it.
+    pub collapsed: FlowGraph,
+    /// Show `collapsed` rather than `graph`.
+    pub collapse: bool,
     pub loading: bool,
     pub error: Option<String>,
+}
+
+impl Default for FlowState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            roots: Vec::new(),
+            graph: FlowGraph::default(),
+            collapsed: FlowGraph::default(),
+            collapse: true,
+            loading: false,
+            error: None,
+        }
+    }
 }
 
 impl FlowState {
@@ -690,6 +711,7 @@ impl FlowState {
         self.open = true;
         self.roots = vec![address];
         self.graph = FlowGraph::default();
+        self.collapsed = FlowGraph::default();
         self.loading = true;
         self.error = None;
     }
@@ -697,13 +719,49 @@ impl FlowState {
     pub fn set_result(&mut self, result: Result<FlowGraph, String>) {
         self.loading = false;
         match result {
-            Ok(graph) => self.graph.merge(graph),
+            Ok(graph) => {
+                self.graph.merge(graph);
+                self.collapsed = self.graph.collapse_chains();
+            }
             Err(e) => self.error = Some(e),
         }
     }
 
+    /// The graph to draw or export, per `collapse`.
+    pub fn shown(&self) -> &FlowGraph {
+        if self.collapse {
+            &self.collapsed
+        } else {
+            &self.graph
+        }
+    }
+
     pub fn close(&mut self) {
-        *self = Self::default();
+        let collapse = self.collapse;
+        *self = Self {
+            collapse,
+            ..Self::default()
+        };
+    }
+}
+
+/// The last export (`UiCommand::Export`) from the Address Info or flow graph window.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ExportStatus {
+    pub running: bool,
+    /// The file written, or why not.
+    pub last: Option<Result<PathBuf, String>>,
+}
+
+impl ExportStatus {
+    pub fn start(&mut self) {
+        self.running = true;
+        self.last = None;
+    }
+
+    pub fn finish(&mut self, result: Result<PathBuf, String>) {
+        self.running = false;
+        self.last = Some(result);
     }
 }
 
@@ -723,6 +781,7 @@ pub struct AddressWindow {
 pub struct AddressState {
     pub open: Option<AddressWindow>,
     pub flows: FlowState,
+    pub export: ExportStatus,
 }
 
 impl AddressState {
@@ -856,6 +915,7 @@ impl App {
         self.watch.clear_node_data();
         self.address.close();
         self.address.flows.close();
+        self.address.export = ExportStatus::default();
         self.mempool_open = None;
         self.dag_selection.set_detail(None);
         self.dag_selection.block_loading = false;

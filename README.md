@@ -16,7 +16,9 @@ Built with [egui/eframe](https://github.com/emilk/egui) and [rusty-kaspa](https:
 - **Addresses**: a watchlist with live balances, pending mempool activity, 24h change, confirmed events and rule-based alerts (any activity, received/sent thresholds, balance crossings, first activity after N hours idle), fed by the node's `UtxosChanged` notifications; alerts pop up as toasts on any tab and count on the Addresses tab until seen; works through the resolver too when the node has `--utxoindex`
   - **Address Info** from any address in the app: label, balance, balance history, transactions, counterparties, the likely-owner cluster and watch settings, backed by a local address index of the node's retention window (direct node only; see below)
   - **Clustering**: addresses that spend together, and probable change outputs, are grouped into likely owners (with guards against merging labelled entities, L2 bridges and covenant contracts, and a size cap), so an exchange's many deposit addresses read as one
-  - **Flow graph**: follow the money hop by hop from any address; click a node to expand it
+  - **Flow graph**: follow the money hop by hop from any address; click a node to expand it, fold pass-through chains (peel chains) into one hop-counted edge, export the graph as CSV or JSON
+  - **Peel chains**: Address Info shows which link of a chain of single-input, two-output spends an address is, with what each spend peeled off
+  - **Export**: an address's indexed transactions and any flow graph as CSV or JSON, under `~/.x4kas/exports/`
   - **Labels** from the public api.kaspa.org list (exchanges, pools, funds, bridges; bundled and refreshed daily) and your own, shown as chips wherever an address appears; opt-in per-address lookups on kas.fyi (API key, with the entity's link and categories) and KNS `.kas` names; pools that mine many blocks are labelled from their coinbase tags as the chain streams in
 - **Mempool**: live transaction table; click a row for details
 - **RPC Cmds**: run any of 36 read-only RPC methods (with argument forms for those that take a hash, address or number) and inspect formatted responses
@@ -104,11 +106,13 @@ The GUI builds a local **address index** of everything the node still serves (it
 ```bash
 x4kas-cli index run --url ws://127.0.0.1:17110 --backfill-hours 0   # keep indexing until Ctrl+C (0 = everything the node has)
 x4kas-cli index status
-x4kas-cli address profile kaspa:qq…        # totals over the indexed window
+x4kas-cli address profile kaspa:qq…        # totals over the indexed window, cluster size, peel chain if any
 x4kas-cli address txs kaspa:qq… --limit 50 # newest first; pass `next` back as --before for the next page
+x4kas-cli address txs kaspa:qq… --all --format csv > txs.csv   # every indexed transaction as CSV
 x4kas-cli address peers kaspa:qq… --top 20 # counterparties by volume
 x4kas-cli address cluster kaspa:qq…        # likely-owner cluster and a sample of members
 x4kas-cli address flows kaspa:qq… --hops 2 # follow the money as a graph (nodes and edges)
+x4kas-cli address flows kaspa:qq… --collapse --format csv       # pass-through chains folded, one row per edge
 x4kas-cli address balance kaspa:qq… --now <sompi>   # balance history from the index's deltas
 x4kas-cli address tx <txid>
 x4kas-cli watch kaspa:qq… kaspa:qz… --balances      # one JSON line per confirmed change and alert (needs --utxoindex on the node)

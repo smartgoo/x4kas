@@ -2,7 +2,7 @@
 //! balance history. Plain structs, serializable for the CLI. Synchronous; call inside
 //! `spawn_blocking` from async code.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::str::FromStr;
 
@@ -10,6 +10,7 @@ use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
 use super::cluster;
+use super::peel::{self, PeelChain};
 use super::records::{
     AddrId, AddrStats, Hash32, IndexedTx, PeerStats, addr_key, addr_tx_key, decode, decode_delta,
     parse_addr_tx_key, parse_peer_key,
@@ -29,6 +30,9 @@ pub struct AddressProfile {
     pub coverage: Option<(u64, u64)>,
     /// Addresses in the same likely-owner cluster, this one included.
     pub cluster_size: u32,
+    /// The peel chain this address is a link of, if any (`peel::peel_chain`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peel_chain: Option<PeelChain>,
 }
 
 /// An address's likely-owner cluster.
@@ -155,8 +159,20 @@ pub struct FlowNode {
 pub struct FlowEdge {
     pub from: AddrId,
     pub to: AddrId,
+    /// Sompi; over a collapsed chain, the least any link carried.
     pub amount: u64,
     pub tx_count: u64,
+    /// The pass-through addresses a collapsed edge skips, in order
+    /// (`FlowGraph::collapse_chains`); empty for a direct flow.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub via: Vec<String>,
+}
+
+impl FlowEdge {
+    /// Direct flows this edge stands for: 1, or more for a collapsed chain.
+    pub fn hops(&self) -> usize {
+        self.via.len() + 1
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -196,6 +212,91 @@ impl FlowGraph {
                 .map(|e| e.amount)
                 .sum();
         }
+    }
+
+    /// The same graph with every chain of pass-through addresses (one flow in, one flow
+    /// out, not a root) folded into a single edge that lists them in `FlowEdge::via`:
+    /// a peel chain or any other relay shows as one hop-counted arrow.
+    pub fn collapse_chains(&self) -> FlowGraph {
+        let roots: HashSet<AddrId> = self
+            .nodes
+            .iter()
+            .filter(|n| n.hop == 0)
+            .map(|n| n.id)
+            .collect();
+        let mut ins: HashMap<AddrId, Vec<usize>> = HashMap::new();
+        let mut outs: HashMap<AddrId, Vec<usize>> = HashMap::new();
+        for (i, e) in self.edges.iter().enumerate() {
+            ins.entry(e.to).or_default().push(i);
+            outs.entry(e.from).or_default().push(i);
+        }
+        let pass_through = |id: AddrId| -> bool {
+            if roots.contains(&id) {
+                return false;
+            }
+            match (ins.get(&id), outs.get(&id)) {
+                (Some(i), Some(o)) if i.len() == 1 && o.len() == 1 => {
+                    let (into, out) = (&self.edges[i[0]], &self.edges[o[0]]);
+                    into.from != id && out.to != id && into.from != out.to
+                }
+                _ => false,
+            }
+        };
+        let name = |id: AddrId| -> String {
+            self.nodes
+                .iter()
+                .find(|n| n.id == id)
+                .map(|n| n.address.clone())
+                .unwrap_or_default()
+        };
+        let mut used = vec![false; self.edges.len()];
+        let mut edges = Vec::with_capacity(self.edges.len());
+        for (i, first) in self.edges.iter().enumerate() {
+            if used[i] || pass_through(first.from) {
+                continue;
+            }
+            used[i] = true;
+            let mut last = first;
+            let mut via = Vec::new();
+            let (mut amount, mut tx_count) = (first.amount, first.tx_count);
+            while pass_through(last.to) {
+                let next = outs[&last.to][0];
+                if used[next] {
+                    break;
+                }
+                used[next] = true;
+                via.push(name(last.to));
+                last = &self.edges[next];
+                amount = amount.min(last.amount);
+                tx_count = tx_count.min(last.tx_count);
+            }
+            edges.push(FlowEdge {
+                from: first.from,
+                to: last.to,
+                amount,
+                tx_count,
+                via,
+            });
+        }
+        // Rings of pass-through addresses have no head to start from; keep them as is.
+        for (i, e) in self.edges.iter().enumerate() {
+            if !used[i] {
+                edges.push(e.clone());
+            }
+        }
+        let kept: HashSet<AddrId> = edges.iter().flat_map(|e| [e.from, e.to]).collect();
+        let mut graph = FlowGraph {
+            nodes: self
+                .nodes
+                .iter()
+                .filter(|n| kept.contains(&n.id) || !pass_through(n.id))
+                .cloned()
+                .collect(),
+            edges,
+        };
+        graph.edges.sort_by_key(|e| (e.from, e.to));
+        graph.recount();
+        graph
     }
 }
 
@@ -250,6 +351,7 @@ pub fn flows(store: &IndexStore, roots: &[AddrId], hops: u8, top: usize) -> Resu
             to,
             amount,
             tx_count,
+            via: Vec::new(),
         })
         .collect();
     graph.edges.sort_by_key(|e| (e.from, e.to));
@@ -270,12 +372,13 @@ pub fn stats(store: &IndexStore, id: AddrId) -> Result<AddrStats> {
 
 pub fn profile(store: &IndexStore, address: &str) -> Result<AddressProfile> {
     let id = store.lookup(address)?;
-    let (stats, cluster_size) = match id {
+    let (stats, cluster_size, peel_chain) = match id {
         Some(id) => (
             stats(store, id)?,
             cluster::size_of(store.clusters(), cluster::root_of(store.clusters(), id)?)?,
+            peel::peel_chain(store, id)?,
         ),
-        None => (AddrStats::default(), 0),
+        None => (AddrStats::default(), 0, None),
     };
     Ok(AddressProfile {
         address: address.to_string(),
@@ -283,6 +386,7 @@ pub fn profile(store: &IndexStore, address: &str) -> Result<AddressProfile> {
         stats,
         coverage: store.coverage(),
         cluster_size,
+        peel_chain,
     })
 }
 
@@ -491,6 +595,71 @@ mod tests {
         };
         assert_eq!(c.to_string().parse::<Cursor>().unwrap(), c);
         assert!("nope".parse::<Cursor>().is_err());
+    }
+
+    fn node(id: AddrId, hop: u8) -> FlowNode {
+        FlowNode {
+            id,
+            address: format!("kaspa:{id}"),
+            volume: 0,
+            hop,
+        }
+    }
+
+    fn edge(from: AddrId, to: AddrId, amount: u64) -> FlowEdge {
+        FlowEdge {
+            from,
+            to,
+            amount,
+            tx_count: 1,
+            via: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn collapse_folds_pass_through_chains_into_one_edge() {
+        // Root 1 → 2 → 3 → 4, and 1 → 5 directly; 4 also pays 6 and 7, so it stays.
+        let mut graph = FlowGraph {
+            nodes: vec![
+                node(1, 0),
+                node(2, 1),
+                node(3, 2),
+                node(4, 3),
+                node(5, 1),
+                node(6, 4),
+                node(7, 4),
+            ],
+            edges: vec![
+                edge(1, 2, 100),
+                edge(2, 3, 90),
+                edge(3, 4, 80),
+                edge(1, 5, 7),
+                edge(4, 6, 40),
+                edge(4, 7, 30),
+            ],
+        };
+        graph.recount();
+        let c = graph.collapse_chains();
+        let ids: Vec<AddrId> = c.nodes.iter().map(|n| n.id).collect();
+        assert_eq!(ids, vec![1, 4, 5, 6, 7]);
+        let chain = c.edges.iter().find(|e| e.from == 1 && e.to == 4).unwrap();
+        assert_eq!(chain.via, vec!["kaspa:2", "kaspa:3"]);
+        assert_eq!((chain.hops(), chain.amount), (3, 80));
+        assert_eq!(c.edges.len(), 4);
+        assert!(c.edges.iter().all(|e| e.via.is_empty() || e.to == 4));
+        // Volumes follow the collapsed edges.
+        assert_eq!(c.nodes[0].volume, 87);
+
+        // A root is never folded, even in the middle of a chain, and a two-way pair isn't a chain.
+        let mut graph = FlowGraph {
+            nodes: vec![node(1, 1), node(2, 0), node(3, 1), node(4, 2)],
+            edges: vec![edge(1, 2, 5), edge(2, 3, 5), edge(3, 4, 5), edge(4, 3, 5)],
+        };
+        graph.recount();
+        let c = graph.collapse_chains();
+        assert_eq!(c.nodes.len(), 4);
+        assert_eq!(c.edges.len(), 4);
+        assert!(c.edges.iter().all(|e| e.via.is_empty()));
     }
 
     #[test]

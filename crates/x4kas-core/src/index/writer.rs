@@ -641,6 +641,15 @@ pub(crate) mod testing {
         }
     }
 
+    /// Point input `i` of `tx` at output `index` of the synthetic transaction `prev`
+    /// (by default inputs spend unrelated outpoints).
+    pub fn with_outpoint(tx: &mut RpcOptionalTransaction, i: usize, prev: u64, index: u32) {
+        tx.inputs[i].previous_outpoint = Some(RpcOptionalTransactionOutpoint {
+            transaction_id: Some(hash(prev)),
+            index: Some(index),
+        });
+    }
+
     pub fn chain_block(
         n: u64,
         time_ms: u64,

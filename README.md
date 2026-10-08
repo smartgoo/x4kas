@@ -1,4 +1,8 @@
-# x4kas - Kaspa Node Monitor
+# x4kas - Kaspa Terminal
+
+A Bloomberg Terminal inspired all-in-one Kaspa desktop app.
+
+An amalgamation of (probably far) too much in one monorepo.
 
 A native desktop app for monitoring Kaspa L1 nodes via wRPC, connecting to a node by URL or through the public resolver, plus a command-line tool (`x4kas-cli`) for scripts and AI agents.
 

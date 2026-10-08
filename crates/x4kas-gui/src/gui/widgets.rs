@@ -567,14 +567,16 @@ fn linked_value(ui: &mut Ui, value: &str, kind: LinkKind, selected: bool, chip: 
         label_slot(ui, id, value, label.as_ref());
     }
 
-    // Leave room for the label's padding, the copy icon and the chip that follows.
+    // Leave room for the label's padding, the copy icon and the chip that follows. The
+    // padding already separates the text from the icon, so the gap only tops it up.
     let padding = 2.0 * ui.spacing().button_padding.x;
+    let gap = (COPY_ICON_GAP - ui.spacing().button_padding.x).max(0.0);
     let chip_room = if chip && !rtl {
         label_slot_width(ui, id, label.as_ref())
     } else {
         0.0
     };
-    let room = ui.available_width() - padding - COPY_ICON_SIZE - COPY_ICON_GAP - chip_room;
+    let room = ui.available_width() - padding - COPY_ICON_WIDTH - gap - chip_room;
     let shown = fit_text(ui, value, room);
 
     if rtl {
@@ -585,7 +587,7 @@ fn linked_value(ui: &mut Ui, value: &str, kind: LinkKind, selected: bool, chip: 
     // their menu is open.
     let context_id = id.with("context");
     let menu_open = egui::Popup::is_id_open(ui.ctx(), context_id);
-    let response = icon_gap(ui, rtl, |ui| {
+    let response = icon_gap(ui, rtl, gap, |ui| {
         ui.selectable_label(selected || menu_open, shown.as_str())
     })
     .on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -645,7 +647,7 @@ fn linked_value(ui: &mut Ui, value: &str, kind: LinkKind, selected: bool, chip: 
     }
 
     if !rtl {
-        icon_gap(ui, true, |ui| copy_button(ui, id, value, copy_hint));
+        icon_gap(ui, true, gap, |ui| copy_button(ui, id, value, copy_hint));
         if chip {
             label_slot(ui, id, value, label.as_ref());
         }
@@ -864,28 +866,30 @@ pub fn copy_value(ui: &mut Ui, value: &str, hint: &str) {
         - if rtl {
             0.0
         } else {
-            COPY_ICON_SIZE + COPY_ICON_GAP
+            COPY_ICON_WIDTH + COPY_ICON_GAP
         };
     let shown = fit_text(ui, value, room);
-    let label = icon_gap(ui, rtl, |ui| {
+    let label = icon_gap(ui, rtl, COPY_ICON_GAP, |ui| {
         ui.add(egui::Label::new(shown.as_str()).wrap_mode(egui::TextWrapMode::Extend))
     });
     if shown != value {
         label.on_hover_text(value);
     }
     if !rtl {
-        icon_gap(ui, true, |ui| copy_button(ui, id, value, hint));
+        icon_gap(ui, true, COPY_ICON_GAP, |ui| {
+            copy_button(ui, id, value, hint)
+        });
     }
 }
 
-/// Adds `add` [`COPY_ICON_GAP`] after the previous widget when `apply` (the value and its
-/// copy icon, whichever comes second in the row), else with the usual item spacing.
-fn icon_gap<R>(ui: &mut Ui, apply: bool, add: impl FnOnce(&mut Ui) -> R) -> R {
+/// Adds `add` `gap` after the previous widget when `apply` (the value and its copy icon,
+/// whichever comes second in the row), else with the usual item spacing.
+fn icon_gap<R>(ui: &mut Ui, apply: bool, gap: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
     if !apply {
         return add(ui);
     }
     let spacing = ui.spacing().item_spacing.x;
-    ui.spacing_mut().item_spacing.x = COPY_ICON_GAP;
+    ui.spacing_mut().item_spacing.x = gap;
     let result = add(ui);
     ui.spacing_mut().item_spacing.x = spacing;
     result
@@ -939,16 +943,18 @@ pub fn is_testnet(ctx: &egui::Context) -> bool {
     ctx.data(|d| d.get_temp(testnet_id())).unwrap_or(false)
 }
 
-/// Side of the square copy icon, about the height of a capital letter.
+/// Height of the copy icon, about that of a capital letter, and its width.
 const COPY_ICON_SIZE: f32 = 11.0;
-/// Gap between a value and its copy icon, a little tighter than the usual item spacing.
+const COPY_ICON_WIDTH: f32 = 8.0;
+/// Visible gap between a value's text and its copy icon, a little tighter than the usual
+/// item spacing.
 const COPY_ICON_GAP: f32 = 5.0;
 
-/// The usual copy icon, two overlapping rounded squares, or a check mark once copied.
-/// Brightens on hover.
+/// The copy icon, an outlined upright rectangle with rounded corners, or a check mark
+/// once copied. Brightens on hover.
 fn copy_icon(ui: &mut Ui, copied: bool) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(
-        egui::vec2(COPY_ICON_SIZE, COPY_ICON_SIZE),
+        egui::vec2(COPY_ICON_WIDTH, COPY_ICON_SIZE),
         egui::Sense::click(),
     );
     let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -966,32 +972,16 @@ fn copy_icon(ui: &mut Ui, copied: bool) -> egui::Response {
     if copied {
         painter.line(
             vec![
-                pos2(r.left() + 1.0, r.center().y),
-                pos2(r.left() + r.width() * 0.4, r.bottom() - 1.5),
-                pos2(r.right() - 0.5, r.top() + 1.5),
+                pos2(r.left(), r.center().y),
+                pos2(r.left() + r.width() * 0.4, r.bottom() - 1.0),
+                pos2(r.right(), r.top() + 1.0),
             ],
             stroke,
         );
         return response;
     }
 
-    // Front sheet at the bottom right, back sheet peeking out at the top left.
-    let offset = (r.width() * 0.3).round();
-    let side = r.width() - offset;
-    let front =
-        egui::Rect::from_min_size(r.min + egui::vec2(offset, offset), egui::vec2(side, side));
-    painter.rect_stroke(front, 1.5, stroke, egui::StrokeKind::Middle);
-    // Only the back sheet's edges that the front one doesn't cover.
-    painter.line(
-        vec![
-            pos2(r.left() + offset - 1.5, r.top() + side),
-            pos2(r.left(), r.top() + side),
-            pos2(r.left(), r.top()),
-            pos2(r.left() + side, r.top()),
-            pos2(r.left() + side, r.top() + offset - 1.5),
-        ],
-        stroke,
-    );
+    painter.rect_stroke(r, 2.0, stroke, egui::StrokeKind::Middle);
     response
 }
 

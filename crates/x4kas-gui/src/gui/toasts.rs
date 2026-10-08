@@ -1,5 +1,5 @@
 //! Alert toasts: an alert the watchlist raises pops up bottom-right over whatever tab is
-//! shown and fades after a few seconds (the Alerts card on the Addresses tab keeps
+//! shown and fades after a few seconds (the Alerts card on the Monitoring tab keeps
 //! them). Its address opens Address Info like any other.
 
 use std::time::{Duration, Instant};

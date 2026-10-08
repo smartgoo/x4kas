@@ -299,7 +299,7 @@ with hop count.
 
 ### 7.1 GUI
 
-- **Addresses tab** (new, `4`): a search box (address or label), the watchlist
+- **Monitoring tab** (new, `4`): a search box (address or label), the watchlist
   table (name, address, balance, 24 h change, last activity, pending), and the
   Alerts feed. Add/remove/edit from the table; a click opens Address Info.
 - **Address Info window** (`gui/address.rs`, opened from any `widgets::address`
@@ -360,7 +360,7 @@ responses, reorg reverse-apply equals never-applied, slab drop corrects stats,
 resume after kill mid-batch.
 
 **Phase 2: Watchlist and alerts (1–2 weeks).** `watch.rs`, `UtxosChanged`
-subscription, rules, Addresses tab, toasts, `address watch`. Works through the
+subscription, rules, Monitoring tab, toasts, `address watch`. Works through the
 resolver when the node has `--utxoindex`. Tests: rule matching, event building
 from notifications, persistence.
 
@@ -432,13 +432,13 @@ Everything in Phases 0–5 is built, with these deviations from the proposal:
 - **Export** writes to `~/.x4kas/exports/` (no file dialog, so the CLI and a headless
   server behave the same) and shows the path to copy; the CLI prints the same CSV/JSON
   to stdout. Exports stop at 250,000 transactions.
-- **Alerts** are in-app (toasts over any tab, an unread count on the Addresses tab, the
+- **Alerts** are in-app (toasts over any tab, an unread count on the Monitoring tab, the
   Alerts feed) and on the CLI's JSON stream; no OS notifications. The idle rule only
   fires once a previous activity is known (`last_activity_ms`, kept in the watchlist
   file), so the first event after adding an address never counts as "after idle".
 - **Online labels:** kas.fyi and KNS lookups are on demand ("Look up" per address),
   never automatic, and cached with negative answers for a week. The opt-in toggles live
-  on the Addresses tab (Label Sources), not in the connection window.
+  on the Monitoring tab (Label Sources), not in the connection window.
 - **Heuristic labels** are the burn address of every network and "Mining pool (<tag>)"
   for a payout address once the analytics sink has seen it mine 25 coinbases; they are
   per session (not saved) and sit below every other source.

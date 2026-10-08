@@ -1,4 +1,4 @@
-//! Addresses tab: the watchlist with live balances and pending activity, the alerts
+//! Monitoring tab: the watchlist with live balances and pending activity, the alerts
 //! raised by its rules, and the activity feed. A row click opens Address Info.
 
 use eframe::egui::{self, RichText, TextEdit, Ui};
@@ -19,13 +19,15 @@ const DAY_MS: u64 = 24 * 3_600_000;
 
 /// The tab's own state: the add/search field.
 #[derive(Default)]
-pub struct AddressesTab {
+pub struct MonitoringTab {
     input: String,
+    /// The label matches popup is showing under the field.
+    search_open: bool,
     /// The API key field, filled from the settings on first show.
     key_input: Option<String>,
 }
 
-impl AddressesTab {
+impl MonitoringTab {
     pub fn show(&mut self, ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
         app.watch.unread_alerts = 0;
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -117,11 +119,16 @@ impl AddressesTab {
         let network = network(app);
         // Add or look up an address, or find a labelled one.
         let mut submitted = false;
+        let mut field: Option<egui::Response> = None;
         ui.horizontal(|ui| {
             let edit = TextEdit::singleline(&mut self.input)
                 .hint_text("kaspa:… address, or a label such as \"Bybit\"")
                 .desired_width(ui.available_width() - 190.0);
             let response = ui.add(edit);
+            field = Some(response.clone());
+            if response.changed() || response.gained_focus() {
+                self.search_open = true;
+            }
             submitted = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             let is_address = looks_like_address(&self.input);
             if ui
@@ -140,8 +147,13 @@ impl AddressesTab {
                 request_address(ui.ctx(), self.input.trim());
             }
         });
-        // Label matches, when the field isn't an address.
-        if !self.input.trim().is_empty() && !looks_like_address(&self.input) {
+        // Label matches, when the field isn't an address: a popup over the page, not in
+        // the flow, so the cards below don't move while typing.
+        if let Some(field) = field
+            && self.search_open
+            && !self.input.trim().is_empty()
+            && !looks_like_address(&self.input)
+        {
             let hits: Vec<(String, String)> = app
                 .labels
                 .search(&self.input)
@@ -149,19 +161,35 @@ impl AddressesTab {
                 .take(8)
                 .map(|(a, l)| (a.to_string(), l.name.clone()))
                 .collect();
-            if hits.is_empty() {
-                placeholder(ui, "No label matches");
-            }
-            for (addr, name) in hits {
-                ui.horizontal(|ui| {
-                    if ui
-                        .link(RichText::new(&name).color(theme::ACCENT_BRIGHT))
-                        .clicked()
-                    {
-                        request_address(ui.ctx(), &addr);
-                    }
-                    address(ui, &addr);
+            let mut picked = false;
+            let popup = egui::Area::new(ui.id().with("label_search"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(field.rect.left_bottom() + egui::vec2(0.0, 4.0))
+                .show(ui.ctx(), |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.set_width(field.rect.width());
+                        if hits.is_empty() {
+                            placeholder(ui, "No label matches");
+                        }
+                        for (addr, name) in &hits {
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .link(RichText::new(name).color(theme::ACCENT_BRIGHT))
+                                    .clicked()
+                                {
+                                    request_address(ui.ctx(), addr);
+                                    picked = true;
+                                }
+                                address(ui, addr);
+                            });
+                        }
+                    });
                 });
+            // Stays while the field has focus or the pointer is on it (a click there
+            // takes focus away first); Esc or a pick closes it.
+            let escaped = ui.input(|i| i.key_pressed(egui::Key::Escape));
+            if picked || escaped || (field.lost_focus() && !popup.response.contains_pointer()) {
+                self.search_open = false;
             }
         }
         ui.add_space(4.0);

@@ -5,7 +5,7 @@
 use eframe::egui::{self, RichText, TextEdit, Ui};
 use egui_extras::{Column, TableBuilder};
 
-use super::addresses::network;
+use super::monitoring::network;
 use super::theme;
 use super::widgets::{
     address, block_hash, copy_value, is_testnet, kv, kv_columns, kv_grid, kv_with, modal_window,
@@ -238,9 +238,9 @@ fn header(
                 .on_hover_text(if enabled {
                     "Ask kas.fyi and/or KNS about this address (sends it to them)"
                 } else {
-                    "Enable kas.fyi or KNS lookups on the Addresses tab first"
+                    "Enable kas.fyi or KNS lookups on the Monitoring tab first"
                 })
-                .on_disabled_hover_text("Enable kas.fyi or KNS lookups on the Addresses tab first")
+                .on_disabled_hover_text("Enable kas.fyi or KNS lookups on the Monitoring tab first")
                 .clicked()
             {
                 let _ = cmd_tx.send(UiCommand::LookupLabelOnline(addr.clone()));

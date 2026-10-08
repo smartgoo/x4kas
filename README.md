@@ -13,7 +13,7 @@ Built with [egui/eframe](https://github.com/emilk/egui) and [rusty-kaspa](https:
   - BlockDAG stats (DAA and blue score, sink, pruning point, tips, DAG width, block interval, blue block rate) and market data (CoinGecko)
   - Supply (incl. unspendable burn-address balance, block reward and next reduction), mining (difficulty, hashrate, unique miners) and node info
   - Chain analytics (direct node only): transactions per 10 minutes over 24h, transaction summary, mempool, transaction inspection (opcodes, covenants, protocols), fees, mining share by node version, top miners, top senders and receivers, each over a 1m / 1h / 24h window
-- **Addresses**: a watchlist with live balances, pending mempool activity, 24h change, confirmed events and rule-based alerts (any activity, received/sent thresholds, balance crossings, first activity after N hours idle), fed by the node's `UtxosChanged` notifications; alerts pop up as toasts on any tab and count on the Addresses tab until seen; works through the resolver too when the node has `--utxoindex`
+- **Monitoring**: a watchlist with live balances, pending mempool activity, 24h change, confirmed events and rule-based alerts (any activity, received/sent thresholds, balance crossings, first activity after N hours idle), fed by the node's `UtxosChanged` notifications; alerts pop up as toasts on any tab and count on the Monitoring tab until seen; works through the resolver too when the node has `--utxoindex`
   - **Address Info** from any address in the app: label, balance, balance history, transactions, counterparties, the likely-owner cluster and watch settings, backed by a local address index of the node's retention window (direct node only; see below)
   - **Clustering**: addresses that spend together, and probable change outputs, are grouped into likely owners (with guards against merging labelled entities, L2 bridges and covenant contracts, and a size cap), so an exchange's many deposit addresses read as one
   - **Flow graph**: follow the money hop by hop from any address; click a node to expand it, fold pass-through chains (peel chains) into one hop-counted edge, export the graph as CSV or JSON
@@ -131,7 +131,7 @@ Besides the node you connect to, x4kas contacts:
 
 - the CoinGecko API every 60s for market data ([data provided by CoinGecko](https://www.coingecko.com/en/api))
 - `api.kaspa.org/addresses/names` once a day for the public address labels (the whole list, so nothing about which addresses you look at leaves your machine)
-- `api.kas.fyi` and `api.knsdomains.org`, only if you enable them (Addresses tab → Label Sources) and only for the address you press "Look up" on; answers are cached for a week
+- `api.kas.fyi` and `api.knsdomains.org`, only if you enable them (Monitoring tab → Label Sources) and only for the address you press "Look up" on; answers are cached for a week
 - the public Kaspa resolver, only when you choose it (or run `x4kas-cli` without `--url`)
 
 ### Files
@@ -162,7 +162,7 @@ Click into the terminal to type; app shortcuts are off until you click elsewhere
 ```
 crates/
   x4kas-core/src/       Shared library (no GUI): everything below the frontends
-    app.rs                Shared App state (Arc<RwLock<App>>), tabs (Dashboard, Addresses, Mempool, RPC Cmds)
+    app.rs                Shared App state (Arc<RwLock<App>>), tabs (Dashboard, Monitoring, Mempool, RPC Cmds)
     controller.rs         UiCommand handling: connections, RPC calls, address lookups, watchlist, labels, shutdown
     config.rs             Saved connection choice (~/.x4kas/connection.toml)
     polling.rs            RPC creation and background polling tasks
@@ -186,7 +186,7 @@ crates/
     gui/
       mod.rs              GuiApp: frame loop, top bar, shortcuts, quit
       dashboard.rs        Dashboard tab: card layout and node-backed cards
-      addresses.rs        Addresses tab: watchlist, alerts, activity
+      monitoring.rs       Monitoring tab: watchlist, alerts, activity
       address.rs          Address Info window
       flows.rs            Flow graph window
       blockdag.rs         DAG visualizer, BlockDAG card, Block Info window

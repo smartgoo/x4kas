@@ -1,7 +1,6 @@
 //! egui/eframe desktop frontend.
 
 mod address;
-mod addresses;
 mod analytics;
 mod blockdag;
 mod connection;
@@ -9,6 +8,7 @@ mod dashboard;
 mod flows;
 mod help;
 mod mempool;
+mod monitoring;
 mod rpc_explorer;
 mod terminal;
 mod theme;
@@ -24,9 +24,9 @@ use tokio::sync::{RwLock, oneshot};
 
 use crate::Args;
 use address::AddressWindowUi;
-use addresses::AddressesTab;
 use connection::ConnectionWindow;
 use flows::FlowWindowUi;
+use monitoring::MonitoringTab;
 use terminal::TerminalPane;
 use toasts::Toasts;
 use widgets::kv;
@@ -112,7 +112,7 @@ struct GuiApp {
     show_help: bool,
     connection: ConnectionWindow,
     terminal: TerminalPane,
-    addresses: AddressesTab,
+    monitoring: MonitoringTab,
     address_window: AddressWindowUi,
     flow_window: FlowWindowUi,
     toasts: Toasts,
@@ -128,7 +128,7 @@ impl GuiApp {
             show_help: false,
             connection,
             terminal: TerminalPane::new(),
-            addresses: AddressesTab::default(),
+            monitoring: MonitoringTab::default(),
             address_window: AddressWindowUi::default(),
             flow_window: FlowWindowUi::default(),
             toasts: Toasts::default(),
@@ -200,7 +200,7 @@ impl eframe::App for GuiApp {
 
         egui::CentralPanel::default().show(ctx, |ui| match app.active_tab {
             Tab::Dashboard => dashboard::show(ui, &mut app),
-            Tab::Addresses => self.addresses.show(ui, &mut app, &self.cmd_tx),
+            Tab::Monitoring => self.monitoring.show(ui, &mut app, &self.cmd_tx),
             Tab::Mempool => mempool::show(ui, &mut app),
             Tab::RpcExplorer => rpc_explorer::show(ui, &mut app, &self.cmd_tx),
         });
@@ -335,9 +335,9 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App, show_help: &mut bool, terminal: &mu
         ui.spacing_mut().item_spacing.x = 2.0;
         for (i, tab) in Tab::all().iter().enumerate() {
             let selected = app.active_tab == *tab;
-            // Alerts raised while the Addresses tab wasn't on show.
+            // Alerts raised while the Monitoring tab wasn't on show.
             let badge = match tab {
-                Tab::Addresses if !selected => app.watch.unread_alerts,
+                Tab::Monitoring if !selected => app.watch.unread_alerts,
                 _ => 0,
             };
             if tab_button(ui, i + 1, tab.label(), selected, badge)

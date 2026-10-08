@@ -154,7 +154,7 @@ impl DagStats {
 pub enum Tab {
     #[default]
     Dashboard,
-    Addresses,
+    Monitoring,
     Mempool,
     RpcExplorer,
 }
@@ -163,7 +163,7 @@ impl Tab {
     pub fn all() -> &'static [Tab] {
         &[
             Tab::Dashboard,
-            Tab::Addresses,
+            Tab::Monitoring,
             Tab::Mempool,
             Tab::RpcExplorer,
         ]
@@ -173,7 +173,7 @@ impl Tab {
     pub fn label(&self) -> &'static str {
         match self {
             Tab::Dashboard => "Dashboard",
-            Tab::Addresses => "Addresses",
+            Tab::Monitoring => "Monitoring",
             Tab::Mempool => "Mempool",
             Tab::RpcExplorer => "RPC Cmds",
         }
@@ -624,7 +624,7 @@ pub struct WatchState {
     pub events: VecDeque<AddressEvent>,
     /// Newest first.
     pub alerts: VecDeque<Alert>,
-    /// Alerts raised since the Addresses tab was last shown.
+    /// Alerts raised since the Monitoring tab was last shown.
     pub unread_alerts: usize,
     /// Alerts raised in total, so a frontend can tell which of `alerts` are new to it.
     pub alerts_raised: u64,
@@ -1084,7 +1084,7 @@ mod tests {
     #[test]
     fn tab_labels() {
         let labels: Vec<_> = Tab::all().iter().map(Tab::label).collect();
-        assert_eq!(labels, ["Dashboard", "Addresses", "Mempool", "RPC Cmds"]);
+        assert_eq!(labels, ["Dashboard", "Monitoring", "Mempool", "RPC Cmds"]);
     }
 
     #[test]
@@ -1101,7 +1101,7 @@ mod tests {
         let mut app = App::default();
         assert_eq!(app.active_tab, Tab::Dashboard);
         app.next_tab();
-        assert_eq!(app.active_tab, Tab::Addresses);
+        assert_eq!(app.active_tab, Tab::Monitoring);
         app.next_tab();
         assert_eq!(app.active_tab, Tab::Mempool);
         app.next_tab();

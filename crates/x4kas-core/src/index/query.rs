@@ -15,6 +15,7 @@ use super::records::{
     parse_addr_tx_key, parse_peer_key,
 };
 use super::{IndexStore, hex, parse_hex};
+use crate::labels::LabelBook;
 use crate::tx_inspect::TransactionProtocol;
 
 /// An address's totals over everything the index holds.
@@ -37,6 +38,10 @@ pub struct ClusterInfo {
     pub size: u32,
     /// Up to the requested number of members, the root first.
     pub members: Vec<String>,
+    /// The likely owner: the strongest label among the sampled members (the most
+    /// common one at that strength; `LabelBook::name_cluster`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 /// Where a transaction page continues: the oldest entry shown.
@@ -281,18 +286,25 @@ pub fn profile(store: &IndexStore, address: &str) -> Result<AddressProfile> {
     })
 }
 
-/// The cluster `id` belongs to, with up to `limit` members.
-pub fn cluster(store: &IndexStore, id: AddrId, limit: usize) -> Result<ClusterInfo> {
+/// The cluster `id` belongs to, with up to `limit` members, named by `labels`.
+pub fn cluster(
+    store: &IndexStore,
+    labels: &LabelBook,
+    id: AddrId,
+    limit: usize,
+) -> Result<ClusterInfo> {
     let ks = store.clusters();
     let root = cluster::root_of(ks, id)?;
     let members = cluster::members_of(ks, root, limit)?
         .into_iter()
         .map(|m| Ok(store.address_of(m)?.unwrap_or_default()))
         .collect::<Result<Vec<_>>>()?;
+    let label = labels.name_cluster(members.iter().map(String::as_str));
     Ok(ClusterInfo {
         root: store.address_of(root)?.unwrap_or_default(),
         size: cluster::size_of(ks, root)?,
         members,
+        label,
     })
 }
 

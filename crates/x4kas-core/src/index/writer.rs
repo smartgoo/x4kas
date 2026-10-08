@@ -16,7 +16,8 @@ use super::records::{
 };
 use super::{IndexStore, Manifest, Position, Slab};
 use crate::labels::LabelBook;
-use crate::tx_inspect::detect_protocol;
+use crate::tx_inspect::{detect_protocol, redeem_script_opcodes};
+use kaspa_addresses::Version;
 
 /// Interned addresses kept in memory; the map is cleared when it grows past this.
 const INTERN_CACHE_MAX: usize = 1_000_000;
@@ -133,6 +134,12 @@ impl IndexWriter {
 
     pub fn store(&self) -> &Arc<IndexStore> {
         &self.store
+    }
+
+    /// Use the current label book for the clustering guard (it is replaced as a whole
+    /// when labels change, so the writer is handed the latest before each batch).
+    pub fn set_labels(&mut self, labels: Arc<LabelBook>) {
+        self.labels = labels;
     }
 
     /// Apply one VSPC v2 response atomically: undo its removed chain blocks, index its
@@ -351,9 +358,11 @@ impl IndexWriter {
         let mut inputs = Vec::with_capacity(tx.inputs.len());
         let mut input_sum = Some(0u64);
         let mut input_scripts: Vec<&[u8]> = Vec::with_capacity(tx.inputs.len());
-        // For clustering: the inputs' address version and entity labels.
+        // For clustering: the inputs' address version and entity labels, and whether a
+        // script-hash input reveals a covenant (an introspecting redeem script).
         let mut input_version: Option<u8> = None;
         let mut input_labels: Vec<Option<String>> = Vec::new();
+        let mut covenant = false;
         for input in &tx.inputs {
             let utxo = input
                 .verbose_data
@@ -368,7 +377,12 @@ impl IndexWriter {
                 Some(a) => {
                     let text = a.to_string();
                     input_version.get_or_insert(a.version as u8);
-                    input_labels.push(self.labels.name(&text).map(str::to_string));
+                    input_labels.push(self.labels.entity_name(&text).map(str::to_string));
+                    if a.version == Version::ScriptHash
+                        && let Some(script) = input.signature_script.as_deref()
+                    {
+                        covenant |= redeem_script_opcodes(script).introspection;
+                    }
                     Some(self.intern(batch, &text)?.0)
                 }
                 None => None,
@@ -435,7 +449,8 @@ impl IndexWriter {
             }
         }
         let labels: Vec<Option<&str>> = input_labels.iter().map(Option::as_deref).collect();
-        let may_union = !is_coinbase && has_sender && cluster::may_union(protocol, &labels);
+        let may_union =
+            !is_coinbase && has_sender && cluster::may_union(protocol, covenant, &labels);
         let compute_mass = tx
             .verbose_data
             .as_ref()
@@ -537,6 +552,28 @@ pub(crate) mod testing {
         let mut payload = [0u8; 32];
         payload[..4].copy_from_slice(&n.to_be_bytes());
         Address::new(Prefix::Mainnet, Version::PubKey, &payload)
+    }
+
+    /// A pay-to-script-hash address, distinct from `address(n)`.
+    pub fn script_address(n: u32) -> Address {
+        let mut payload = [0u8; 32];
+        payload[..4].copy_from_slice(&n.to_be_bytes());
+        Address::new(Prefix::Mainnet, Version::ScriptHash, &payload)
+    }
+
+    /// Make input `i` of `tx` spend from a script address with this signature script
+    /// (its last push is the revealed redeem script).
+    pub fn spend_from_script(tx: &mut RpcOptionalTransaction, i: usize, n: u32, sig: Vec<u8>) {
+        let input = &mut tx.inputs[i];
+        input.signature_script = Some(sig);
+        if let Some(utxo) = input
+            .verbose_data
+            .as_mut()
+            .and_then(|vd| vd.utxo_entry.as_mut())
+            .and_then(|u| u.verbose_data.as_mut())
+        {
+            utxo.script_public_key_address = Some(script_address(n));
+        }
     }
 
     pub fn hash(n: u64) -> RpcHash {
@@ -663,8 +700,12 @@ mod tests {
     }
 
     fn writer() -> TempWriter {
+        writer_with(LabelBook::bundled())
+    }
+
+    fn writer_with(labels: LabelBook) -> TempWriter {
         let store = temp_store();
-        let writer = IndexWriter::new(store.store.clone(), Arc::new(LabelBook::bundled())).unwrap();
+        let writer = IndexWriter::new(store.store.clone(), Arc::new(labels)).unwrap();
         TempWriter {
             writer,
             _store: store,
@@ -947,7 +988,8 @@ mod tests {
         w.apply(&r).unwrap();
         let store = w.store();
         let id = |n: u32| store.lookup(&address(n).to_string()).unwrap().unwrap();
-        let c = query::cluster(store, id(1), 10).unwrap();
+        let book = LabelBook::bundled();
+        let c = query::cluster(store, &book, id(1), 10).unwrap();
         assert_eq!(c.size, 3);
         let mut members = c.members.clone();
         members.sort();
@@ -958,7 +1000,7 @@ mod tests {
         ];
         expected.sort();
         assert_eq!(members, expected);
-        assert_eq!(query::cluster(store, id(3), 10).unwrap().size, 1);
+        assert_eq!(query::cluster(store, &book, id(3), 10).unwrap().size, 1);
         let detail = query::transaction(store, &hash(2).as_bytes())
             .unwrap()
             .unwrap();
@@ -977,13 +1019,81 @@ mod tests {
         w.apply(&r2).unwrap();
         let store = w.store();
         let id5 = store.lookup(&address(5).to_string()).unwrap().unwrap();
-        assert_eq!(query::cluster(store, id5, 10).unwrap().size, 4);
+        assert_eq!(query::cluster(store, &book, id5, 10).unwrap().size, 4);
         assert_eq!(
             query::profile(store, &address(2).to_string())
                 .unwrap()
                 .cluster_size,
             4
         );
+    }
+
+    #[test]
+    fn guards_keep_strangers_apart() {
+        use crate::labels::AddressName;
+        let mut book = LabelBook::bundled();
+        let named = |n: u32, name: &str| AddressName {
+            address: address(n).to_string(),
+            name: name.to_string(),
+        };
+        book.apply_kaspa_org(
+            &[named(1, "Bybit"), named(2, "Gate.io"), named(5, "Bybit")],
+            std::time::SystemTime::now(),
+        );
+        let mut tw = writer_with(book.clone());
+        let w = &mut tw.writer;
+
+        // A bridge-protocol spend: its payload names Kasplex.
+        let mut bridge = tx(3, &[(3, 10), (4, 10)], &[(9, 15)]);
+        bridge.payload = Some(b"kasplex bridge".to_vec());
+        // A covenant spend: a script-hash input whose redeem script introspects.
+        let mut covenant = tx(4, &[(6, 10), (7, 10)], &[(9, 15)]);
+        spend_from_script(
+            &mut covenant,
+            0,
+            6,
+            vec![3, 0xaa, 0xbb, 0xcc, 2, 0xb4, 0xac],
+        );
+        // A plain script-hash spend (a multisig wallet) still clusters.
+        let mut multisig = tx(5, &[(10, 10), (11, 10)], &[(9, 15)]);
+        spend_from_script(&mut multisig, 0, 10, vec![3, 0xaa, 0xbb, 0xcc, 1, 0xac]);
+        let r = response(
+            vec![],
+            vec![chain_block(
+                1,
+                1_000,
+                vec![
+                    // Two exchanges sweeping together never become one owner.
+                    tx(1, &[(1, 10), (2, 10)], &[(9, 15)]),
+                    // Two Bybit addresses do.
+                    tx(2, &[(1, 10), (5, 10)], &[(9, 15)]),
+                    bridge,
+                    covenant,
+                    multisig,
+                    // The covenant's other party spends normally later.
+                    tx(6, &[(7, 10), (8, 10)], &[(9, 15)]),
+                ],
+            )],
+        );
+        let report = w.apply(&r).unwrap();
+        assert_eq!(report.cluster_cap_hits, 0);
+        let store = w.store();
+        let id = |a: &str| store.lookup(a).unwrap().unwrap();
+        let size = |a: &str| query::cluster(store, &book, id(a), 10).unwrap().size;
+        let plain = |n: u32| address(n).to_string();
+
+        let bybit = query::cluster(store, &book, id(&plain(1)), 10).unwrap();
+        assert_eq!(bybit.size, 2);
+        assert_eq!(bybit.label.as_deref(), Some("Bybit"));
+        assert_eq!(size(&plain(2)), 1);
+        assert_eq!(size(&plain(3)), 1);
+        assert_eq!(size(&plain(4)), 1);
+        assert_eq!(size(&script_address(6).to_string()), 1);
+        assert_eq!(size(&script_address(10).to_string()), 2);
+        let party = query::cluster(store, &book, id(&plain(7)), 10).unwrap();
+        assert_eq!(party.size, 2);
+        assert_eq!(party.label, None);
+        assert!(party.members.contains(&plain(8)));
     }
 
     #[test]

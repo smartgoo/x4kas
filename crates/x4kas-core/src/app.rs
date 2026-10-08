@@ -564,6 +564,9 @@ pub struct IndexStatus {
     pub backlog: usize,
     /// Removed chain blocks the index didn't have (reorgs past its coverage).
     pub unresolved_reorgs: u64,
+    /// Owner merges the cluster size cap refused this session: a heuristic failure
+    /// (a bridge or service whose spends pool strangers), never a discovery.
+    pub cluster_cap_hits: u64,
     pub last_batch_at: Option<Instant>,
 }
 

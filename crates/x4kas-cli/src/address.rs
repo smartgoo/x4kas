@@ -8,6 +8,7 @@ use serde::Serialize;
 
 use x4kas_core::index::query::{self, Cursor};
 use x4kas_core::index::{IndexStore, parse_hex};
+use x4kas_core::labels::LabelBook;
 
 #[derive(Subcommand, Debug, Clone, PartialEq)]
 pub enum AddressCommand {
@@ -119,7 +120,8 @@ pub fn run(network: &str, cmd: AddressCommand) -> Result<()> {
         }
         AddressCommand::Cluster { address, limit } => {
             let id = known(&store, &address.address)?;
-            to_json(&query::cluster(&store, id, limit)?)?
+            let labels = LabelBook::load();
+            to_json(&query::cluster(&store, &labels, id, limit)?)?
         }
         AddressCommand::Flows { address, hops, top } => {
             let id = known(&store, &address.address)?;

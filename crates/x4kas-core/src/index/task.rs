@@ -62,12 +62,17 @@ fn run(
 
     let mut batches = 0u64;
     while let Some(batch) = receiver.blocking_recv() {
+        // The latest labels for the clustering guard, and the node's pruning point
+        // (which polling keeps in the app state) to prune behind.
+        let (labels, floor) = {
+            let app = app.blocking_read();
+            (app.labels.clone(), app.node.pruning_point_timestamp_ms)
+        };
+        writer.set_labels(labels);
         let started = Instant::now();
         let result = writer.apply(&batch);
         batches += 1;
 
-        // Prune behind the node's pruning point, which polling keeps in the app state.
-        let floor = app.blocking_read().node.pruning_point_timestamp_ms;
         let pruned = match floor {
             Some(floor) => store.prune_before(floor).unwrap_or(0),
             None => 0,
@@ -86,6 +91,7 @@ fn run(
                 if !report.unresolved_reorgs.is_empty() {
                     status.unresolved_reorgs += report.unresolved_reorgs.len() as u64;
                 }
+                status.cluster_cap_hits += report.cluster_cap_hits;
             }
             Err(e) => status.phase = IndexPhase::Error(format!("{e:#}")),
         }

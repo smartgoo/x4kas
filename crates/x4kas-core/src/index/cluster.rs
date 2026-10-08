@@ -10,8 +10,9 @@
 //! Membership is knowledge, not activity, so it isn't slabbed or undone by reorgs.
 //!
 //! Guards keep the heuristic from merging strangers: inputs carrying different entity
-//! labels (an exchange sweep never merges two exchanges), L2 bridge protocols, and a
-//! size cap that treats a runaway cluster as a heuristic failure.
+//! labels (an exchange sweep never merges two exchanges), L2 bridge protocols, covenant
+//! spends (a contract's inputs belong to its parties, not one owner), and a size cap
+//! that treats a runaway cluster as a heuristic failure.
 
 use std::collections::{HashMap, HashSet};
 
@@ -37,6 +38,8 @@ pub struct ClusterKeyspaces {
 /// Union-find with a per-batch overlay, flushed into the batch at the end.
 pub struct Clusters<'a> {
     ks: &'a ClusterKeyspaces,
+    /// A cluster that would grow past this stays as it is.
+    cap: u32,
     parent: HashMap<AddrId, Option<AddrId>>,
     size: HashMap<AddrId, Option<u32>>,
     member_add: HashSet<(AddrId, AddrId)>,
@@ -47,8 +50,14 @@ pub struct Clusters<'a> {
 
 impl<'a> Clusters<'a> {
     pub fn new(ks: &'a ClusterKeyspaces) -> Self {
+        Self::with_cap(ks, MAX_CLUSTER)
+    }
+
+    /// A union-find whose clusters never grow past `cap` members.
+    pub fn with_cap(ks: &'a ClusterKeyspaces, cap: u32) -> Self {
         Self {
             ks,
+            cap,
             parent: HashMap::new(),
             size: HashMap::new(),
             member_add: HashSet::new(),
@@ -128,7 +137,7 @@ impl<'a> Clusters<'a> {
             return Ok(true);
         }
         let (sa, sb) = (self.size_of(ra)?, self.size_of(rb)?);
-        if sa + sb > MAX_CLUSTER {
+        if sa + sb > self.cap {
             self.cap_hits += 1;
             return Ok(false);
         }
@@ -213,12 +222,20 @@ pub fn members_of(ks: &ClusterKeyspaces, root: AddrId, limit: usize) -> Result<V
 }
 
 /// Whether a transaction's inputs may be unioned: not an L2 bridge protocol (which
-/// pools unrelated users' funds), and no two inputs with different entity labels.
-pub fn may_union(protocol: Option<TransactionProtocol>, input_labels: &[Option<&str>]) -> bool {
-    if matches!(
-        protocol,
-        Some(TransactionProtocol::Kasplex | TransactionProtocol::Igra)
-    ) {
+/// pools unrelated users' funds), not a covenant spend (`covenant`: an input's redeem
+/// script introspects the transaction, so a contract, not a wallet, signed it), and no
+/// two inputs with different entity labels.
+pub fn may_union(
+    protocol: Option<TransactionProtocol>,
+    covenant: bool,
+    input_labels: &[Option<&str>],
+) -> bool {
+    if covenant
+        || matches!(
+            protocol,
+            Some(TransactionProtocol::Kasplex | TransactionProtocol::Igra)
+        )
+    {
         return false;
     }
     let mut seen: Option<&str> = None;
@@ -338,12 +355,86 @@ mod tests {
 
     #[test]
     fn union_guards() {
-        assert!(may_union(None, &[Some("Bybit"), None, Some("Bybit")]));
-        assert!(!may_union(None, &[Some("Bybit"), Some("Gate.io")]));
+        assert!(may_union(
+            None,
+            false,
+            &[Some("Bybit"), None, Some("Bybit")]
+        ));
+        assert!(!may_union(None, false, &[Some("Bybit"), Some("Gate.io")]));
         assert!(!may_union(
             Some(TransactionProtocol::Kasplex),
+            false,
             &[None, None]
         ));
-        assert!(may_union(Some(TransactionProtocol::Krc), &[None, None]));
+        assert!(!may_union(Some(TransactionProtocol::Igra), false, &[]));
+        assert!(may_union(
+            Some(TransactionProtocol::Krc),
+            false,
+            &[None, None]
+        ));
+        assert!(!may_union(None, true, &[None, None]));
+    }
+
+    /// Every member of a persisted cluster resolves to one root whose size and member
+    /// list agree.
+    fn check(ks: &ClusterKeyspaces, members: &[AddrId]) -> AddrId {
+        let root = root_of(ks, members[0]).unwrap();
+        for &m in members {
+            assert_eq!(root_of(ks, m).unwrap(), root, "member {m}");
+        }
+        assert_eq!(size_of(ks, root).unwrap(), members.len() as u32);
+        let mut listed = members_of(ks, root, 1_000).unwrap();
+        listed.sort_unstable();
+        let mut expected = members.to_vec();
+        expected.sort_unstable();
+        assert_eq!(listed, expected);
+        root
+    }
+
+    #[test]
+    fn size_cap_refuses_runaway_merges() {
+        let temp = crate::index::temp_store();
+        let store = &temp.store;
+        let ks = store.clusters();
+
+        let mut c = Clusters::with_cap(ks, 3);
+        assert!(c.union(1, 2).unwrap());
+        assert!(c.union(3, 4).unwrap());
+        // 2 + 2 would pass the cap; the clusters stay as they are.
+        assert!(!c.union(1, 3).unwrap());
+        assert!(c.union(2, 5).unwrap());
+        assert_eq!(c.cap_hits, 1);
+        assert_eq!(c.find(5).unwrap(), c.find(1).unwrap());
+        let mut batch = store.db().batch();
+        c.flush(&mut batch);
+        batch.commit().unwrap();
+
+        check(ks, &[1, 2, 5]);
+        check(ks, &[3, 4]);
+        assert_eq!(root_of(ks, 6).unwrap(), 6);
+        assert_eq!(size_of(ks, 6).unwrap(), 1);
+        assert_eq!(members_of(ks, 6, 10).unwrap(), vec![6]);
+
+        // A later batch sees the persisted sizes: the full cluster takes nobody else,
+        // the other one still has room.
+        let mut c = Clusters::with_cap(ks, 3);
+        assert!(!c.union(5, 6).unwrap());
+        assert!(c.union(4, 6).unwrap());
+        assert!(!c.union(6, 7).unwrap());
+        assert_eq!(c.cap_hits, 2);
+        let mut batch = store.db().batch();
+        c.flush(&mut batch);
+        batch.commit().unwrap();
+        check(ks, &[1, 2, 5]);
+        check(ks, &[3, 4, 6]);
+
+        // The default cap is the production one, which these never reach.
+        let mut c = Clusters::new(ks);
+        assert!(c.union(1, 3).unwrap());
+        assert_eq!(c.cap_hits, 0);
+        let mut batch = store.db().batch();
+        c.flush(&mut batch);
+        batch.commit().unwrap();
+        check(ks, &[1, 2, 3, 4, 5, 6]);
     }
 }

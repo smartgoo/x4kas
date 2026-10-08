@@ -51,6 +51,13 @@ impl LabelSource {
         }
     }
 
+    /// Whether the source names an entity (an exchange, a pool, the burn address)
+    /// rather than one address: the user's notes and `.kas` names are per address, so
+    /// two of them never prove two owners and the clustering guard ignores them.
+    pub fn is_entity(&self) -> bool {
+        !matches!(self, Self::User | Self::Kns)
+    }
+
     /// Precedence: a label only replaces one of a weaker (or the same) source. The
     /// bundled snapshot is the kaspa.org list, so a fresh list replaces it and KNS
     /// doesn't.
@@ -235,6 +242,9 @@ fn kaspa_org_cache_path() -> PathBuf {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LabelBook {
     map: HashMap<String, Label>,
+    /// The strongest entity label per address (`LabelSource::is_entity`), kept even
+    /// where a user label or `.kas` name is shown, for the clustering guard.
+    entity: HashMap<String, Label>,
     user: UserLabels,
     /// Labels derived locally (burn addresses, detected pools); the weakest source,
     /// kept across rebuilds like the user's labels but not saved.
@@ -254,6 +264,7 @@ impl LabelBook {
     pub fn bundled() -> Self {
         let mut book = Self {
             map: HashMap::new(),
+            entity: HashMap::new(),
             user: UserLabels::default(),
             heuristic: BTreeMap::new(),
             kaspa_org_refreshed: None,
@@ -304,6 +315,32 @@ impl LabelBook {
 
     pub fn name(&self, address: &str) -> Option<&str> {
         self.get(address).map(|l| l.name.as_str())
+    }
+
+    /// The strongest entity label of an address (kas.fyi, kaspa.org, heuristics), even
+    /// when a user label or `.kas` name is shown instead.
+    pub fn entity_name(&self, address: &str) -> Option<&str> {
+        self.entity.get(address).map(|l| l.name.as_str())
+    }
+
+    /// The label that names a cluster: the strongest source among the members, the
+    /// most common name within it. `None` when no member is labelled.
+    pub fn name_cluster<'a, I>(&self, members: I) -> Option<String>
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let mut counts: HashMap<&str, (u8, usize)> = HashMap::new();
+        for member in members {
+            if let Some(label) = self.get(member) {
+                let entry = counts.entry(label.name.as_str()).or_insert((0, 0));
+                entry.0 = entry.0.max(label.source.rank());
+                entry.1 += 1;
+            }
+        }
+        counts
+            .into_iter()
+            .max_by_key(|(name, (rank, count))| (*rank, *count, std::cmp::Reverse(*name)))
+            .map(|(name, _)| name.to_string())
     }
 
     pub fn len(&self) -> usize {
@@ -390,6 +427,14 @@ impl LabelBook {
 
     /// Set a label unless a stronger source already names the address.
     fn apply_one(&mut self, address: &str, label: Label) {
+        if label.source.is_entity()
+            && !self
+                .entity
+                .get(address)
+                .is_some_and(|l| l.source.rank() > label.source.rank())
+        {
+            self.entity.insert(address.to_string(), label.clone());
+        }
         if self
             .map
             .get(address)
@@ -843,6 +888,83 @@ mod tests {
         ));
         // A file from the future (clock change) is not stale.
         assert!(!is_stale(Some(now + Duration::from_secs(60)), now));
+    }
+
+    #[test]
+    fn entity_labels_outlive_user_and_kns_names() {
+        let mut book = LabelBook::bundled();
+        let burn = "kaspa:qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqkx9awp4e";
+        assert_eq!(book.entity_name(burn), Some("Burn Address"));
+        book.user
+            .labels
+            .insert(burn.to_string(), "Mine".to_string());
+        book.apply_user();
+        assert_eq!(book.name(burn), Some("Mine"));
+        assert_eq!(book.entity_name(burn), Some("Burn Address"));
+
+        // A .kas name alone is no entity; a kas.fyi tag is, and a stronger one wins.
+        let other = "kaspa:qother";
+        book.apply_online(
+            other,
+            &OnlineEntry {
+                source: LabelSource::Kns,
+                name: Some("other.kas".into()),
+                link: None,
+                categories: Vec::new(),
+                fetched_at_ms: 0,
+            },
+        );
+        assert_eq!(book.name(other), Some("other.kas"));
+        assert_eq!(book.entity_name(other), None);
+        // The shown label doesn't change (KNS outranks heuristics), the entity does.
+        assert!(!book.set_heuristic(other, "Mining pool"));
+        assert_eq!(book.name(other), Some("other.kas"));
+        assert_eq!(book.entity_name(other), Some("Mining pool"));
+        book.apply_online(
+            other,
+            &OnlineEntry {
+                source: LabelSource::KasFyi,
+                name: Some("Pool X".into()),
+                link: None,
+                categories: Vec::new(),
+                fetched_at_ms: 0,
+            },
+        );
+        assert_eq!(book.entity_name(other), Some("Pool X"));
+        assert!(!LabelSource::User.is_entity());
+        assert!(!LabelSource::Kns.is_entity());
+        assert!(LabelSource::KaspaOrg.is_entity());
+    }
+
+    #[test]
+    fn cluster_name_is_the_strongest_then_most_common_label() {
+        let mut book = LabelBook::bundled();
+        book.apply_kaspa_org(
+            &[
+                AddressName {
+                    address: "kaspa:a".into(),
+                    name: "Gate.io".into(),
+                },
+                AddressName {
+                    address: "kaspa:b".into(),
+                    name: "Gate.io".into(),
+                },
+                AddressName {
+                    address: "kaspa:c".into(),
+                    name: "Bybit".into(),
+                },
+            ],
+            SystemTime::now(),
+        );
+        let members = ["kaspa:a", "kaspa:b", "kaspa:c", "kaspa:d"];
+        assert_eq!(book.name_cluster(members), Some("Gate.io".into()));
+        assert_eq!(book.name_cluster(["kaspa:d", "kaspa:e"]), None);
+        // The user's own label outranks any count of public ones.
+        book.user
+            .labels
+            .insert("kaspa:d".to_string(), "My cold wallet".to_string());
+        book.apply_user();
+        assert_eq!(book.name_cluster(members), Some("My cold wallet".into()));
     }
 
     #[test]

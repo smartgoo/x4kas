@@ -131,7 +131,7 @@ impl Controller {
                 UiCommand::Disconnect => self.disconnect().await,
                 UiCommand::ExecuteRpc { method, args } => self.execute_rpc(method, args),
                 UiCommand::LookupBlock(hash) => self.lookup_block(hash),
-                UiCommand::LookupAddress(address) => self.lookup_address(address),
+                UiCommand::LookupAddress(address) => self.lookup_address(address).await,
                 UiCommand::AddressPage { address, before } => self.address_page(address, before),
                 UiCommand::AddressFlows { address, hops } => self.address_flows(address, hops),
                 UiCommand::WatchSet(list) => self.set_watchlist(list).await,
@@ -325,9 +325,10 @@ impl Controller {
     /// Load everything the Address Info window shows: the index's profile, first page
     /// and counterparties (in a blocking task, the store is synchronous) and the node's
     /// balance.
-    fn lookup_address(&mut self, address: String) {
+    async fn lookup_address(&mut self, address: String) {
         let store = self.index.clone();
         let key = address.clone();
+        let labels = self.app.read().await.labels.clone();
         self.spawn_rpc(
             move |rpc| async move {
                 let balance = match kaspa_rpc_core::RpcAddress::try_from(address.as_str()) {
@@ -348,7 +349,7 @@ impl Controller {
                                 query::transactions(&store, id, None, ADDRESS_PAGE)?,
                                 query::counterparties(&store, id, ADDRESS_PEERS)?,
                                 query::balance_curve(&deltas, balance),
-                                Some(query::cluster(&store, id, CLUSTER_MEMBERS)?),
+                                Some(query::cluster(&store, &labels, id, CLUSTER_MEMBERS)?),
                             )
                         }
                         None => (

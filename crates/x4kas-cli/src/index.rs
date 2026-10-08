@@ -149,8 +149,13 @@ fn progress_line(app: &App) -> String {
         }
         (phase, _) => format!("{phase:?}").to_lowercase(),
     };
+    let refused = if index.cluster_cap_hits > 0 {
+        format!(", {} cluster merges refused", index.cluster_cap_hits)
+    } else {
+        String::new()
+    };
     format!(
-        "{phase} | {} txs, {} addresses, {} slabs, {} MB | {} tx/s, backlog {}",
+        "{phase} | {} txs, {} addresses, {} slabs, {} MB | {} tx/s, backlog {}{refused}",
         format_number(index.txs_indexed),
         format_number(index.addresses),
         index.slabs,

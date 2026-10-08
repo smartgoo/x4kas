@@ -113,7 +113,7 @@ impl AddressWindowUi {
                 counterparties(right, view);
             });
             ui.add_space(6.0);
-            cluster(ui, app, view);
+            cluster(ui, view);
             ui.add_space(6.0);
             if ui
                 .add(primary_button("Open flow graph"))
@@ -480,7 +480,7 @@ fn transactions(
 }
 
 /// The likely-owner cluster: size, the most common label among members, and a sample.
-fn cluster(ui: &mut Ui, app: &App, view: &AddressView) {
+fn cluster(ui: &mut Ui, view: &AddressView) {
     subheader(ui, "Likely owner cluster");
     let Some(ref cluster) = view.cluster else {
         placeholder(ui, "Not indexed");
@@ -495,20 +495,9 @@ fn cluster(ui: &mut Ui, app: &App, view: &AddressView) {
         );
         return;
     }
-    // The strongest label among the sampled members names the cluster.
-    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    for member in &cluster.members {
-        if let Some(name) = app.labels.name(member) {
-            *counts.entry(name).or_default() += 1;
-        }
-    }
-    let likely = counts
-        .into_iter()
-        .max_by_key(|(_, n)| *n)
-        .map(|(name, _)| name);
     ui.horizontal(|ui| {
         ui.label(format!("{} addresses", format_number(cluster.size as u64)));
-        if let Some(name) = likely {
+        if let Some(name) = &cluster.label {
             ui.label(RichText::new(format!("likely {name}")).color(theme::ACCENT_BRIGHT));
         }
         ui.label(

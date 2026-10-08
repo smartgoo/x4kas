@@ -436,6 +436,13 @@ Everything in Phases 0–5 is built, with these deviations from the proposal:
 - **Heuristic labels** are the burn address of every network and "Mining pool (<tag>)"
   for a payout address once the analytics sink has seen it mine 25 coinbases; they are
   per session (not saved) and sit below every other source.
+- **Clustering guards:** the entity guard only counts entity labels (kas.fyi,
+  kaspa.org, heuristics), never the user's own notes or `.kas` names, which are
+  per address; besides Kasplex and Igra, any spend revealing an introspecting
+  redeem script (a covenant) is left unclustered. Refused merges at the size cap are
+  counted in the index status (GUI hover, CLI progress line) as the proposal's
+  "warning". A cluster is named in core (`ClusterInfo::label`: strongest source,
+  then most common name among the sampled members) so the CLI shows it too.
 - **Live validation** against a real node was not possible in the build session (no
   node was reachable); the pipeline is covered by synthetic-response tests
   (indexing, replay idempotence, reorg undo, slab pruning, clustering, flows).

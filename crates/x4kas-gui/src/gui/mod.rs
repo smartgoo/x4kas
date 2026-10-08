@@ -657,6 +657,13 @@ fn index_chip(ui: &mut egui::Ui, app: &App) {
                 format_number(status.unresolved_reorgs),
             );
         }
+        if status.cluster_cap_hits > 0 {
+            kv(
+                ui,
+                "Cluster merges refused (size cap)",
+                format_number(status.cluster_cap_hits),
+            );
+        }
         if let IndexPhase::Error(ref err) = status.phase {
             kv(ui, "Error", RichText::new(err).color(theme::ERROR));
         }

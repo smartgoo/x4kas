@@ -33,6 +33,8 @@ pub struct AddressWindowUi {
     sent_min: String,
     balance_below: String,
     balance_above: String,
+    /// Hours, as typed.
+    idle_hours: String,
 }
 
 impl AddressWindowUi {
@@ -74,6 +76,12 @@ impl AddressWindowUi {
         self.sent_min = kas(self.watch.rules.sent_min);
         self.balance_below = kas(self.watch.rules.balance_below);
         self.balance_above = kas(self.watch.rules.balance_above);
+        self.idle_hours = self
+            .watch
+            .rules
+            .idle_hours
+            .map(|h| h.to_string())
+            .unwrap_or_default();
     }
 
     fn contents(
@@ -161,6 +169,7 @@ impl AddressWindowUi {
                     ("Sent ≥", &mut self.sent_min, "KAS"),
                     ("Balance <", &mut self.balance_below, "KAS"),
                     ("Balance >", &mut self.balance_above, "KAS"),
+                    ("Active after ≥", &mut self.idle_hours, "hours idle"),
                 ] {
                     ui.label(RichText::new(label).color(theme::LABEL));
                     if ui
@@ -183,6 +192,7 @@ impl AddressWindowUi {
                 sent_min: parse_kas(&self.sent_min),
                 balance_below: parse_kas(&self.balance_below),
                 balance_above: parse_kas(&self.balance_above),
+                idle_hours: self.idle_hours.trim().parse().ok().filter(|h| *h > 0),
             };
             let mut list = app.watch.list.clone();
             match list.entries.iter_mut().find(|e| e.address == addr) {

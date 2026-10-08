@@ -426,7 +426,10 @@ Everything in Phases 0–5 is built, with these deviations from the proposal:
   a slab removes exactly its contribution; no lazy correction is needed.
 - **Peel chains** are not collapsed in the graph yet; a node's hop count and edge
   amounts show them.
-- **Alerts** are in-app (toasts/feed) and on the CLI's JSON stream; no OS notifications.
+- **Alerts** are in-app (toasts over any tab, an unread count on the Addresses tab, the
+  Alerts feed) and on the CLI's JSON stream; no OS notifications. The idle rule only
+  fires once a previous activity is known (`last_activity_ms`, kept in the watchlist
+  file), so the first event after adding an address never counts as "after idle".
 - **Online labels:** kas.fyi and KNS lookups are on demand ("Look up" per address),
   never automatic, and cached with negative answers for a week.
 - **Live validation** against a real node was not possible in the build session (no

@@ -37,6 +37,8 @@ pub struct AlertRules {
     pub sent_min: Option<u64>,
     pub balance_below: Option<u64>,
     pub balance_above: Option<u64>,
+    /// First activity after at least this many hours without any.
+    pub idle_hours: Option<u32>,
 }
 
 impl Default for AlertRules {
@@ -47,6 +49,7 @@ impl Default for AlertRules {
             sent_min: None,
             balance_below: None,
             balance_above: None,
+            idle_hours: None,
         }
     }
 }
@@ -59,6 +62,10 @@ pub struct WatchEntry {
     pub network: String,
     pub enabled: bool,
     pub rules: AlertRules,
+    /// When the address last moved funds while watched (kept across restarts for the
+    /// idle rule); `None` until the first event.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_activity_ms: Option<u64>,
 }
 
 impl Default for WatchEntry {
@@ -69,6 +76,7 @@ impl Default for WatchEntry {
             network: "mainnet".to_string(),
             enabled: true,
             rules: AlertRules::default(),
+            last_activity_ms: None,
         }
     }
 }
@@ -155,19 +163,22 @@ pub struct Alert {
     pub message: String,
 }
 
-/// Which rules an event trips; one message per rule, in rule order.
+/// Which rules an event trips; one message per rule, in rule order. `balance_before`
+/// and `last_activity_ms` are what was known before the event: the balance crossing
+/// rules fire on the crossing only, and the idle rule needs a previous activity to
+/// measure from.
 pub fn evaluate(
     rules: &AlertRules,
     event: &AddressEvent,
     balance_before: Option<u64>,
+    last_activity_ms: Option<u64>,
 ) -> Vec<String> {
     let mut out = Vec::new();
     let kas = |sompi: u64| format!("{} KAS", format_kas(sompi as f64, 8));
-    let (verb, prep) = match event.kind {
-        EventKind::Received => ("received", "from"),
-        EventKind::Sent => ("sent", "to"),
+    let verb = match event.kind {
+        EventKind::Received => "received",
+        EventKind::Sent => "sent",
     };
-    let _ = prep;
     if rules.any_activity {
         out.push(format!("{verb} {}", kas(event.amount)));
     }
@@ -193,6 +204,17 @@ pub fn evaluate(
         && balance_before.is_none_or(|b| b <= limit)
     {
         out.push(format!("balance rose above {}: {}", kas(limit), kas(after)));
+    }
+    if let (Some(hours), Some(last)) = (rules.idle_hours, last_activity_ms)
+        && hours > 0
+        && event.time_ms.saturating_sub(last) >= u64::from(hours) * 3_600_000
+    {
+        let idle = Duration::from_millis(event.time_ms - last);
+        out.push(format!(
+            "{verb} {} after {} idle",
+            kas(event.amount),
+            crate::format::format_duration(idle)
+        ));
     }
     out
 }
@@ -331,23 +353,28 @@ async fn refresh(rpc: &RpcManager, app: &RwLock<App>, addresses: &[RpcAddress]) 
     app.mark_dirty();
 }
 
-async fn handle_notification(app: &RwLock<App>, n: &UtxosChangedNotification) {
-    let changes = net_changes(n);
-    if changes.is_empty() {
-        return;
-    }
-    let time_ms = now_ms();
-    let mut app = app.write().await;
+/// Turn a notification's per-address changes into events, applying them to `balances`
+/// on the way. Each event comes with the balance known before it (for the crossing
+/// rules). An address whose UTXOs were only replaced by the same amount (a
+/// self-transfer) gets no event. Sorted by address so the order is stable.
+pub fn build_events(
+    changes: HashMap<String, NetChange>,
+    balances: &mut HashMap<String, u64>,
+    time_ms: u64,
+) -> Vec<(AddressEvent, Option<u64>)> {
+    let mut changes: Vec<_> = changes.into_iter().collect();
+    changes.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut out = Vec::new();
     for (address, change) in changes {
         let (kind, amount) = if change.added >= change.removed {
             (EventKind::Received, change.added - change.removed)
         } else {
             (EventKind::Sent, change.removed - change.added)
         };
-        let before = app.watch.balances.get(&address).copied();
+        let before = balances.get(&address).copied();
         let after = before.map(|b| (b + change.added).saturating_sub(change.removed));
         if let Some(after) = after {
-            app.watch.balances.insert(address.clone(), after);
+            balances.insert(address.clone(), after);
         }
         if amount == 0 {
             continue;
@@ -355,36 +382,69 @@ async fn handle_notification(app: &RwLock<App>, n: &UtxosChangedNotification) {
         let txid = (change.txids.len() == 1)
             .then(|| change.txids.into_iter().next())
             .flatten();
-        let event = AddressEvent {
-            time_ms,
-            address: address.clone(),
-            kind,
-            amount,
-            txid,
-            is_coinbase: change.coinbase,
-            balance_after: after,
-        };
-        let entry = app
+        out.push((
+            AddressEvent {
+                time_ms,
+                address,
+                kind,
+                amount,
+                txid,
+                is_coinbase: change.coinbase,
+                balance_after: after,
+            },
+            before,
+        ));
+    }
+    out
+}
+
+async fn handle_notification(app: &RwLock<App>, n: &UtxosChangedNotification) {
+    let changes = net_changes(n);
+    if changes.is_empty() {
+        return;
+    }
+    let time_ms = now_ms();
+    let mut guard = app.write().await;
+    let events = build_events(changes, &mut guard.watch.balances, time_ms);
+    let mut list_changed = false;
+    for (event, before) in events {
+        let entry = guard
             .watch
             .list
             .entries
-            .iter()
-            .find(|e| e.address == address)
-            .cloned();
+            .iter_mut()
+            .find(|e| e.address == event.address);
         if let Some(entry) = entry {
-            for message in evaluate(&entry.rules, &event, before) {
-                app.watch.push_alert(Alert {
+            let last = entry.last_activity_ms;
+            entry.last_activity_ms = Some(time_ms);
+            list_changed = true;
+            let (rules, name) = (entry.rules.clone(), entry.name.clone());
+            for message in evaluate(&rules, &event, before, last) {
+                guard.watch.push_alert(Alert {
                     time_ms,
-                    address: address.clone(),
-                    name: entry.name.clone(),
+                    address: event.address.clone(),
+                    name: name.clone(),
                     message,
                 });
             }
         }
-        app.watch.push_event(event);
+        guard.watch.push_event(event);
     }
-    app.watch.status.last_event_at = Some(std::time::Instant::now());
-    app.mark_dirty();
+    guard.watch.status.last_event_at = Some(std::time::Instant::now());
+    guard.mark_dirty();
+    if !list_changed {
+        return;
+    }
+    // Keep the last-activity times for the idle rule across restarts. The file is
+    // tiny, but write it off the async thread and without holding the lock.
+    let list = guard.watch.list.clone();
+    drop(guard);
+    let saved = tokio::task::spawn_blocking(move || list.save()).await;
+    if let Err(e) = saved.unwrap_or_else(|e| Err(e.into())) {
+        let mut guard = app.write().await;
+        guard.watch.status.last_error = Some(format!("watchlist: {e}"));
+        guard.mark_dirty();
+    }
 }
 
 async fn set_phase(app: &RwLock<App>, phase: WatchPhase) {
@@ -419,51 +479,122 @@ mod tests {
             sent_min: Some(50),
             balance_below: Some(1_000),
             balance_above: None,
+            idle_hours: None,
         };
-        assert!(
-            evaluate(
-                &rules,
-                &event(EventKind::Received, 99, Some(5_000)),
-                Some(5_000)
-            )
-            .is_empty()
-        );
+        let eval = |ev: AddressEvent, before: Option<u64>| evaluate(&rules, &ev, before, None);
+        assert!(eval(event(EventKind::Received, 99, Some(5_000)), Some(5_000)).is_empty());
         assert_eq!(
-            evaluate(
-                &rules,
-                &event(EventKind::Received, 100, Some(5_000)),
-                Some(5_000)
-            )
-            .len(),
+            eval(event(EventKind::Received, 100, Some(5_000)), Some(5_000)).len(),
             1
         );
         // Falling below fires once, on the crossing.
         assert_eq!(
-            evaluate(&rules, &event(EventKind::Sent, 60, Some(900)), Some(1_200)).len(),
+            eval(event(EventKind::Sent, 60, Some(900)), Some(1_200)).len(),
             2
         );
         assert_eq!(
-            evaluate(&rules, &event(EventKind::Sent, 60, Some(800)), Some(900)).len(),
+            eval(event(EventKind::Sent, 60, Some(800)), Some(900)).len(),
             1
         );
         // Unknown previous balance counts as a crossing.
+        let no_sent = AlertRules {
+            sent_min: None,
+            ..rules.clone()
+        };
         assert_eq!(
-            evaluate(
-                &AlertRules {
-                    sent_min: None,
-                    ..rules.clone()
-                },
-                &event(EventKind::Sent, 1, Some(10)),
-                None
-            )
-            .len(),
+            evaluate(&no_sent, &event(EventKind::Sent, 1, Some(10)), None, None).len(),
             1
         );
         let any = AlertRules::default();
         assert_eq!(
-            evaluate(&any, &event(EventKind::Received, 5, None), None),
+            evaluate(&any, &event(EventKind::Received, 5, None), None, None),
             vec!["received 0.00000005 KAS".to_string()]
         );
+    }
+
+    #[test]
+    fn idle_rule_needs_a_known_gap() {
+        let rules = AlertRules {
+            any_activity: false,
+            idle_hours: Some(2),
+            ..AlertRules::default()
+        };
+        let mut ev = event(EventKind::Received, 7, None);
+        ev.time_ms = 10 * 3_600_000;
+        // No previous activity known: nothing to measure from.
+        assert!(evaluate(&rules, &ev, None, None).is_empty());
+        // Too recent.
+        assert!(evaluate(&rules, &ev, None, Some(9 * 3_600_000)).is_empty());
+        let fired = evaluate(&rules, &ev, None, Some(7 * 3_600_000));
+        assert_eq!(
+            fired,
+            vec!["received 0.00000007 KAS after 3h 00m idle".to_string()]
+        );
+        // Zero hours is off.
+        let off = AlertRules {
+            idle_hours: Some(0),
+            ..rules
+        };
+        assert!(evaluate(&off, &ev, None, Some(0)).is_empty());
+    }
+
+    #[test]
+    fn events_are_built_from_a_notification() {
+        use kaspa_rpc_core::{
+            RpcHash, RpcScriptPublicKey, RpcTransactionOutpoint, RpcUtxoEntry,
+            RpcUtxosByAddressesEntry,
+        };
+        let synthetic = |n: u32| crate::index::writer::testing::address(n).to_string();
+        let (a, b, c) = (&synthetic(1), &synthetic(2), &synthetic(3));
+        let entry =
+            |address: &str, tx: u64, amount: u64, coinbase: bool| RpcUtxosByAddressesEntry {
+                address: Some(RpcAddress::try_from(address).unwrap()),
+                outpoint: RpcTransactionOutpoint {
+                    transaction_id: RpcHash::from_u64_word(tx),
+                    index: 0,
+                },
+                utxo_entry: RpcUtxoEntry {
+                    amount,
+                    script_public_key: RpcScriptPublicKey::default(),
+                    block_daa_score: 1,
+                    is_coinbase: coinbase,
+                    covenant_id: None,
+                },
+            };
+        // `a` spends a 500 UTXO and gets 120 change back (one tx); `b` receives 300 from
+        // it plus a 50 coinbase (two txs, so no single txid); `c` is only shuffled.
+        let n = UtxosChangedNotification {
+            added: Arc::new(vec![
+                entry(a, 1, 120, false),
+                entry(b, 1, 300, false),
+                entry(b, 2, 50, true),
+                entry(c, 3, 10, false),
+            ]),
+            removed: Arc::new(vec![entry(a, 0, 500, false), entry(c, 0, 10, false)]),
+        };
+        let changes = net_changes(&n);
+        assert_eq!(changes.len(), 3);
+        let mut balances = HashMap::from([(a.clone(), 1_000u64), (c.clone(), 10)]);
+        let events = build_events(changes, &mut balances, 99);
+        assert_eq!(events.len(), 2);
+        let (ea, before_a) = &events[0];
+        assert_eq!(&ea.address, a);
+        assert_eq!(ea.kind, EventKind::Sent);
+        assert_eq!(ea.amount, 380);
+        assert_eq!(ea.txid, Some(RpcHash::from_u64_word(1).to_string()));
+        assert_eq!(ea.balance_after, Some(620));
+        assert_eq!(*before_a, Some(1_000));
+        assert_eq!(balances[a.as_str()], 620);
+        let (eb, before_b) = &events[1];
+        assert_eq!(&eb.address, b);
+        assert_eq!(eb.kind, EventKind::Received);
+        assert_eq!(eb.amount, 350);
+        assert!(eb.txid.is_none() && eb.is_coinbase);
+        // An unknown balance stays unknown; the next refresh from the node fills it.
+        assert_eq!(eb.balance_after, None);
+        assert_eq!(*before_b, None);
+        assert!(!balances.contains_key(b.as_str()));
+        assert_eq!(balances[c.as_str()], 10);
     }
 
     #[test]

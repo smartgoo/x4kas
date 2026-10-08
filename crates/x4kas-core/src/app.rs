@@ -622,6 +622,8 @@ pub struct WatchState {
     pub alerts: VecDeque<Alert>,
     /// Alerts raised since the Addresses tab was last shown.
     pub unread_alerts: usize,
+    /// Alerts raised in total, so a frontend can tell which of `alerts` are new to it.
+    pub alerts_raised: u64,
     pub status: WatchStatus,
 }
 
@@ -635,6 +637,7 @@ impl WatchState {
         self.alerts.push_front(alert);
         self.alerts.truncate(crate::watch::MAX_ALERTS);
         self.unread_alerts += 1;
+        self.alerts_raised += 1;
     }
 
     pub fn entry(&self, address: &str) -> Option<&WatchEntry> {

@@ -12,6 +12,7 @@ mod mempool;
 mod rpc_explorer;
 mod terminal;
 mod theme;
+mod toasts;
 mod widgets;
 
 use std::sync::Arc;
@@ -27,6 +28,7 @@ use addresses::AddressesTab;
 use connection::ConnectionWindow;
 use flows::FlowWindowUi;
 use terminal::TerminalPane;
+use toasts::Toasts;
 use widgets::kv;
 use x4kas_core::analytics_streaming;
 use x4kas_core::app::{
@@ -113,6 +115,7 @@ struct GuiApp {
     addresses: AddressesTab,
     address_window: AddressWindowUi,
     flow_window: FlowWindowUi,
+    toasts: Toasts,
 }
 
 impl GuiApp {
@@ -128,6 +131,7 @@ impl GuiApp {
             addresses: AddressesTab::default(),
             address_window: AddressWindowUi::default(),
             flow_window: FlowWindowUi::default(),
+            toasts: Toasts::default(),
         }
     }
 
@@ -215,6 +219,9 @@ impl eframe::App for GuiApp {
         }
         self.address_window.show(ctx, &mut app, &self.cmd_tx);
         self.flow_window.show(ctx, &mut app, &self.cmd_tx);
+        // Watchlist alerts pop up over any tab.
+        self.toasts.collect(&app);
+        self.toasts.show(ctx, &app);
 
         self.connection.show(ctx, &mut app, &self.cmd_tx);
         help::show(ctx, &mut self.show_help);
@@ -327,7 +334,13 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App, show_help: &mut bool, terminal: &mu
 
         ui.spacing_mut().item_spacing.x = 2.0;
         for (i, tab) in Tab::all().iter().enumerate() {
-            if tab_button(ui, i + 1, tab.label(), app.active_tab == *tab)
+            let selected = app.active_tab == *tab;
+            // Alerts raised while the Addresses tab wasn't on show.
+            let badge = match tab {
+                Tab::Addresses if !selected => app.watch.unread_alerts,
+                _ => 0,
+            };
+            if tab_button(ui, i + 1, tab.label(), selected, badge)
                 .on_hover_text(format!("Shortcut: {}", i + 1))
                 .clicked()
             {
@@ -359,17 +372,30 @@ fn brand(ui: &mut egui::Ui) {
     ui.label(RichText::new("kas").color(theme::TEXT_BRIGHT).size(15.0));
 }
 
-/// A tab in the strip: the shortcut number, then the name. The active tab is inverted.
-fn tab_button(ui: &mut egui::Ui, number: usize, label: &str, selected: bool) -> egui::Response {
+/// A tab in the strip: the shortcut number, then the name, then a count (unread alerts)
+/// when `badge` is non-zero. The active tab is inverted.
+fn tab_button(
+    ui: &mut egui::Ui,
+    number: usize,
+    label: &str,
+    selected: bool,
+    badge: usize,
+) -> egui::Response {
     let (num_color, text_color, fill) = if selected {
         (theme::BG_DEEP, theme::BG_DEEP, theme::ACCENT)
     } else {
         (theme::ACCENT, theme::TEXT, egui::Color32::TRANSPARENT)
     };
+    let badge = if badge > 0 {
+        RichText::new(format!(" {badge}")).color(theme::WARN)
+    } else {
+        RichText::new("")
+    };
     ui.add(
         Button::new((
             RichText::new(number.to_string()).color(num_color),
             RichText::new(label).color(text_color),
+            badge,
         ))
         .fill(fill)
         .stroke(Stroke::NONE)

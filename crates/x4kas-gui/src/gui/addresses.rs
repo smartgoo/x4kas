@@ -5,8 +5,8 @@ use eframe::egui::{self, RichText, TextEdit, Ui};
 
 use super::theme;
 use super::widgets::{
-    CARD_GAP, address, card, card_with_header, fit_label, placeholder, primary_button,
-    request_address, section_title, status_chip, weighted_columns, wide_table,
+    CARD_GAP, address, card, card_with_header, placeholder, primary_button, request_address,
+    status_chip, weighted_columns, wide_table,
 };
 use x4kas_core::app::{App, WatchPhase};
 use x4kas_core::controller::{CommandSender, UiCommand};
@@ -15,6 +15,7 @@ use x4kas_core::watch::{EventKind, WatchEntry};
 
 /// Narrowest a card gets before its row wraps.
 const CARD_MIN: f32 = 380.0;
+const DAY_MS: u64 = 24 * 3_600_000;
 
 /// The tab's own state: the add/search field.
 #[derive(Default)]
@@ -173,6 +174,7 @@ impl AddressesTab {
             .filter(|e| e.network == network)
             .cloned()
             .collect();
+        let now = x4kas_core::format::now_ms();
         let rows = entries
             .iter()
             .map(|e| {
@@ -183,7 +185,20 @@ impl AddressesTab {
                     .events
                     .iter()
                     .find(|ev| ev.address == e.address)
-                    .map(|ev| ago(ev.time_ms));
+                    .map(|ev| ev.time_ms)
+                    .or(e.last_activity_ms)
+                    .map(ago);
+                // Net of the events seen in the last 24h (since this session started).
+                let day: i128 = app
+                    .watch
+                    .events
+                    .iter()
+                    .filter(|ev| ev.address == e.address && now.saturating_sub(ev.time_ms) < DAY_MS)
+                    .map(|ev| match ev.kind {
+                        EventKind::Received => i128::from(ev.amount),
+                        EventKind::Sent => -i128::from(ev.amount),
+                    })
+                    .sum();
                 [
                     e.address.clone(),
                     e.name
@@ -203,6 +218,7 @@ impl AddressesTab {
                         }
                         _ => String::new(),
                     },
+                    signed_kas(day),
                     last.unwrap_or_default(),
                     if e.enabled { "on".into() } else { "off".into() },
                 ]
@@ -216,6 +232,7 @@ impl AddressesTab {
                 "Name",
                 "Balance (KAS)",
                 "Pending",
+                "24h change",
                 "Last activity",
                 "Alerts",
             ],
@@ -263,6 +280,15 @@ pub fn looks_like_address(s: &str) -> bool {
     s.contains(':') && s.len() > 40 && !s.contains(' ')
 }
 
+/// A net amount with its sign, or blank for zero.
+fn signed_kas(sompi: i128) -> String {
+    match sompi.signum() {
+        0 => String::new(),
+        1 => format!("+{}", format_kas(sompi as f64, 2)),
+        _ => format!("-{}", format_kas(-sompi as f64, 2)),
+    }
+}
+
 fn ago(time_ms: u64) -> String {
     let now = x4kas_core::format::now_ms();
     format!(
@@ -304,32 +330,32 @@ fn watch_status(ui: &mut Ui, app: &App) {
     });
 }
 
+/// Newest first; the watchlist name prefixes the message (labels show as chips on the
+/// address).
 fn alerts(ui: &mut Ui, app: &App) {
     let rows = app
         .watch
         .alerts
         .iter()
         .map(|a| {
-            let who = a
-                .name
-                .clone()
-                .or_else(|| app.labels.name(&a.address).map(str::to_string))
-                .unwrap_or_else(|| a.address.clone());
-            [format!("{who}: {}", a.message), ago(a.time_ms)]
+            let message = match &a.name {
+                Some(name) => format!("{name}: {}", a.message),
+                None => a.message.clone(),
+            };
+            [a.address.clone(), message, ago(a.time_ms)]
         })
         .collect();
     wide_table(
         ui,
         "alerts",
-        ["Alert", "When"],
+        ["Address", "Alert", "When"],
         rows,
         "No alerts yet",
-        |ui, v| {
-            fit_label(ui, v);
-        },
+        address,
     );
 }
 
+/// Confirmed balance changes, newest first.
 fn activity(ui: &mut Ui, app: &App) {
     let rows = app
         .watch
@@ -340,14 +366,14 @@ fn activity(ui: &mut Ui, app: &App) {
                 EventKind::Received => "+",
                 EventKind::Sent => "-",
             };
-            let who = app
+            let name = app
                 .watch
                 .entry(&e.address)
                 .and_then(|w| w.name.clone())
-                .or_else(|| app.labels.name(&e.address).map(str::to_string))
-                .unwrap_or_else(|| e.address.clone());
+                .unwrap_or_default();
             [
-                who,
+                e.address.clone(),
+                name,
                 format!("{sign}{}", format_kas(e.amount as f64, 8)),
                 if e.is_coinbase {
                     "coinbase".into()
@@ -361,12 +387,9 @@ fn activity(ui: &mut Ui, app: &App) {
     wide_table(
         ui,
         "activity",
-        ["Address", "Amount (KAS)", "", "When"],
+        ["Address", "Name", "Amount (KAS)", "", "When"],
         rows,
         "No confirmed activity yet",
-        |ui, v| {
-            fit_label(ui, v);
-        },
+        address,
     );
-    let _ = section_title;
 }

@@ -156,6 +156,7 @@ mod tests {
         let args = Args::try_parse_from(std::iter::once("x4kas-cli").chain(argv.iter().copied()))?;
         match args.command {
             CliCommand::Rpc { call } => Ok(call),
+            other => panic!("expected an rpc command, got {other:?}"),
         }
     }
 

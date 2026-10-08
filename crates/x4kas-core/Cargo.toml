@@ -22,3 +22,8 @@ bincode.workspace = true
 futures.workspace = true
 async-channel.workspace = true
 indexmap.workspace = true
+fjall.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+kaspa-addresses.workspace = true

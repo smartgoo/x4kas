@@ -4,10 +4,14 @@
 pub mod analytics;
 pub mod analytics_streaming;
 pub mod app;
+pub mod chain_stream;
 pub mod config;
 pub mod controller;
 pub mod emission;
 pub mod format;
+pub mod index;
+pub mod labels;
 pub mod polling;
 pub mod rpc;
 pub mod tx_inspect;
+pub mod watch;

@@ -4,7 +4,8 @@ use std::time::Duration;
 use anyhow::Result;
 use kaspa_rpc_core::api::rpc::RpcApi;
 use kaspa_rpc_core::{
-    GetVirtualChainFromBlockV2Response, RpcDataVerbosityLevel, RpcHash, RpcHeader,
+    GetVirtualChainFromBlockV2Response, RpcAddress, RpcDataVerbosityLevel, RpcHash, RpcHeader,
+    UtxosChangedNotification,
 };
 use kaspa_wrpc_client::prelude::*;
 use serde::Serialize;
@@ -99,10 +100,17 @@ impl RpcManager {
             client.get_fee_estimate(),
             client.get_sink_blue_score(),
         );
-        // Header only (no transactions) of the sink, for "seconds behind tip".
-        let sink_block = match dag_info {
-            Ok(ref info) => Some(client.get_block(info.sink, false).await),
-            Err(_) => None,
+        // Headers only (no transactions) of the sink, for "seconds behind tip", and of the
+        // pruning point, the address index's retention floor.
+        let (sink_block, pruning_block) = match dag_info {
+            Ok(ref info) => {
+                let (sink, pruning) = tokio::join!(
+                    client.get_block(info.sink, false),
+                    client.get_block(info.pruning_point_hash, false),
+                );
+                (Some(sink), Some(pruning))
+            }
+            Err(_) => (None, None),
         };
         // Balance lookups need the node's UTXO index.
         let burn_address = server_info
@@ -153,6 +161,13 @@ impl RpcManager {
         match sink_block {
             Some(Ok(block)) => app.node.sink_timestamp_ms = Some(block.header.timestamp),
             Some(Err(e)) => errors.push(format!("sink_block: {}", e)),
+            None => {}
+        }
+        match pruning_block {
+            Some(Ok(block)) => {
+                app.node.pruning_point_timestamp_ms = Some(block.header.timestamp);
+            }
+            Some(Err(e)) => errors.push(format!("pruning_point_block: {}", e)),
             None => {}
         }
 
@@ -237,6 +252,114 @@ impl RpcManager {
         if app.node.dag_visualizer.add(block) && app.active_tab == Tab::Dashboard {
             app.mark_dirty();
         }
+    }
+
+    /// Forward the node's `UtxosChanged` notifications for `addresses` to `sender` until
+    /// the surrounding task is aborted, resubscribing on every connect like
+    /// [`Self::stream_blocks`]. Needs the node's UTXO index.
+    pub async fn watch_utxos(
+        &self,
+        addresses: Vec<RpcAddress>,
+        sender: tokio::sync::mpsc::Sender<UtxosChangedNotification>,
+    ) {
+        let ctl = self.client.rpc_ctl().multiplexer().channel();
+        let (tx, rx) = async_channel::unbounded();
+        let subscribe = |tx: &async_channel::Sender<Notification>| {
+            let id = self.client.register_new_listener(ChannelConnection::new(
+                "x4kas-watch",
+                tx.clone(),
+                ChannelType::Persistent,
+            ));
+            let scope = Scope::UtxosChanged(UtxosChangedScope::new(addresses.clone()));
+            async move { self.client.start_notify(id, scope).await }
+        };
+        if self.client.is_connected()
+            && let Err(e) = subscribe(&tx).await
+        {
+            self.app_state.write().await.watch.status.last_error = Some(format!("subscribe: {e}"));
+        }
+        loop {
+            tokio::select! {
+                state = ctl.receiver.recv() => match state {
+                    Ok(RpcState::Connected) => {
+                        if let Err(e) = subscribe(&tx).await {
+                            self.app_state.write().await.watch.status.last_error =
+                                Some(format!("subscribe: {e}"));
+                        }
+                    }
+                    Ok(RpcState::Disconnected) => {}
+                    Err(_) => return,
+                },
+                notification = rx.recv() => match notification {
+                    Ok(Notification::UtxosChanged(n)) => {
+                        if sender.send(n).await.is_err() {
+                            return;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => return,
+                },
+            }
+        }
+    }
+
+    /// Balances of `addresses` in sompi (needs the node's UTXO index).
+    pub async fn balances(&self, addresses: Vec<RpcAddress>) -> Result<Vec<(String, u64)>> {
+        Ok(self
+            .client
+            .get_balances_by_addresses(addresses)
+            .await?
+            .into_iter()
+            .map(|e| (e.address.to_string(), e.balance.unwrap_or(0)))
+            .collect())
+    }
+
+    /// Unconfirmed activity of `addresses`: `(address, incoming, outgoing)` sompi in the
+    /// mempool, from the transactions paying each address and spending from it.
+    pub async fn pending_by_addresses(
+        &self,
+        addresses: Vec<RpcAddress>,
+    ) -> Result<Vec<(String, u64, u64)>> {
+        let entries = self
+            .client
+            .get_mempool_entries_by_addresses(addresses, false, false)
+            .await?;
+        Ok(entries
+            .into_iter()
+            .map(|e| {
+                let address = e.address.to_string();
+                let incoming: u64 = e
+                    .receiving
+                    .iter()
+                    .flat_map(|m| &m.transaction.outputs)
+                    .filter(|o| {
+                        o.verbose_data
+                            .as_ref()
+                            .is_some_and(|v| v.script_public_key_address.to_string() == address)
+                    })
+                    .map(|o| o.value)
+                    .sum();
+                // Mempool inputs carry no amounts, so what leaves is what the spending
+                // transactions pay to other addresses.
+                let outgoing: u64 = e
+                    .sending
+                    .iter()
+                    .flat_map(|m| &m.transaction.outputs)
+                    .filter(|o| {
+                        o.verbose_data
+                            .as_ref()
+                            .is_none_or(|v| v.script_public_key_address.to_string() != address)
+                    })
+                    .map(|o| o.value)
+                    .sum();
+                (address, incoming, outgoing)
+            })
+            .collect())
+    }
+
+    /// Balance of one address in sompi (needs the node's UTXO index).
+    pub async fn balance(&self, address: RpcAddress) -> Result<u64> {
+        Ok(self.client.get_balance_by_address(address).await?)
     }
 
     /// Run a read-only RPC method from the RPC Cmds tab, truncating long responses so

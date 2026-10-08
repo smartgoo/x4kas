@@ -18,7 +18,16 @@ pub struct PollingHandles {
     /// Connects the RPC client, then polls node state.
     pub node: Option<JoinHandle<()>>,
     pub hashrate: Option<JoinHandle<()>>,
+    /// The chain stream (`chain_stream::run`), which feeds the sinks below.
     pub analytics: Option<JoinHandle<()>>,
+    /// The analytics engine, fed by the chain stream.
+    pub analytics_sink: Option<JoinHandle<()>>,
+    /// The address index writer thread, fed by the chain stream. Not aborted: a blocking
+    /// thread can't be, and it must finish its batch and release the store's lock. It
+    /// exits once the stream (its sender) is gone; see [`Self::stop_index`].
+    pub index: Option<JoinHandle<()>>,
+    /// The watchlist's `UtxosChanged` subscription (`watch::start_watch`).
+    pub watch: Option<JoinHandle<()>>,
     /// One-off requests from the frontend (RPC calls, block lookups, commands).
     requests: JoinSet<()>,
 }
@@ -31,13 +40,28 @@ impl PollingHandles {
         self.requests.spawn(task);
     }
 
+    /// Abort every task except the index writer; call [`Self::stop_index`] after.
     pub fn abort_all(&mut self) {
-        for handle in [&mut self.node, &mut self.hashrate, &mut self.analytics] {
+        for handle in [
+            &mut self.node,
+            &mut self.hashrate,
+            &mut self.analytics,
+            &mut self.analytics_sink,
+            &mut self.watch,
+        ] {
             if let Some(h) = handle.take() {
                 h.abort();
             }
         }
         self.requests.abort_all();
+    }
+
+    /// Wait for the index writer to drain and close the store. Call after
+    /// [`Self::abort_all`], which drops the stream that feeds it.
+    pub async fn stop_index(&mut self) {
+        if let Some(h) = self.index.take() {
+            let _ = h.await;
+        }
     }
 }
 

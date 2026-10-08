@@ -1,14 +1,22 @@
 //! `x4kas-cli`: headless access to a Kaspa node. Each command connects, prints its
 //! result to stdout and exits, with a nonzero exit code on error.
 
+mod address;
+mod index;
+mod labels;
 mod rpc;
+mod watch;
 
 use std::time::Duration;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+use crate::address::AddressCommand;
+use crate::index::IndexCommand;
+use crate::labels::LabelsCommand;
 use crate::rpc::RpcCall;
+use crate::watch::WatchArgs;
 
 #[derive(Parser, Debug, Clone)]
 #[command(
@@ -40,6 +48,23 @@ pub enum Command {
         #[command(subcommand)]
         call: RpcCall,
     },
+    /// Query the address index (built by the GUI or `index run`); needs no node
+    Address {
+        #[command(subcommand)]
+        cmd: AddressCommand,
+    },
+    /// Build the address index headlessly, or show what it holds
+    Index {
+        #[command(subcommand)]
+        cmd: IndexCommand,
+    },
+    /// Follow addresses live: one JSON line per balance change and alert, until Ctrl+C
+    Watch(WatchArgs),
+    /// Address labels: yours, the public api.kaspa.org list and the bundled snapshot
+    Labels {
+        #[command(subcommand)]
+        cmd: LabelsCommand,
+    },
 }
 
 #[tokio::main]
@@ -49,6 +74,10 @@ async fn main() -> Result<()> {
     let timeout = Duration::from_secs(args.timeout);
     match args.command {
         Command::Rpc { call } => rpc::run(url, &args.network, timeout, call).await,
+        Command::Address { cmd } => address::run(&args.network, cmd),
+        Command::Index { cmd } => index::run(url, &args.network, cmd).await,
+        Command::Watch(watch_args) => watch::run(url, &args.network, watch_args).await,
+        Command::Labels { cmd } => labels::run(cmd).await,
     }
 }
 

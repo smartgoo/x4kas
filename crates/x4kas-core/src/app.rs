@@ -1,12 +1,15 @@
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::analytics::{AggregatedView, AnalyticsEngine, TxHistogram};
 use crate::emission::{BlockReward, Emission};
+use crate::index::query::{AddressProfile, ClusterInfo, FlowGraph, Page, Peer, TxRow};
+use crate::labels::{LabelBook, LabelSettings};
 use crate::rpc::hash_links::{HashLink, block_hash_links};
 use crate::rpc::methods::{RPC_METHODS, RpcMethod};
 use crate::rpc::types::*;
+use crate::watch::{AddressEvent, Alert, WatchEntry, Watchlist};
 
 /// A block from the node's `BlockAdded` stream, as the DAG visualizer needs it.
 #[derive(Debug, Clone, PartialEq)]
@@ -150,19 +153,26 @@ impl DagStats {
 pub enum Tab {
     #[default]
     Dashboard,
+    Addresses,
     Mempool,
     RpcExplorer,
 }
 
 impl Tab {
     pub fn all() -> &'static [Tab] {
-        &[Tab::Dashboard, Tab::Mempool, Tab::RpcExplorer]
+        &[
+            Tab::Dashboard,
+            Tab::Addresses,
+            Tab::Mempool,
+            Tab::RpcExplorer,
+        ]
     }
 
     /// Name in the tab strip, after its number shortcut (its position in [`Self::all`] + 1).
     pub fn label(&self) -> &'static str {
         match self {
             Tab::Dashboard => "Dashboard",
+            Tab::Addresses => "Addresses",
             Tab::Mempool => "Mempool",
             Tab::RpcExplorer => "RPC Cmds",
         }
@@ -347,6 +357,9 @@ pub struct NodeState {
     pub sink_blue_score: Option<u64>,
     /// Header timestamp (unix ms) of the sink, the node's newest selected tip.
     pub sink_timestamp_ms: Option<u64>,
+    /// Header timestamp (unix ms) of the pruning point: the address index prunes
+    /// everything older.
+    pub pruning_point_timestamp_ms: Option<u64>,
     pub node_url: Option<String>,
     pub node_uid: Option<String>,
     pub connection_status: ConnectionStatus,
@@ -408,7 +421,8 @@ pub enum StartPoint {
     LastDay,
 }
 
-/// Progress of the analytics task, shown in the status bar and on the Dashboard tab.
+/// Progress of the chain stream that feeds analytics and the address index, shown in
+/// the status bar and on the Dashboard tab.
 #[derive(Debug, Clone, Default)]
 pub struct AnalyticsStatus {
     pub phase: AnalyticsPhase,
@@ -518,6 +532,235 @@ impl AnalyticsState {
     }
 }
 
+/// What the address index writer is doing.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum IndexPhase {
+    /// No writer running (not connected, or connected through the resolver).
+    #[default]
+    Idle,
+    Opening,
+    /// Applying batches from the chain stream (whose phase says whether that's a
+    /// catch-up or live polling).
+    Indexing,
+    /// The last batch failed; the writer goes on with the next.
+    Error(String),
+}
+
+/// Progress of the address index, shown in the status bar.
+#[derive(Debug, Clone, Default)]
+pub struct IndexStatus {
+    pub phase: IndexPhase,
+    pub txs_indexed: u64,
+    pub addresses: u64,
+    /// The last indexed chain block.
+    pub position: Option<crate::index::Position>,
+    pub disk_bytes: u64,
+    pub slabs: usize,
+    /// The time span the index covers, `(from_ms, to_ms)`.
+    pub coverage: Option<(u64, u64)>,
+    /// Smoothed write speed, in transactions per second of writer time.
+    pub tx_per_sec: Option<f64>,
+    /// Batches waiting for the writer.
+    pub backlog: usize,
+    /// Removed chain blocks the index didn't have (reorgs past its coverage).
+    pub unresolved_reorgs: u64,
+    pub last_batch_at: Option<Instant>,
+}
+
+impl IndexStatus {
+    /// Record a written batch of `txs` transactions that took `elapsed`.
+    pub fn record_batch(&mut self, txs: usize, elapsed: Duration) {
+        let secs = elapsed.as_secs_f64();
+        if txs > 0 && secs > 0.0 {
+            let rate = txs as f64 / secs;
+            self.tx_per_sec = Some(match self.tx_per_sec {
+                Some(r) => r * 0.8 + rate * 0.2,
+                None => rate,
+            });
+        }
+        self.last_batch_at = Some(Instant::now());
+    }
+}
+
+#[derive(Default)]
+pub struct IndexState {
+    pub status: IndexStatus,
+}
+
+/// What the watchlist task is doing.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum WatchPhase {
+    /// Nothing to watch, or not connected.
+    #[default]
+    Idle,
+    /// Waiting for the node to connect and sync.
+    Waiting,
+    /// The node can't serve address queries (no UTXO index).
+    Unavailable(String),
+    /// Subscribed for this many addresses.
+    Active(usize),
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct WatchStatus {
+    pub phase: WatchPhase,
+    pub last_error: Option<String>,
+    pub last_event_at: Option<Instant>,
+}
+
+/// The watchlist with its live data: balances, pending activity, events and alerts.
+#[derive(Default)]
+pub struct WatchState {
+    pub list: Watchlist,
+    /// Balance in sompi per watched address, from the node.
+    pub balances: HashMap<String, u64>,
+    /// Unconfirmed `(incoming, outgoing)` sompi per watched address.
+    pub pending: HashMap<String, (u64, u64)>,
+    /// Newest first.
+    pub events: VecDeque<AddressEvent>,
+    /// Newest first.
+    pub alerts: VecDeque<Alert>,
+    /// Alerts raised since the Addresses tab was last shown.
+    pub unread_alerts: usize,
+    pub status: WatchStatus,
+}
+
+impl WatchState {
+    pub fn push_event(&mut self, event: AddressEvent) {
+        self.events.push_front(event);
+        self.events.truncate(crate::watch::MAX_EVENTS);
+    }
+
+    pub fn push_alert(&mut self, alert: Alert) {
+        self.alerts.push_front(alert);
+        self.alerts.truncate(crate::watch::MAX_ALERTS);
+        self.unread_alerts += 1;
+    }
+
+    pub fn entry(&self, address: &str) -> Option<&WatchEntry> {
+        self.list.entries.iter().find(|e| e.address == address)
+    }
+
+    /// Drop node data (balances, pending, events, alerts) but keep the list.
+    pub fn clear_node_data(&mut self) {
+        self.balances.clear();
+        self.pending.clear();
+        self.events.clear();
+        self.alerts.clear();
+        self.unread_alerts = 0;
+        self.status = WatchStatus::default();
+    }
+}
+
+/// Everything the Address Info window shows for one address.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AddressView {
+    pub profile: AddressProfile,
+    /// Balance in sompi from the node (needs its UTXO index).
+    pub balance: Option<u64>,
+    pub page: Page<TxRow>,
+    pub peers: Vec<Peer>,
+    /// Balance over the indexed window, `(time_ms, balance)` oldest first (see
+    /// `query::balance_curve`); relative to 0 when the node balance is unknown.
+    pub curve: Vec<(u64, i64)>,
+    /// The likely-owner cluster, with a sample of members; `None` when unindexed.
+    pub cluster: Option<ClusterInfo>,
+}
+
+/// The flow graph window: money followed hop by hop from one or more addresses.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FlowState {
+    pub open: bool,
+    /// The addresses the graph was started from.
+    pub roots: Vec<String>,
+    pub graph: FlowGraph,
+    pub loading: bool,
+    pub error: Option<String>,
+}
+
+impl FlowState {
+    /// Start a new graph from `address`; the controller fills it in.
+    pub fn start(&mut self, address: String) {
+        self.open = true;
+        self.roots = vec![address];
+        self.graph = FlowGraph::default();
+        self.loading = true;
+        self.error = None;
+    }
+
+    pub fn set_result(&mut self, result: Result<FlowGraph, String>) {
+        self.loading = false;
+        match result {
+            Ok(graph) => self.graph.merge(graph),
+            Err(e) => self.error = Some(e),
+        }
+    }
+
+    pub fn close(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// The Address Info window, shown on any tab while `Some`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AddressWindow {
+    pub address: String,
+    pub view: Option<AddressView>,
+    pub loading: bool,
+    pub loading_more: bool,
+    pub error: Option<String>,
+    /// What the online sources said, once asked.
+    pub online_result: Option<Vec<crate::labels::OnlineEntry>>,
+}
+
+#[derive(Default)]
+pub struct AddressState {
+    pub open: Option<AddressWindow>,
+    pub flows: FlowState,
+}
+
+impl AddressState {
+    /// Start loading `address` (the controller then fills in the view).
+    pub fn request(&mut self, address: String) {
+        self.open = Some(AddressWindow {
+            address,
+            loading: true,
+            ..Default::default()
+        });
+    }
+
+    pub fn set_view(&mut self, address: &str, result: Result<AddressView, String>) {
+        let Some(window) = self.open.as_mut().filter(|w| w.address == address) else {
+            return;
+        };
+        window.loading = false;
+        match result {
+            Ok(view) => window.view = Some(view),
+            Err(e) => window.error = Some(e),
+        }
+    }
+
+    /// Append an older page of transactions.
+    pub fn append_page(&mut self, address: &str, result: Result<Page<TxRow>, String>) {
+        let Some(window) = self.open.as_mut().filter(|w| w.address == address) else {
+            return;
+        };
+        window.loading_more = false;
+        match (result, window.view.as_mut()) {
+            (Ok(page), Some(view)) => {
+                view.page.items.extend(page.items);
+                view.page.next = page.next;
+            }
+            (Err(e), _) => window.error = Some(e),
+            _ => {}
+        }
+    }
+
+    pub fn close(&mut self) {
+        self.open = None;
+    }
+}
+
 #[derive(Default)]
 pub struct DagSelection {
     /// The block shown (or loading) in the Block Info window.
@@ -557,6 +800,13 @@ pub struct App {
 
     pub node: NodeState,
     pub analytics: AnalyticsState,
+    pub index: IndexState,
+    pub watch: WatchState,
+    pub address: AddressState,
+    /// Known address labels; replaced as a whole when a source changes.
+    pub labels: Arc<LabelBook>,
+    /// Opt-in online label sources.
+    pub label_settings: LabelSettings,
     pub dag_selection: DagSelection,
     pub market_data: Option<MarketData>,
 
@@ -596,6 +846,10 @@ impl App {
         self.analytics.cached_views = None;
         self.analytics.tx_histogram = None;
         self.analytics.reorg_notification = None;
+        self.index.status = IndexStatus::default();
+        self.watch.clear_node_data();
+        self.address.close();
+        self.address.flows.close();
         self.mempool_open = None;
         self.dag_selection.set_detail(None);
         self.dag_selection.block_loading = false;
@@ -764,7 +1018,7 @@ mod tests {
     #[test]
     fn tab_labels() {
         let labels: Vec<_> = Tab::all().iter().map(Tab::label).collect();
-        assert_eq!(labels, ["Dashboard", "Mempool", "RPC Cmds"]);
+        assert_eq!(labels, ["Dashboard", "Addresses", "Mempool", "RPC Cmds"]);
     }
 
     #[test]
@@ -780,6 +1034,8 @@ mod tests {
     fn next_tab_cycles_forward() {
         let mut app = App::default();
         assert_eq!(app.active_tab, Tab::Dashboard);
+        app.next_tab();
+        assert_eq!(app.active_tab, Tab::Addresses);
         app.next_tab();
         assert_eq!(app.active_tab, Tab::Mempool);
         app.next_tab();

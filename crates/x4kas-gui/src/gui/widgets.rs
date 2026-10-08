@@ -493,7 +493,21 @@ enum LinkKind {
 /// A Kaspa address: fitted like [`fit_label`], with a copy icon, a hover highlight and a
 /// click menu to open it in a block explorer. Use this for every address shown.
 pub fn address(ui: &mut Ui, addr: &str) {
-    linked_value(ui, addr, LinkKind::Address, false);
+    linked_value(ui, addr, LinkKind::Address, false, true);
+}
+
+/// [`address`] without its label chip, for a table that shows the label in its own
+/// column (see [`label_cell`]).
+pub fn address_bare(ui: &mut Ui, addr: &str) {
+    linked_value(ui, addr, LinkKind::Address, false, false);
+}
+
+/// The label chip of `addr` on its own (nothing when it has none): a click edits the
+/// user's label in place, as on the chip before an [`address`].
+pub fn label_cell(ui: &mut Ui, addr: &str) {
+    let id = ui.id().with(("label_cell", addr));
+    let label = labels(ui.ctx()).and_then(|book| book.get(addr).cloned());
+    label_slot(ui, id, addr, label.as_ref());
 }
 
 /// A block hash, like [`address`] but a click opens the Block Info window for it (see
@@ -502,13 +516,14 @@ pub fn address(ui: &mut Ui, addr: &str) {
 /// e.g. for the block on show. Returns true when clicked. Use this for every block hash
 /// shown.
 pub fn block_hash(ui: &mut Ui, hash: &str, selected: bool) -> bool {
-    linked_value(ui, hash, LinkKind::Block, selected)
+    linked_value(ui, hash, LinkKind::Block, selected, false)
 }
 
-fn linked_value(ui: &mut Ui, value: &str, kind: LinkKind, selected: bool) -> bool {
+/// `chip`: show a known address's label chip (and the inline editor) before it.
+fn linked_value(ui: &mut Ui, value: &str, kind: LinkKind, selected: bool, chip: bool) -> bool {
     if !ui.layout().is_horizontal() {
         return ui
-            .horizontal(|ui| linked_value(ui, value, kind, selected))
+            .horizontal(|ui| linked_value(ui, value, kind, selected, chip))
             .inner;
     }
     let id = ui.id().with(("linked_value", value));
@@ -524,11 +539,14 @@ fn linked_value(ui: &mut Ui, value: &str, kind: LinkKind, selected: bool) -> boo
         LinkKind::Address => labels(ui.ctx()),
         LinkKind::Block => None,
     };
-    let label = book.as_ref().and_then(|book| book.get(value).cloned());
+    let label = book
+        .as_ref()
+        .filter(|_| chip)
+        .and_then(|book| book.get(value).cloned());
     let user_label = book
         .as_ref()
         .and_then(|book| book.user_labels().get(value).cloned());
-    if !rtl {
+    if !rtl && chip {
         label_slot(ui, id, value, label.as_ref());
     }
 
@@ -610,7 +628,7 @@ fn linked_value(ui: &mut Ui, value: &str, kind: LinkKind, selected: bool) -> boo
     if !rtl {
         icon_gap(ui, true, |ui| copy_button(ui, id, value, copy_hint));
     }
-    if rtl {
+    if rtl && chip {
         label_slot(ui, id, value, label.as_ref());
     }
     get_block

@@ -1,7 +1,7 @@
 //! Settings page (`SettingsPage`, opened from the ⚙ button in the top bar): a left
 //! navigation of sections with the chosen one's content on the right, in place of the
-//! active tab. Address Labels: the public list refresh, the opt-in online sources, and
-//! the user's own labels (add, edit in place, remove, the whole saved list).
+//! active tab. Address Labels: the public list (its sources and refresh) and the user's
+//! every known label (label, address, source; add, edit in place, remove).
 
 use eframe::egui::{self, RichText, TextEdit, Ui};
 use egui_extras::{Column, TableBuilder};
@@ -9,17 +9,17 @@ use egui_extras::{Column, TableBuilder};
 use super::monitoring::looks_like_address;
 use super::theme;
 use super::widgets::{
-    CARD_GAP, address, card, card_with_header, copy_value, placeholder, primary_button,
-    request_label, section_title,
+    CARD_GAP, address_bare, card, card_with_header, copy_value, kv, kv_grid, label_cell,
+    placeholder, primary_button, section_title,
 };
 use x4kas_core::app::App;
 use x4kas_core::controller::{CommandSender, UiCommand};
 use x4kas_core::format::{format_duration, format_number};
-use x4kas_core::labels::UserLabels;
+use x4kas_core::labels::{LabelSource, UserLabels};
 
 /// Width of the section navigation.
 const NAV_WIDTH: f32 = 170.0;
-/// Rows of the user's labels shown before the table scrolls.
+/// Rows of labels shown before the table scrolls.
 const TABLE_HEIGHT: f32 = 420.0;
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -43,8 +43,6 @@ impl Section {
 pub struct SettingsPage {
     pub open: bool,
     section: Section,
-    /// The kas.fyi API key field, filled from the settings on first show.
-    key_input: Option<String>,
     /// The "add a label" form.
     new_address: String,
     new_name: String,
@@ -83,12 +81,6 @@ impl SettingsPage {
                         }
                     }
                 });
-                ui.add_space(8.0);
-                ui.label(
-                    RichText::new("Esc or a tab returns to the app.")
-                        .weak()
-                        .small(),
-                );
             });
         egui::CentralPanel::default()
             .frame(egui::Frame::new().inner_margin(egui::Margin {
@@ -109,88 +101,58 @@ impl SettingsPage {
         ui.add_space(CARD_GAP);
         card_with_header(
             ui,
-            "Your Labels",
+            "Known Labels",
             app,
             |ui, app| {
                 ui.label(
                     RichText::new(format!(
-                        "{} saved",
+                        "{} labels, {} manual",
+                        format_number(app.labels.len() as u64),
                         format_number(app.labels.user_labels().len() as u64)
                     ))
                     .weak(),
                 );
             },
-            |ui, app| self.user_labels(ui, app, cmd_tx),
+            |ui, app| self.known_labels(ui, app, cmd_tx),
         );
     }
 
-    /// The public list is always on; per-address online lookups are opt-in because they
-    /// reveal which addresses the user looks at.
+    /// The public list: where it comes from and when it was last fetched.
     fn sources(&mut self, ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
         let book = app.labels.clone();
-        ui.label(
-            RichText::new(format!(
-                "{} labels known: your own, the public api.kaspa.org list (fetched in bulk, refreshed daily) and the bundled snapshot.",
-                format_number(book.len() as u64)
-            ))
-            .weak(),
-        );
         ui.horizontal(|ui| {
             if ui.button("Refresh public list").clicked() {
                 let _ = cmd_tx.send(UiCommand::RefreshLabels);
             }
-            if let Some(at) = book.kaspa_org_refreshed {
-                ui.label(
-                    RichText::new(format!(
-                        "fetched {} ago",
-                        format_duration(at.elapsed().unwrap_or_default())
-                    ))
-                    .weak(),
-                );
-            }
+            ui.label(format!(
+                "{} public labels",
+                format_number(book.public_len() as u64)
+            ));
         });
         ui.add_space(4.0);
-        ui.label(
-            RichText::new(
-                "Per-address lookups below send the address you open to that service. Off until you enable them; run from \"Look up\" in Address Info.",
-            )
-            .weak()
-            .small(),
-        );
-        if self.key_input.is_none() {
-            self.key_input = Some(
-                app.label_settings
-                    .kas_fyi_api_key
-                    .clone()
-                    .unwrap_or_default(),
+        kv_grid(ui, "label_sources", |ui| {
+            kv(
+                ui,
+                "api.kaspa.org",
+                match book.kaspa_org_refreshed {
+                    Some(at) => format!(
+                        "/addresses/names, fetched {} ago; refreshed daily",
+                        format_duration(at.elapsed().unwrap_or_default())
+                    ),
+                    None => "/addresses/names, not fetched yet; refreshed daily".to_string(),
+                },
             );
-        }
-        let mut changed = false;
-        let mut settings = app.label_settings.clone();
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("kas.fyi API key:").color(theme::LABEL));
-            let key = self.key_input.get_or_insert_with(String::new);
-            let response = ui.add(
-                TextEdit::singleline(key)
-                    .password(true)
-                    .hint_text("from developer.kas.fyi")
-                    .desired_width(260.0),
+            kv(
+                ui,
+                "Bundled snapshot",
+                "the same list as shipped with this build, until the first fetch",
             );
-            if response.lost_focus() {
-                settings.kas_fyi_api_key = Some(key.trim().to_string()).filter(|k| !k.is_empty());
-                changed = true;
-            }
-            changed |= ui
-                .checkbox(&mut settings.kns, "Resolve .kas names (KNS)")
-                .changed();
         });
-        if changed {
-            let _ = cmd_tx.send(UiCommand::SetLabelSettings(settings));
-        }
     }
 
-    /// The add form, a filter, and every saved label: the chip edits in place, ✕ removes.
-    fn user_labels(&mut self, ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
+    /// The add form, a filter, and every known label with its address and source;
+    /// the label edits in place.
+    fn known_labels(&mut self, ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
         ui.horizontal(|ui| {
             ui.add(
                 TextEdit::singleline(&mut self.new_address)
@@ -222,39 +184,41 @@ impl SettingsPage {
         ui.horizontal(|ui| {
             ui.add(
                 TextEdit::singleline(&mut self.filter)
-                    .hint_text("filter by label or address")
+                    .hint_text("filter by label, address or source")
                     .desired_width(260.0),
             );
             ui.label(
-                RichText::new("Click a label to edit it; Enter saves, Esc cancels.")
-                    .weak()
-                    .small(),
+                RichText::new(
+                    "Click a label to edit it (Enter saves, Esc cancels); right-click an address to add or remove one.",
+                )
+                .weak()
+                .small(),
             );
         });
         ui.add_space(4.0);
 
         let filter = self.filter.trim().to_lowercase();
-        let mut rows: Vec<(String, String)> = app
+        let rows: Vec<LabelRow> = app
             .labels
-            .user_labels()
-            .iter()
-            .filter(|(address, name)| {
-                filter.is_empty()
-                    || name.to_lowercase().contains(&filter)
-                    || address.to_lowercase().contains(&filter)
+            .all()
+            .into_iter()
+            .map(|(address, label)| LabelRow {
+                address: address.to_string(),
+                name: label.name.clone(),
+                source: source_name(label.source),
             })
-            .map(|(a, n)| (a.clone(), n.clone()))
+            .filter(|r| {
+                filter.is_empty()
+                    || r.name.to_lowercase().contains(&filter)
+                    || r.address.to_lowercase().contains(&filter)
+                    || r.source.to_lowercase().contains(&filter)
+            })
             .collect();
-        rows.sort_by(|a, b| {
-            a.1.to_lowercase()
-                .cmp(&b.1.to_lowercase())
-                .then(a.0.cmp(&b.0))
-        });
         if rows.is_empty() {
             placeholder(
                 ui,
                 if filter.is_empty() {
-                    "No labels of your own yet. Add one above, or right-click any address."
+                    "No labels known yet. Refresh the public list, or add one above."
                 } else {
                     "No labels match the filter."
                 },
@@ -264,42 +228,52 @@ impl SettingsPage {
         }
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Saved in").weak().small());
+            ui.label(RichText::new("Manual labels are saved in").weak().small());
             copy_value(ui, &UserLabels::path().display().to_string(), "Copy path");
         });
     }
 }
 
-/// The user's labels: each row the label chip (click to edit) and address, and a remove
-/// button.
-fn labels_table(ui: &mut Ui, rows: &[(String, String)]) {
-    ui.push_id("user_labels", |ui| {
+struct LabelRow {
+    address: String,
+    name: String,
+    source: &'static str,
+}
+
+/// How a label's source reads in the table: "manual" for the user's own.
+fn source_name(source: LabelSource) -> &'static str {
+    match source {
+        LabelSource::User => "manual",
+        other => other.label(),
+    }
+}
+
+/// Every known label: the chip (click to edit), the address and the source.
+fn labels_table(ui: &mut Ui, rows: &[LabelRow]) {
+    ui.push_id("known_labels", |ui| {
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-        // Room for the clickable address cell, as in `wide_table`.
+        // Room for the clickable cells, as in `wide_table`.
         let row_height =
             ui.spacing().interact_size.y + 2.0 * ui.visuals().widgets.hovered.expansion;
         TableBuilder::new(ui)
             .striped(true)
             .max_scroll_height(TABLE_HEIGHT)
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-            .column(Column::remainder().clip(true))
-            .column(Column::exact(36.0))
+            .column(Column::auto().at_least(120.0).clip(true))
+            .column(Column::remainder().at_least(200.0).clip(true))
+            .column(Column::auto().at_least(90.0))
             .header(theme::ROW_HEIGHT + 4.0, |mut h| {
-                h.col(|ui| section_title(ui, "Label / Address"));
-                h.col(|_| {});
+                for title in ["Label", "Address", "Source"] {
+                    h.col(|ui| section_title(ui, title));
+                }
             })
             .body(|body| {
                 body.rows(row_height, rows.len(), |mut row| {
-                    let (addr, name) = &rows[row.index()];
-                    row.col(|ui| address(ui, addr));
+                    let r = &rows[row.index()];
+                    row.col(|ui| label_cell(ui, &r.address));
+                    row.col(|ui| address_bare(ui, &r.address));
                     row.col(|ui| {
-                        if ui
-                            .small_button("✕")
-                            .on_hover_text(format!("Remove the label \"{name}\""))
-                            .clicked()
-                        {
-                            request_label(ui.ctx(), addr, None);
-                        }
+                        ui.label(RichText::new(r.source).weak());
                     });
                 });
             });

@@ -238,13 +238,11 @@ fn header(
             if ui
                 .add_enabled(enabled, egui::Button::new("Look up"))
                 .on_hover_text(if enabled {
-                    "Ask kas.fyi and/or KNS about this address (sends it to them)"
+                    "Ask KNS for this address's .kas name (sends it the address)"
                 } else {
-                    "Enable kas.fyi or KNS lookups in Settings → Address Labels first"
+                    "Enable KNS lookups first: x4kas-cli labels kns on"
                 })
-                .on_disabled_hover_text(
-                    "Enable kas.fyi or KNS lookups in Settings → Address Labels first",
-                )
+                .on_disabled_hover_text("Enable KNS lookups first: x4kas-cli labels kns on")
                 .clicked()
             {
                 let _ = cmd_tx.send(UiCommand::LookupLabelOnline(addr.clone()));

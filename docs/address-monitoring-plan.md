@@ -437,8 +437,9 @@ Everything in Phases 0–5 is built, with these deviations from the proposal:
   fires once a previous activity is known (`last_activity_ms`, kept in the watchlist
   file), so the first event after adding an address never counts as "after idle".
 - **Online labels:** kas.fyi and KNS lookups are on demand ("Look up" per address),
-  never automatic, and cached with negative answers for a week. The opt-in toggles live
-  on the Settings page (Address Labels), not in the connection window.
+  never automatic, and cached with negative answers for a week. The opt-in toggles are
+  CLI only (`labels key`, `labels kns on`); the GUI's Settings page shows just the
+  public list, since kas.fyi is deprecated.
 - **User labels** are edited in place anywhere an address appears: a click on its label
   chip, or "Add/Edit/Remove Address Label" in its right-click menu. The Settings page
   lists the whole saved list and adds, edits and removes entries.

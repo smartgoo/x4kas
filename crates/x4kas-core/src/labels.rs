@@ -355,6 +355,15 @@ impl LabelBook {
         &self.user.labels
     }
 
+    /// Addresses named by the public list (the fetched api.kaspa.org list, or the
+    /// bundled snapshot of it), whatever is shown over them.
+    pub fn public_len(&self) -> usize {
+        self.entity
+            .values()
+            .filter(|l| matches!(l.source, LabelSource::KaspaOrg | LabelSource::Bundled))
+            .count()
+    }
+
     /// Every label, sorted by name.
     pub fn all(&self) -> Vec<(&str, &Label)> {
         let mut all: Vec<(&str, &Label)> = self.map.iter().map(|(a, l)| (a.as_str(), l)).collect();

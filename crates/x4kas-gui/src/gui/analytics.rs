@@ -15,10 +15,11 @@ use x4kas_core::format::{format_kas, format_number};
 use x4kas_core::tx_inspect::TransactionProtocol;
 
 /// Tables taller than this scroll.
-const TABLE_MAX_HEIGHT: f32 = 200.0;
+/// A [`wide_table`]'s body height.
+pub const TABLE_HEIGHT: f32 = 200.0;
 
 /// Shown instead of an empty list while analytics catches up, when its counts are partial.
-const SYNCING: &str = "DAG sync in progress…";
+const SYNCING: &str = "Analyzing DAG…";
 
 /// A count from `view`, or a dash without one (while syncing), never a partial `0`.
 fn count(view: Option<&AggregatedView>, f: impl FnOnce(&AggregatedView) -> u64) -> String {
@@ -51,7 +52,7 @@ pub(super) fn sync_dot(ui: &mut Ui, app: &App) {
         size * 0.25,
         theme::WARN.gamma_multiply(0.3 + 0.7 * pulse),
     );
-    response.on_hover_text(format!("DAG syncing ({:.1}%)", fraction * 100.0));
+    response.on_hover_text(format!("Analyzing DAG ({:.1}%)", fraction * 100.0));
     // Animate only while syncing; the frame loop otherwise repaints once a second.
     ui.ctx()
         .request_repaint_after(std::time::Duration::from_millis(50));
@@ -378,7 +379,7 @@ pub(super) fn addresses(ui: &mut Ui, entries: Option<&[(String, u64)]>, kind: &s
 /// Full-width table: the first column takes the remaining width and is drawn by
 /// `first_cell`, which fits it to that width (e.g. [`fit_label`], [`address`]). The other
 /// columns are right-aligned, so values sit against the right edge of the card. The body
-/// is always [`TABLE_MAX_HEIGHT`] tall (scrolling beyond), with `empty` in its first row
+/// is always [`TABLE_HEIGHT`] tall (scrolling beyond), with `empty` in its first row
 /// while there are no rows, so the card keeps its size as rows arrive.
 pub fn wide_table<const N: usize>(
     ui: &mut Ui,
@@ -387,6 +388,33 @@ pub fn wide_table<const N: usize>(
     rows: Vec<[String; N]>,
     empty: &str,
     first_cell: fn(&mut Ui, &str),
+) {
+    wide_table_with_lead(
+        ui,
+        id,
+        headers,
+        rows,
+        empty,
+        first_cell,
+        |_, _| {},
+        TABLE_HEIGHT,
+    );
+}
+
+/// [`wide_table`] with `lead` drawn at the start of every row (given its index), before
+/// the first cell: a marker such as the Activity card's alert dot. It should take the
+/// same width on every row so the first cells line up. The body is `height` tall: the
+/// Monitoring tab's panes give their tables the rest of the tab.
+#[allow(clippy::too_many_arguments)]
+pub fn wide_table_with_lead<const N: usize>(
+    ui: &mut Ui,
+    id: &str,
+    headers: [&str; N],
+    rows: Vec<[String; N]>,
+    empty: &str,
+    first_cell: fn(&mut Ui, &str),
+    mut lead: impl FnMut(&mut Ui, usize),
+    height: f32,
 ) {
     ui.push_id(id, |ui| {
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
@@ -423,8 +451,8 @@ pub fn wide_table<const N: usize>(
             .striped(true)
             // Interactive cells, so egui_extras highlights the hovered row.
             .sense(egui::Sense::click())
-            .min_scrolled_height(TABLE_MAX_HEIGHT)
-            .max_scroll_height(TABLE_MAX_HEIGHT)
+            .min_scrolled_height(height)
+            .max_scroll_height(height)
             .auto_shrink([false, false])
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .column(Column::exact(first));
@@ -452,9 +480,11 @@ pub fn wide_table<const N: usize>(
                 return;
             }
             body.rows(row_height, rows.len(), |mut row| {
-                for (i, cell) in rows[row.index()].iter().enumerate() {
+                let index = row.index();
+                for (i, cell) in rows[index].iter().enumerate() {
                     row.col(|ui| {
                         if i == 0 {
+                            lead(ui, index);
                             first_cell(ui, cell);
                         } else {
                             right_after_first(ui, i, |ui| {

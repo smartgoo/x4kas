@@ -1,17 +1,20 @@
-//! The Address Info window, opened from any address (see `widgets::request_address`):
-//! label, balance, indexed totals, balance history, transactions, counterparties and
-//! the watchlist settings for the address.
+//! The pieces of an address page, shared by the info pane (opened from any address, see
+//! `widgets::request_address`) and the Explorer tab: `AddressForms` (the label and watch
+//! settings forms) and `body` (the cards: summary with balance and indexed totals,
+//! balance history, transactions, counterparties with the flow graph button, cluster
+//! and peel chain).
 
 use eframe::egui::{self, RichText, TextEdit, Ui};
-use egui_extras::{Column, TableBuilder};
+use egui_extras::Column;
 
 use super::monitoring::network;
 use super::theme;
 use super::widgets::{
-    address, block_hash, copy_value, is_testnet, kv, kv_columns, kv_grid, kv_with, modal_window,
-    or_dash, placeholder, primary_button, section_title, subheader,
+    CARD_GAP, address, block_hash, card, card_with_header, copy_value, is_testnet, kv, kv_columns,
+    kv_grid, kv_with, link_table, or_dash, page_table, placeholder, primary_button, subheader,
+    table_header, table_row_height, transaction_id, weighted_columns,
 };
-use x4kas_core::app::{AddressView, AddressWindow, App, ExportStatus};
+use x4kas_core::app::{AddressView, App, ExportStatus};
 use x4kas_core::controller::{CommandSender, ExportRequest, UiCommand};
 use x4kas_core::format::{
     explorer_address_url, format_duration, format_kas, format_number, kaspa_stream_address_url,
@@ -19,11 +22,18 @@ use x4kas_core::format::{
 };
 use x4kas_core::index::export::ExportFormat;
 use x4kas_core::index::query::TxRow;
+use x4kas_core::labels::OnlineEntry;
 use x4kas_core::watch::{AlertRules, WatchEntry};
 
-/// The window's editable state, kept across frames.
+/// Rows of the transactions table before it scrolls.
+const TXS_HEIGHT: f32 = 260.0;
+/// Height of the cluster members and peel chain lists before they scroll.
+const LIST_HEIGHT: f32 = 120.0;
+
+/// The editable state of an address's forms (its label and watch settings), kept
+/// across frames and refilled when the address changes.
 #[derive(Default)]
-pub struct AddressWindowUi {
+pub struct AddressForms {
     /// Which address the fields below were filled for.
     for_address: String,
     label: String,
@@ -40,28 +50,16 @@ pub struct AddressWindowUi {
     idle_hours: String,
 }
 
-impl AddressWindowUi {
-    pub fn show(&mut self, ctx: &egui::Context, app: &mut App, cmd_tx: &CommandSender) {
-        let Some(window) = app.address.open.clone() else {
-            return;
-        };
-        let saved = app.labels.user_labels().get(&window.address).cloned();
-        if self.for_address != window.address {
-            self.fill(app, &window.address);
+impl AddressForms {
+    /// Fill the fields for `addr` if they aren't already, and pick up a label saved
+    /// elsewhere.
+    pub fn sync(&mut self, app: &App, addr: &str) {
+        let saved = app.labels.user_labels().get(addr).cloned();
+        if self.for_address != addr {
+            self.fill(app, addr);
         } else if saved != self.saved_label {
             self.label = saved.clone().unwrap_or_default();
             self.saved_label = saved;
-        }
-        let win = egui::Window::new("Address Info")
-            .default_size([860.0, 640.0])
-            .resizable(true);
-        let open = modal_window(ctx, win, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                self.contents(ui, app, &window, cmd_tx);
-            });
-        });
-        if !open {
-            app.address.close();
         }
     }
 
@@ -87,58 +85,90 @@ impl AddressWindowUi {
             .unwrap_or_default();
     }
 
-    fn contents(
+    /// Address, explorer links, the online lookup and the label (public one shown,
+    /// user's editable).
+    pub fn header(
         &mut self,
         ui: &mut Ui,
-        app: &mut App,
-        window: &AddressWindow,
+        app: &App,
+        addr: &str,
+        online_result: Option<&[OnlineEntry]>,
         cmd_tx: &CommandSender,
     ) {
-        header(ui, app, window, &mut self.label, cmd_tx);
-        ui.add_space(6.0);
-
-        if window.loading {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label("Loading address info…");
+        let label = &mut self.label;
+        let _ = is_testnet(ui.ctx());
+        kv_grid(ui, "address_header", |ui| {
+            kv_with(ui, "Address", |ui| copy_value(ui, addr, "Copy address"));
+            kv_with(ui, "View on", |ui| {
+                ui.hyperlink_to("Kaspa Stream", kaspa_stream_address_url(addr));
+                ui.label(RichText::new("·").weak());
+                ui.hyperlink_to("Kaspa Explorer", explorer_address_url(addr));
             });
-        }
-        if let Some(ref err) = window.error {
-            ui.label(RichText::new(err).color(theme::ERROR));
-        }
-        if let Some(ref view) = window.view {
-            summary(ui, view);
-            ui.add_space(6.0);
-            balance_chart(ui, view);
-            ui.add_space(6.0);
-            kv_columns(ui, 360.0, |[left, right]| {
-                transactions(left, &window.address, view, window.loading_more, cmd_tx);
-                counterparties(right, view);
+            kv_with(ui, "Online", |ui| {
+                // Right to left: the button, then what was learned.
+                let enabled = app.label_settings.any_enabled();
+                if ui
+                    .add_enabled(enabled, egui::Button::new("Look up"))
+                    .on_hover_text(if enabled {
+                        "Ask KNS for this address's .kas name (sends it the address)"
+                    } else {
+                        "Enable KNS lookups first: x4kas-cli labels kns on"
+                    })
+                    .on_disabled_hover_text("Enable KNS lookups first: x4kas-cli labels kns on")
+                    .clicked()
+                {
+                    let _ = cmd_tx.send(UiCommand::LookupLabelOnline(addr.to_string()));
+                }
+                match online_result {
+                    None => {
+                        ui.label(RichText::new("not asked").weak());
+                    }
+                    Some([]) => {
+                        ui.label(RichText::new("no online source enabled").weak());
+                    }
+                    Some(entries) => {
+                        for entry in entries {
+                            let text = match &entry.name {
+                                Some(name) => format!("{}: {name}", entry.source.label()),
+                                None => format!("{}: no label", entry.source.label()),
+                            };
+                            ui.label(RichText::new(text).color(theme::TEXT));
+                        }
+                    }
+                }
             });
-            export_status(ui, &app.address.export);
-            ui.add_space(6.0);
-            cluster(ui, view);
-            peel_chain(ui, view);
-            ui.add_space(6.0);
-            if ui
-                .add(primary_button("Open flow graph"))
-                .on_hover_text("Follow the money: counterparties of counterparties")
-                .clicked()
-            {
-                app.address.flows.start(window.address.clone());
-                let _ = cmd_tx.send(UiCommand::AddressFlows {
-                    address: window.address.clone(),
-                    hops: 2,
-                });
-            }
-        }
-        ui.add_space(8.0);
-        self.watch_settings(ui, app, &window.address, cmd_tx);
+            kv_with(ui, "Label", |ui| {
+                // Right to left: the button, then the field, then the known label.
+                if ui.button("Save").clicked() {
+                    let _ = cmd_tx.send(UiCommand::SetLabel {
+                        address: addr.to_string(),
+                        name: Some(label.clone()).filter(|l| !l.trim().is_empty()),
+                    });
+                }
+                ui.add(
+                    TextEdit::singleline(label)
+                        .hint_text("your label")
+                        .desired_width(180.0),
+                );
+                if let Some(known) = app.labels.get(addr) {
+                    if let Some(link) = &known.link {
+                        ui.hyperlink_to("↗", link).on_hover_text(link);
+                    }
+                    if !known.categories.is_empty() {
+                        ui.label(RichText::new(known.categories.join(", ")).weak());
+                    }
+                    ui.label(
+                        RichText::new(format!("{} ({})", known.name, known.source.label()))
+                            .color(theme::ACCENT_BRIGHT),
+                    );
+                }
+            });
+        });
     }
 
-    /// The watchlist entry for this address: on/off, name and alert rules.
-    fn watch_settings(&mut self, ui: &mut Ui, app: &App, addr: &str, cmd_tx: &CommandSender) {
-        section_title(ui, "Watch");
+    /// The watchlist entry for this address: on/off, name and alert rules (the body of
+    /// a "Watch" card).
+    pub fn watch_settings(&mut self, ui: &mut Ui, app: &App, addr: &str, cmd_tx: &CommandSender) {
         let watched = app.watch.entry(addr).is_some();
         let mut changed = false;
         ui.horizontal(|ui| {
@@ -209,89 +239,78 @@ impl AddressWindowUi {
     }
 }
 
+/// The cards below the header for a loaded address: summary, balance history,
+/// transactions (export buttons in the header) beside counterparties (the flow graph
+/// button in the header), cluster and, when it is a link of one, the peel chain.
+/// Returns whether "Open flow graph" was clicked (see [`open_flow_graph`]).
+pub(super) fn body(
+    ui: &mut Ui,
+    app: &App,
+    addr: &str,
+    view: &AddressView,
+    loading_more: bool,
+    cmd_tx: &CommandSender,
+) -> bool {
+    card(ui, "Summary", |ui| {
+        summary(ui, view);
+        if let Some(note) = &view.index_note {
+            ui.add_space(4.0);
+            ui.label(RichText::new(note).color(theme::WARN));
+        }
+    });
+    if view.index_note.is_some() {
+        return false;
+    }
+    ui.add_space(CARD_GAP);
+    card(ui, "Balance history", |ui| balance_chart(ui, view));
+    ui.add_space(CARD_GAP);
+    let mut open_flows = false;
+    weighted_columns(ui, [1.0, 1.0], 360.0, |[left, right]| {
+        card_with_header(
+            left,
+            "Transactions",
+            &mut (),
+            |ui, _| export_buttons(ui, addr, view, cmd_tx),
+            |ui, _| {
+                transactions(ui, addr, view, loading_more, cmd_tx);
+                export_status(ui, &app.address.export);
+            },
+        );
+        card_with_header(
+            right,
+            "Top counterparties",
+            &mut open_flows,
+            |ui, open| {
+                *open = ui
+                    .small_button("Open flow graph")
+                    .on_hover_text("Follow the money: counterparties of counterparties")
+                    .clicked();
+            },
+            |ui, _| counterparties(ui, view),
+        );
+    });
+    ui.add_space(CARD_GAP);
+    card(ui, "Likely owner cluster", |ui| cluster(ui, view));
+    if view.profile.peel_chain.is_some() {
+        ui.add_space(CARD_GAP);
+        card(ui, "Peel chain", |ui| peel_chain(ui, view));
+    }
+    open_flows
+}
+
+/// Start the flow graph window from `addr`.
+pub(super) fn open_flow_graph(app: &mut App, addr: &str, cmd_tx: &CommandSender) {
+    app.address.flows.start(addr.to_string());
+    let _ = cmd_tx.send(UiCommand::AddressFlows {
+        address: addr.to_string(),
+        hops: 2,
+    });
+}
+
 /// KAS as typed to sompi; empty or invalid is no threshold.
 fn parse_kas(s: &str) -> Option<u64> {
     let v: f64 = s.trim().replace(',', "").parse().ok()?;
     (v > 0.0).then(|| (v * 100_000_000.0).round() as u64)
-}
-
-/// Address, explorer links and the label (public one shown, user's editable).
-fn header(
-    ui: &mut Ui,
-    app: &App,
-    window: &AddressWindow,
-    label: &mut String,
-    cmd_tx: &CommandSender,
-) {
-    let addr = &window.address;
-    let _ = is_testnet(ui.ctx());
-    kv_grid(ui, "address_header", |ui| {
-        kv_with(ui, "Address", |ui| copy_value(ui, addr, "Copy address"));
-        kv_with(ui, "View on", |ui| {
-            ui.hyperlink_to("Kaspa Stream", kaspa_stream_address_url(addr));
-            ui.label(RichText::new("·").weak());
-            ui.hyperlink_to("Kaspa Explorer", explorer_address_url(addr));
-        });
-        kv_with(ui, "Online", |ui| {
-            // Right to left: the button, then what was learned.
-            let enabled = app.label_settings.any_enabled();
-            if ui
-                .add_enabled(enabled, egui::Button::new("Look up"))
-                .on_hover_text(if enabled {
-                    "Ask KNS for this address's .kas name (sends it the address)"
-                } else {
-                    "Enable KNS lookups first: x4kas-cli labels kns on"
-                })
-                .on_disabled_hover_text("Enable KNS lookups first: x4kas-cli labels kns on")
-                .clicked()
-            {
-                let _ = cmd_tx.send(UiCommand::LookupLabelOnline(addr.clone()));
-            }
-            match window.online_result.as_deref() {
-                None => {
-                    ui.label(RichText::new("not asked").weak());
-                }
-                Some([]) => {
-                    ui.label(RichText::new("no online source enabled").weak());
-                }
-                Some(entries) => {
-                    for entry in entries {
-                        let text = match &entry.name {
-                            Some(name) => format!("{}: {name}", entry.source.label()),
-                            None => format!("{}: no label", entry.source.label()),
-                        };
-                        ui.label(RichText::new(text).color(theme::TEXT));
-                    }
-                }
-            }
-        });
-        kv_with(ui, "Label", |ui| {
-            // Right to left: the button, then the field, then the known label.
-            if ui.button("Save").clicked() {
-                let _ = cmd_tx.send(UiCommand::SetLabel {
-                    address: addr.clone(),
-                    name: Some(label.clone()).filter(|l| !l.trim().is_empty()),
-                });
-            }
-            ui.add(
-                TextEdit::singleline(label)
-                    .hint_text("your label")
-                    .desired_width(180.0),
-            );
-            if let Some(known) = app.labels.get(addr) {
-                if let Some(link) = &known.link {
-                    ui.hyperlink_to("↗", link).on_hover_text(link);
-                }
-                if !known.categories.is_empty() {
-                    ui.label(RichText::new(known.categories.join(", ")).weak());
-                }
-                ui.label(
-                    RichText::new(format!("{} ({})", known.name, known.source.label()))
-                        .color(theme::ACCENT_BRIGHT),
-                );
-            }
-        });
-    });
 }
 
 fn summary(ui: &mut Ui, view: &AddressView) {
@@ -308,6 +327,7 @@ fn summary(ui: &mut Ui, view: &AddressView) {
         )
     };
     kv_columns(ui, 300.0, |[left, right]| {
+        subheader(left, "Balance");
         kv_grid(left, "address_balance", |ui| {
             kv(
                 ui,
@@ -329,6 +349,7 @@ fn summary(ui: &mut Ui, view: &AddressView) {
             );
             kv(ui, "Transactions (indexed)", format_number(stats.tx_count));
         });
+        subheader(right, "Activity");
         kv_grid(right, "address_seen", |ui| {
             kv(ui, "First seen", seen(stats.first_seen_ms));
             kv(ui, "Last seen", seen(stats.last_seen_ms));
@@ -359,7 +380,6 @@ fn summary(ui: &mut Ui, view: &AddressView) {
 
 /// Balance over the indexed window as a step line.
 fn balance_chart(ui: &mut Ui, view: &AddressView) {
-    subheader(ui, "Balance history");
     if view.curve.len() < 2 {
         placeholder(ui, "Not enough indexed activity for a chart");
         return;
@@ -408,6 +428,32 @@ fn balance_chart(ui: &mut Ui, view: &AddressView) {
     );
 }
 
+/// The CSV and JSON export buttons in the Transactions card's header, once there are
+/// transactions to export.
+fn export_buttons(ui: &mut Ui, addr: &str, view: &AddressView, cmd_tx: &CommandSender) {
+    if view.page.items.is_empty() {
+        return;
+    }
+    ui.label(RichText::new("Export").weak().small());
+    for format in [ExportFormat::Csv, ExportFormat::Json] {
+        if ui
+            .small_button(format.extension().to_ascii_uppercase())
+            .on_hover_text(format!(
+                "Export every indexed transaction as {} to ~/.x4kas/exports",
+                format.extension().to_ascii_uppercase()
+            ))
+            .clicked()
+        {
+            let _ = cmd_tx.send(UiCommand::Export(ExportRequest::Transactions {
+                address: addr.to_string(),
+                format,
+            }));
+        }
+    }
+}
+
+/// The transactions table, newest first, with "Load older" under it while there are
+/// more.
 fn transactions(
     ui: &mut Ui,
     addr: &str,
@@ -415,83 +461,64 @@ fn transactions(
     loading_more: bool,
     cmd_tx: &CommandSender,
 ) {
-    ui.horizontal(|ui| {
-        subheader(ui, "Transactions (newest first)");
-        if view.page.items.is_empty() {
-            return;
-        }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            for format in [ExportFormat::Json, ExportFormat::Csv] {
-                if ui
-                    .small_button(format.extension().to_ascii_uppercase())
-                    .on_hover_text(format!(
-                        "Export every indexed transaction as {} to ~/.x4kas/exports",
-                        format.extension().to_ascii_uppercase()
-                    ))
-                    .clicked()
-                {
-                    let _ = cmd_tx.send(UiCommand::Export(ExportRequest::Transactions {
-                        address: addr.to_string(),
-                        format,
-                    }));
-                }
-            }
-            ui.label(RichText::new("Export").weak().small());
-        });
-    });
     let rows: &[TxRow] = &view.page.items;
     if rows.is_empty() {
         placeholder(ui, "No indexed transactions");
         return;
     }
     ui.push_id("address_txs", |ui| {
-        TableBuilder::new(ui)
-            .striped(true)
-            .max_scroll_height(260.0)
-            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+        let row_height = table_row_height(ui);
+        let table = page_table(ui, TXS_HEIGHT)
+            .column(Column::remainder().at_least(110.0))
             .column(Column::auto().at_least(80.0))
             .column(Column::auto().at_least(120.0))
             .column(Column::auto().at_least(60.0))
-            .column(Column::remainder().at_least(120.0))
-            .header(theme::ROW_HEIGHT + 4.0, |mut h| {
-                for title in ["When", "Change (KAS)", "Fee", "Accepting block"] {
-                    h.col(|ui| section_title(ui, title));
-                }
-            })
-            .body(|body| {
-                body.rows(theme::KV_ROW_HEIGHT, rows.len(), |mut row| {
-                    let tx = &rows[row.index()];
-                    row.col(|ui| {
-                        ui.label(
-                            format_duration(std::time::Duration::from_millis(
-                                now_ms().saturating_sub(tx.time_ms),
-                            )) + " ago",
-                        );
-                    });
-                    row.col(|ui| {
-                        let (sign, color) = if tx.delta >= 0 {
-                            ("+", theme::OK)
-                        } else {
-                            ("-", theme::ERROR)
-                        };
-                        let text =
-                            format!("{sign}{}", format_kas(tx.delta.unsigned_abs() as f64, 8));
-                        let text = if tx.is_coinbase {
-                            format!("{text} ⛏")
-                        } else {
-                            text
-                        };
-                        ui.label(RichText::new(text).color(color))
-                            .on_hover_text(format!("txid {}", tx.txid));
-                    });
-                    row.col(|ui| {
-                        ui.label(or_dash(tx.fee, |f| format_kas(f as f64, 8)));
-                    });
-                    row.col(|ui| {
-                        block_hash(ui, &tx.accepting_block, false);
-                    });
+            .column(Column::remainder().at_least(110.0));
+        table_header(
+            table,
+            &[
+                "Transaction",
+                "When",
+                "Change (KAS)",
+                "Fee",
+                "Accepting block",
+            ],
+        )
+        .body(|body| {
+            body.rows(row_height, rows.len(), |mut row| {
+                let tx = &rows[row.index()];
+                row.col(|ui| {
+                    transaction_id(ui, &tx.txid);
+                });
+                row.col(|ui| {
+                    ui.label(
+                        format_duration(std::time::Duration::from_millis(
+                            now_ms().saturating_sub(tx.time_ms),
+                        )) + " ago",
+                    );
+                });
+                row.col(|ui| {
+                    let (sign, color) = if tx.delta >= 0 {
+                        ("+", theme::OK)
+                    } else {
+                        ("-", theme::ERROR)
+                    };
+                    let text = format!("{sign}{}", format_kas(tx.delta.unsigned_abs() as f64, 8));
+                    let text = if tx.is_coinbase {
+                        format!("{text} ⛏")
+                    } else {
+                        text
+                    };
+                    ui.label(RichText::new(text).color(color));
+                });
+                row.col(|ui| {
+                    ui.label(or_dash(tx.fee, |f| format_kas(f as f64, 8)));
+                });
+                row.col(|ui| {
+                    block_hash(ui, &tx.accepting_block, false);
                 });
             });
+        });
     });
     if let Some(next) = view.page.next {
         ui.horizontal(|ui| {
@@ -509,7 +536,6 @@ fn transactions(
 
 /// The likely-owner cluster: size, the most common label among members, and a sample.
 fn cluster(ui: &mut Ui, view: &AddressView) {
-    subheader(ui, "Likely owner cluster");
     let Some(ref cluster) = view.cluster else {
         placeholder(ui, "Not indexed");
         return;
@@ -534,18 +560,20 @@ fn cluster(ui: &mut Ui, view: &AddressView) {
                 .small(),
         );
     });
-    egui::ScrollArea::vertical()
-        .id_salt("cluster_members")
-        .max_height(120.0)
-        .show(ui, |ui| {
-            for member in cluster
-                .members
-                .iter()
-                .filter(|m| **m != view.profile.address)
-            {
-                address(ui, member);
-            }
-        });
+    let members: Vec<String> = cluster
+        .members
+        .iter()
+        .filter(|m| **m != view.profile.address)
+        .cloned()
+        .collect();
+    link_table(
+        ui,
+        "cluster_members",
+        "Address",
+        &members,
+        LIST_HEIGHT,
+        address,
+    );
     if cluster.size as usize > cluster.members.len() {
         ui.label(
             RichText::new(format!(
@@ -588,8 +616,6 @@ fn peel_chain(ui: &mut Ui, view: &AddressView) {
     let Some(chain) = &view.profile.peel_chain else {
         return;
     };
-    ui.add_space(6.0);
-    subheader(ui, "Peel chain");
     let carried = chain.links.last().map(|l| l.carried).unwrap_or(0);
     ui.horizontal(|ui| {
         ui.label(
@@ -614,7 +640,7 @@ fn peel_chain(ui: &mut Ui, view: &AddressView) {
     });
     egui::ScrollArea::vertical()
         .id_salt("peel_links")
-        .max_height(120.0)
+        .max_height(LIST_HEIGHT)
         .show(ui, |ui| {
             kv_grid(ui, "peel_links", |ui| {
                 for (i, link) in chain.links.iter().enumerate() {
@@ -638,7 +664,6 @@ fn peel_chain(ui: &mut Ui, view: &AddressView) {
 }
 
 fn counterparties(ui: &mut Ui, view: &AddressView) {
-    subheader(ui, "Top counterparties");
     if view.peers.is_empty() {
         placeholder(ui, "No counterparties indexed");
         return;

@@ -19,9 +19,8 @@ use crate::format::{format_kas, now_ms};
 use crate::polling::PollingHandles;
 use crate::rpc::client::RpcManager;
 
-/// Events and alerts kept in memory.
+/// Events kept in memory.
 pub const MAX_EVENTS: usize = 500;
-pub const MAX_ALERTS: usize = 200;
 /// How often balances are re-read from the node (notifications keep them current in
 /// between) and pending mempool activity is polled.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(10);
@@ -153,14 +152,20 @@ pub struct AddressEvent {
     pub txid: Option<String>,
     pub is_coinbase: bool,
     pub balance_after: Option<u64>,
+    /// The messages of the address's alert rules this event tripped ([`evaluate`]);
+    /// empty when none did, or the address isn't on the watchlist.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub alerts: Vec<String>,
+    /// The user has marked the alert as read (only meaningful with `alerts`).
+    #[serde(skip)]
+    pub read: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Alert {
-    pub time_ms: u64,
-    pub address: String,
-    pub name: Option<String>,
-    pub message: String,
+impl AddressEvent {
+    /// An alert the user hasn't marked as read yet.
+    pub fn unread(&self) -> bool {
+        !self.alerts.is_empty() && !self.read
+    }
 }
 
 /// Which rules an event trips; one message per rule, in rule order. `balance_before`
@@ -391,6 +396,8 @@ pub fn build_events(
                 txid,
                 is_coinbase: change.coinbase,
                 balance_after: after,
+                alerts: Vec::new(),
+                read: false,
             },
             before,
         ));
@@ -407,7 +414,7 @@ async fn handle_notification(app: &RwLock<App>, n: &UtxosChangedNotification) {
     let mut guard = app.write().await;
     let events = build_events(changes, &mut guard.watch.balances, time_ms);
     let mut list_changed = false;
-    for (event, before) in events {
+    for (mut event, before) in events {
         let entry = guard
             .watch
             .list
@@ -418,15 +425,7 @@ async fn handle_notification(app: &RwLock<App>, n: &UtxosChangedNotification) {
             let last = entry.last_activity_ms;
             entry.last_activity_ms = Some(time_ms);
             list_changed = true;
-            let (rules, name) = (entry.rules.clone(), entry.name.clone());
-            for message in evaluate(&rules, &event, before, last) {
-                guard.watch.push_alert(Alert {
-                    time_ms,
-                    address: event.address.clone(),
-                    name: name.clone(),
-                    message,
-                });
-            }
+            event.alerts = evaluate(&entry.rules, &event, before, last);
         }
         guard.watch.push_event(event);
     }
@@ -468,6 +467,8 @@ mod tests {
             txid: None,
             is_coinbase: false,
             balance_after: after,
+            alerts: Vec::new(),
+            read: false,
         }
     }
 

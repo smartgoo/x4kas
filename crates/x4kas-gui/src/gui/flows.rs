@@ -1,7 +1,7 @@
 //! The flow graph window: money followed hop by hop from an address (data in
 //! `App.address.flows`, from `UiCommand::AddressFlows`). Nodes are addresses sized by
 //! the volume over their edges, laid out by a small force simulation; a click on a node
-//! expands it by one hop, a right-click opens its Address Info.
+//! expands it by one hop, a right-click shows its info pane.
 
 use std::collections::HashMap;
 

@@ -1,22 +1,15 @@
-//! The Dashboard's BlockDAG section: the live DAG visualizer band and the BlockDAG card,
-//! plus the Block Info window shown on any tab.
+//! The Dashboard's BlockDAG section: the live DAG visualizer band and the BlockDAG card.
 
 use std::collections::{HashMap, HashSet};
 
 use eframe::egui::{
-    self, Align2, Color32, CursorIcon, FontId, Painter, Pos2, Rect, RichText, Sense, Stroke, Ui,
-    Vec2, vec2,
+    self, Align2, Color32, CursorIcon, FontId, Painter, Pos2, Rect, Sense, Stroke, Ui, Vec2, vec2,
 };
 
 use super::theme;
-use super::widgets::{
-    block_hash, copy_value, is_testnet, json_view, kv, kv_columns, kv_grid, kv_with, modal_window,
-    or_dash, request_block,
-};
+use super::widgets::{block_hash, kv, kv_columns, kv_grid, kv_with, or_dash, request_block};
 use x4kas_core::app::{App, DAG_MAX_DAA_SCORES, DagBlock, DagVisualizer};
-use x4kas_core::format::{
-    explorer_block_url, format_number, kaspa_stream_block_url, shorten_middle,
-};
+use x4kas_core::format::{format_number, shorten_middle};
 
 // The visualizer mirrors the one on the Kaspalytics home page: a band of the newest DAA
 // scores, one column each, blocks spread evenly down their column and joined to their
@@ -40,8 +33,8 @@ const EXIT_X: f32 = -BLOCK_SIZE - 100.0;
 /// Pointer distance at which a block counts as hovered (blocks are tiny).
 const HIT_RADIUS: f32 = 6.0;
 
-/// The live DAG visualizer band across the top of the Dashboard. A click on a block opens
-/// its Block Info.
+/// The live DAG visualizer band across the top of the Dashboard. A click on a block shows
+/// its info pane.
 pub(super) fn band(ui: &mut Ui, app: &App) {
     let waiting = if app.node.server_info.as_ref().is_some_and(|s| s.is_synced) {
         "Waiting for blocks…"
@@ -404,52 +397,5 @@ fn hash_row(ui: &mut Ui, label: &str, hash: Option<&str>) {
             ui.set_min_height(ui.spacing().interact_size.y);
             ui.label("—");
         }
-    });
-}
-
-/// The Block Info window for the requested block (see [`request_block`]), on any tab.
-/// The block's `get_block` JSON links other block hashes to their own Block Info.
-pub fn block_window(ctx: &egui::Context, app: &mut App) {
-    let sel = &mut app.dag_selection;
-    if !sel.block_loading && sel.block_detail.is_none() {
-        return;
-    }
-    let window = egui::Window::new("Block Info").default_size([640.0, 480.0]);
-    let open = modal_window(ctx, window, |ui| {
-        if let Some(ref hash) = sel.block_hash {
-            block_links(ui, hash);
-            ui.separator();
-        }
-        if sel.block_loading {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label("Loading block info…");
-            });
-        } else if let Some(ref detail) = sel.block_detail
-            && let Some(hash) = egui::ScrollArea::vertical()
-                .show(ui, |ui| json_view(ui, detail, &sel.hash_links))
-                .inner
-        {
-            request_block(ui.ctx(), &hash);
-        }
-    });
-    if !open {
-        sel.close();
-    }
-}
-
-/// The block's hash (with a copy icon) and links to it on the block explorers.
-fn block_links(ui: &mut Ui, hash: &str) {
-    let testnet = is_testnet(ui.ctx());
-    kv_grid(ui, "block_links", |ui| {
-        kv_with(ui, "Hash", |ui| {
-            copy_value(ui, hash, "Copy hash");
-        });
-        kv_with(ui, "View on", |ui| {
-            // Right to left: the last link first.
-            ui.hyperlink_to("Kaspa Stream", kaspa_stream_block_url(hash));
-            ui.label(RichText::new("·").weak());
-            ui.hyperlink_to("Kaspa Explorer", explorer_block_url(hash, testnet));
-        });
     });
 }

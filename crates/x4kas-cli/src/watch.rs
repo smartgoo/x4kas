@@ -1,5 +1,6 @@
 //! `x4kas-cli watch <address>…`: follow addresses live and print one JSON line per
-//! confirmed balance change (and the alerts the watchlist's rules raise) until Ctrl+C.
+//! confirmed balance change (with the alerts the watchlist's rules raised for it in its
+//! `alerts`) until Ctrl+C.
 //! Addresses given on the command line are watched with the default rules; without
 //! any, the saved watchlist for the network is used.
 
@@ -13,7 +14,7 @@ use tokio::sync::RwLock;
 
 use x4kas_core::app::{App, WatchPhase};
 use x4kas_core::polling::{PollingHandles, create_and_start_rpc};
-use x4kas_core::watch::{self, AddressEvent, Alert, WatchEntry, Watchlist};
+use x4kas_core::watch::{self, AddressEvent, WatchEntry, Watchlist};
 
 #[derive(Args, Debug, Clone, PartialEq)]
 pub struct WatchArgs {
@@ -30,7 +31,6 @@ enum Line<'a> {
     Status { phase: String },
     Balance { address: &'a str, balance: u64 },
     Event(&'a AddressEvent),
-    Alert(&'a Alert),
 }
 
 pub async fn run(url: Option<&str>, network: &str, args: WatchArgs) -> Result<()> {
@@ -57,8 +57,7 @@ pub async fn run(url: Option<&str>, network: &str, args: WatchArgs) -> Result<()
     let rpc = create_and_start_rpc(url, network, &app, 1000, &mut handles)?;
     watch::start_watch(&rpc, &app, &mut handles, network);
 
-    let mut seen_events = 0usize;
-    let mut seen_alerts = 0usize;
+    let mut seen_events = 0u64;
     let mut last_phase = WatchPhase::Idle;
     let mut printed_balances = false;
     let mut ticker = tokio::time::interval(Duration::from_millis(250));
@@ -80,15 +79,12 @@ pub async fn run(url: Option<&str>, network: &str, args: WatchArgs) -> Result<()
                         print(&Line::Balance { address, balance: *balance })?;
                     }
                 }
-                // Events and alerts are newest first; print what arrived since last time.
-                for event in watch.events.iter().take(watch.events.len() - seen_events.min(watch.events.len())).collect::<Vec<_>>().into_iter().rev() {
+                // Events are newest first; print what arrived since last time.
+                let new = (watch.events_raised - seen_events) as usize;
+                for event in watch.events.iter().take(new).collect::<Vec<_>>().into_iter().rev() {
                     print(&Line::Event(event))?;
                 }
-                seen_events = watch.events.len();
-                for alert in watch.alerts.iter().take(watch.alerts.len() - seen_alerts.min(watch.alerts.len())).collect::<Vec<_>>().into_iter().rev() {
-                    print(&Line::Alert(alert))?;
-                }
-                seen_alerts = watch.alerts.len();
+                seen_events = watch.events_raised;
             }
         }
     }

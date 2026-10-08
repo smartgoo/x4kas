@@ -5,10 +5,12 @@ use std::sync::Arc;
 use eframe::egui::{
     self, Button, FontId, Margin, RichText, Stroke, TextEdit, Ui, WidgetText, pos2, text::CCursor,
 };
+use egui_extras::{Column, Table, TableBuilder};
 
-pub use super::analytics::wide_table;
+pub use super::analytics::{TABLE_HEIGHT, wide_table_with_lead};
 use super::theme;
 use x4kas_core::app::{ActiveConnection, App};
+use x4kas_core::explorer::ExplorerPage;
 use x4kas_core::format::{explorer_address_url, kaspa_stream_address_url, shorten_middle};
 use x4kas_core::labels::{Label, LabelBook, LabelSource};
 use x4kas_core::rpc::hash_links::HashLink;
@@ -52,6 +54,14 @@ pub fn kv_columns<R, const N: usize>(
     add_contents: impl FnOnce(&mut [Ui; N]) -> R,
 ) -> R {
     columns_with_gap(ui, [1.0; N], min_width, COLUMN_GAP, false, add_contents)
+}
+
+/// Whether [`weighted_columns`] with these `weights` and `min_width` would wrap onto
+/// more than one row at the current width, for a layout that changes when it does
+/// (e.g. the Monitoring tab's panes fill the tab side by side but scroll as a page
+/// stacked).
+pub fn columns_wrap<const N: usize>(ui: &Ui, weights: [f32; N], min_width: f32) -> bool {
+    wrap_rows(&weights, min_width, ui.available_width(), CARD_GAP_X).len() > 1
 }
 
 /// Splits columns into rows: each row takes columns while every one of them still gets
@@ -485,14 +495,32 @@ const COPIED_FOR: f64 = 1.5;
 
 /// What a [`linked_value`] is, which decides its menu.
 #[derive(Clone, Copy)]
-enum LinkKind {
+enum LinkKind<'a> {
     Address,
     Block,
+    /// `block`: a block the transaction is in, for the Explorer to fall back on.
+    Transaction {
+        block: Option<&'a str>,
+    },
+}
+
+impl LinkKind<'_> {
+    /// The Explorer page for this value.
+    fn page(self, value: &str) -> ExplorerPage {
+        match self {
+            Self::Address => ExplorerPage::Address(value.to_string()),
+            Self::Block => ExplorerPage::Block(value.to_string()),
+            Self::Transaction { block } => ExplorerPage::Transaction {
+                txid: value.to_string(),
+                block: block.map(str::to_string),
+            },
+        }
+    }
 }
 
 /// A Kaspa address: fitted like [`fit_label`], with a copy icon and a hover highlight. A
-/// click opens its Address Info; the right-click menu labels it or opens it in a block
-/// explorer. Use this for every address shown.
+/// click shows its info pane (see [`request_pane`]); the right-click menu labels it or
+/// opens it in the Explorer or a block explorer. Use this for every address shown.
 pub fn address(ui: &mut Ui, addr: &str) {
     linked_value(ui, addr, LinkKind::Address, false, true);
 }
@@ -525,17 +553,34 @@ pub fn edit_label_cell(ctx: &egui::Context, addr: &str) {
     start_label_edit(ctx, label_cell_id(addr), &initial);
 }
 
-/// A block hash, like [`address`] but a click opens the Block Info window for it (see
-/// [`request_block`]) instead of a menu: hashes such as DAG tips refresh too quickly for a
-/// menu to stay open. Block Info has the explorer links. `selected` keeps it highlighted,
-/// e.g. for the block on show. Returns true when clicked. Use this for every block hash
-/// shown.
+/// A block hash, like [`address`] but without a menu: hashes such as DAG tips refresh
+/// too quickly for a menu to stay open; a click shows its info pane, which has the
+/// explorer links. `selected` keeps it highlighted, e.g. for the block on show. Returns
+/// true when clicked. Use this for every block hash shown.
 pub fn block_hash(ui: &mut Ui, hash: &str, selected: bool) -> bool {
     linked_value(ui, hash, LinkKind::Block, selected, false)
 }
 
+/// A transaction id, like [`block_hash`] but with a right-click menu that opens it in
+/// the Explorer tab (see [`request_explorer`]). Use this for every transaction id shown.
+pub fn transaction_id(ui: &mut Ui, txid: &str) {
+    linked_value(
+        ui,
+        txid,
+        LinkKind::Transaction { block: None },
+        false,
+        false,
+    );
+}
+
+/// [`transaction_id`] for a transaction known to be in `block`: the Explorer reads it
+/// from there when neither the index nor the mempool has it.
+pub fn transaction_id_in_block(ui: &mut Ui, txid: &str, block: Option<&str>) {
+    linked_value(ui, txid, LinkKind::Transaction { block }, false, false);
+}
+
 /// `chip`: show a known address's label chip (and the inline editor) before it.
-fn linked_value(ui: &mut Ui, value: &str, kind: LinkKind, selected: bool, chip: bool) -> bool {
+fn linked_value(ui: &mut Ui, value: &str, kind: LinkKind<'_>, selected: bool, chip: bool) -> bool {
     if !ui.layout().is_horizontal() {
         return ui
             .horizontal(|ui| linked_value(ui, value, kind, selected, chip))
@@ -545,14 +590,17 @@ fn linked_value(ui: &mut Ui, value: &str, kind: LinkKind, selected: bool, chip: 
     let copy_hint = match kind {
         LinkKind::Address => "Copy address",
         LinkKind::Block => "Copy hash",
+        LinkKind::Transaction { .. } => "Copy transaction id",
     };
+    // Inside the Explorer tab a click navigates the page rather than opening the pane.
+    let in_explorer = in_explorer(ui.ctx());
 
     // A known address shows its label after it (see [`set_labels`]); a click on the
     // chip, or the right-click menu, edits the user's own label in place.
     let rtl = ui.layout().prefer_right_to_left();
     let book = match kind {
         LinkKind::Address => labels(ui.ctx()),
-        LinkKind::Block => None,
+        LinkKind::Block | LinkKind::Transaction { .. } => None,
     };
     let label = book
         .as_ref()
@@ -593,9 +641,15 @@ fn linked_value(ui: &mut Ui, value: &str, kind: LinkKind, selected: bool, chip: 
         ui.selectable_label(selected || menu_open, shown.as_str())
     })
     .on_hover_cursor(egui::CursorIcon::PointingHand);
-    let hint = match kind {
-        LinkKind::Address => Some("Click for address info, right-click for more"),
-        LinkKind::Block => Some("Click for block info"),
+    let hint = match (kind, in_explorer) {
+        (LinkKind::Address, false) => Some("Click for address info, right-click for more"),
+        (LinkKind::Address, true) => Some("Click to open, right-click for more"),
+        (LinkKind::Block, false) => Some("Click for block info"),
+        (LinkKind::Block, true) => Some("Click to open"),
+        (LinkKind::Transaction { .. }, false) => {
+            Some("Click for transaction info, right-click for more")
+        }
+        (LinkKind::Transaction { .. }, true) => Some("Click to open, right-click for more"),
     };
     let response = match (shown != value, hint) {
         (true, Some(hint)) => response.on_hover_text(format!("{value}\n{hint}")),
@@ -604,16 +658,25 @@ fn linked_value(ui: &mut Ui, value: &str, kind: LinkKind, selected: bool, chip: 
         (false, None) => response,
     };
 
+    // A click: the info pane, or inside the Explorer the page.
     let mut get_block = false;
+    if response.clicked() {
+        if in_explorer {
+            request_explorer(ui.ctx(), kind.page(value), false);
+        } else {
+            request_pane(ui.ctx(), kind.page(value));
+        }
+        get_block = matches!(kind, LinkKind::Block);
+    }
     match kind {
         LinkKind::Address => {
-            if response.clicked() {
-                request_address(ui.ctx(), value);
-            }
-            // Right click: the user's own label (over any public one), and the explorers.
+            // Right click: the user's own label (over any public one), where else to
+            // open it, and the explorers.
             egui::Popup::context_menu(&response)
                 .id(context_id)
                 .show(|ui| {
+                    explorer_menu_items(ui, kind, value, in_explorer);
+                    ui.separator();
                     match user_label.as_deref() {
                         Some(current) => {
                             if ui.button("Edit Address Label").clicked() {
@@ -640,11 +703,11 @@ fn linked_value(ui: &mut Ui, value: &str, kind: LinkKind, selected: bool, chip: 
                     }
                 });
         }
-        LinkKind::Block => {
-            if response.clicked() {
-                request_block(ui.ctx(), value);
-                get_block = true;
-            }
+        LinkKind::Block => {}
+        LinkKind::Transaction { .. } => {
+            egui::Popup::context_menu(&response)
+                .id(context_id)
+                .show(|ui| explorer_menu_items(ui, kind, value, in_explorer));
         }
     }
 
@@ -655,6 +718,21 @@ fn linked_value(ui: &mut Ui, value: &str, kind: LinkKind, selected: bool, chip: 
         }
     }
     get_block
+}
+
+/// Context menu entries that open `value` elsewhere: in the Explorer tab's current
+/// sub tab (when not already there) or a new one, and inside the Explorer (where a
+/// click navigates) in the info pane.
+fn explorer_menu_items(ui: &mut Ui, kind: LinkKind<'_>, value: &str, in_explorer: bool) {
+    if !in_explorer && ui.button("Open in Explorer").clicked() {
+        request_explorer(ui.ctx(), kind.page(value), false);
+    }
+    if ui.button("Open in new Explorer tab").clicked() {
+        request_explorer(ui.ctx(), kind.page(value), true);
+    }
+    if in_explorer && ui.button("Show in info pane").clicked() {
+        request_pane(ui.ctx(), kind.page(value));
+    }
 }
 
 /// The width [`label_slot`] will take for this widget (with the item spacing before
@@ -824,19 +902,25 @@ pub fn take_label_requests(ctx: &egui::Context) -> Vec<(String, Option<String>)>
         .unwrap_or_default()
 }
 
-fn address_request_id() -> egui::Id {
-    egui::Id::new("address_lookup_request")
+fn pane_request_id() -> egui::Id {
+    egui::Id::new("info_pane_request")
 }
 
-/// Ask for the Address Info window for `address`, from any tab. The GUI frame loop picks
-/// it up with [`take_address_request`] and sends the lookup.
+/// Ask for `page` in the info pane (the panel that slides in on the right, on any
+/// tab), from anywhere. The GUI frame loop picks it up with [`take_pane_request`].
+pub fn request_pane(ctx: &egui::Context, page: ExplorerPage) {
+    ctx.data_mut(|d| d.insert_temp(pane_request_id(), Some(page)));
+}
+
+/// The page requested for the info pane this frame, if any.
+pub fn take_pane_request(ctx: &egui::Context) -> Option<ExplorerPage> {
+    ctx.data_mut(|d| d.remove_temp::<Option<ExplorerPage>>(pane_request_id()))
+        .flatten()
+}
+
+/// [`request_pane`] with the address's page.
 pub fn request_address(ctx: &egui::Context, address: &str) {
-    ctx.data_mut(|d| d.insert_temp(address_request_id(), address.trim().to_string()));
-}
-
-/// The address requested this frame, if any.
-pub fn take_address_request(ctx: &egui::Context) -> Option<String> {
-    ctx.data_mut(|d| d.remove_temp::<String>(address_request_id()))
+    request_pane(ctx, ExplorerPage::Address(address.trim().to_string()));
 }
 
 fn labels_id() -> egui::Id {
@@ -916,19 +1000,95 @@ fn copy_button(ui: &mut Ui, id: egui::Id, value: &str, hint: &str) {
     }
 }
 
-fn block_request_id() -> egui::Id {
-    egui::Id::new("block_lookup_request")
-}
-
-/// Ask for the Block Info window for `hash`, from any tab. The GUI frame loop picks it up
-/// with [`take_block_request`] and sends the lookup.
+/// [`request_pane`] with the block's page.
 pub fn request_block(ctx: &egui::Context, hash: &str) {
-    ctx.data_mut(|d| d.insert_temp(block_request_id(), hash.to_string()));
+    request_pane(ctx, ExplorerPage::Block(hash.to_string()));
 }
 
-/// The block hash requested this frame, if any.
-pub fn take_block_request(ctx: &egui::Context) -> Option<String> {
-    ctx.data_mut(|d| d.remove_temp::<String>(block_request_id()))
+fn explorer_request_id() -> egui::Id {
+    egui::Id::new("explorer_requests")
+}
+
+/// Ask the Explorer tab to show `page`, in the active sub tab or a new one, from
+/// anywhere. The GUI frame loop picks it up with [`take_explorer_requests`], switches to
+/// the tab and loads the page.
+pub fn request_explorer(ctx: &egui::Context, page: ExplorerPage, new_tab: bool) {
+    ctx.data_mut(|d| {
+        d.get_temp_mut_or_default::<Vec<(ExplorerPage, bool)>>(explorer_request_id())
+            .push((page, new_tab));
+    });
+}
+
+/// The Explorer pages requested this frame, each with whether it wants a new sub tab.
+pub fn take_explorer_requests(ctx: &egui::Context) -> Vec<(ExplorerPage, bool)> {
+    ctx.data_mut(|d| d.remove_temp(explorer_request_id()))
+        .unwrap_or_default()
+}
+
+fn in_explorer_id() -> egui::Id {
+    egui::Id::new("in_explorer_tab")
+}
+
+/// Mark the widgets drawn until the next call as inside the Explorer tab: a click on
+/// an address, block hash or transaction id there navigates the Explorer rather than
+/// opening the info pane.
+pub fn set_in_explorer(ctx: &egui::Context, inside: bool) {
+    ctx.data_mut(|d| d.insert_temp(in_explorer_id(), inside));
+}
+
+fn in_explorer(ctx: &egui::Context) -> bool {
+    ctx.data(|d| d.get_temp(in_explorer_id())).unwrap_or(false)
+}
+
+/// Label matches for `query` in a popup under `field`, when `open`: a popup over the
+/// page, not in the flow, so what is below doesn't move while typing. Stays while the
+/// field has focus or the pointer is on it; Esc or a pick closes it. Returns the
+/// address picked.
+pub fn label_search_popup(
+    ui: &mut Ui,
+    field: &egui::Response,
+    open: &mut bool,
+    query: &str,
+    book: &LabelBook,
+) -> Option<String> {
+    if !*open || query.trim().is_empty() {
+        return None;
+    }
+    let hits: Vec<(String, String)> = book
+        .search(query)
+        .into_iter()
+        .take(8)
+        .map(|(a, l)| (a.to_string(), l.name.clone()))
+        .collect();
+    let mut picked = None;
+    let popup = egui::Area::new(ui.id().with("label_search"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(field.rect.left_bottom() + egui::vec2(0.0, 4.0))
+        .show(ui.ctx(), |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.set_width(field.rect.width());
+                if hits.is_empty() {
+                    placeholder(ui, "No label matches");
+                }
+                for (addr, name) in &hits {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .link(RichText::new(name).color(theme::ACCENT_BRIGHT))
+                            .clicked()
+                        {
+                            picked = Some(addr.clone());
+                        }
+                        address(ui, addr);
+                    });
+                }
+            });
+        });
+    // A click there takes focus away from the field first.
+    let escaped = ui.input(|i| i.key_pressed(egui::Key::Escape));
+    if picked.is_some() || escaped || (field.lost_focus() && !popup.response.contains_pointer()) {
+        *open = false;
+    }
+    picked
 }
 
 fn testnet_id() -> egui::Id {
@@ -1003,6 +1163,74 @@ fn arc(path: &mut Vec<egui::Pos2>, center: egui::Pos2, radius: f32, from: f32, t
         let angle = (from + (to - from) * i as f32 / STEPS as f32).to_radians();
         path.push(center + egui::vec2(angle.cos(), angle.sin()) * radius);
     }
+}
+
+/// A page's data table (the Explorer's and the info pane's): striped, the row under the
+/// pointer highlighted like the Dashboard's tables, cells centered, and scrolling past
+/// `max_height`. Add its columns, then the header with [`table_header`]; rows are
+/// [`table_row_height`] tall.
+pub fn page_table(ui: &mut Ui, max_height: f32) -> TableBuilder<'_> {
+    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+    TableBuilder::new(ui)
+        .striped(true)
+        // Interactive cells, so egui_extras highlights the hovered row.
+        .sense(egui::Sense::click())
+        .max_scroll_height(max_height)
+        .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+}
+
+/// A [`page_table`] row's height: room for clickable cells (a selectable label is at
+/// least `interact_size.y` tall and grows by `expansion` on hover), as in `wide_table`.
+pub fn table_row_height(ui: &Ui) -> f32 {
+    ui.spacing().interact_size.y + 2.0 * ui.visuals().widgets.hovered.expansion
+}
+
+/// The header row of a [`page_table`]: the column titles in the accent color over a
+/// rule, so the header stands apart from the rows.
+pub fn table_header<'a>(table: TableBuilder<'a>, titles: &[&str]) -> Table<'a> {
+    table.header(theme::ROW_HEIGHT + 4.0, |mut header| {
+        for title in titles {
+            header.col(|ui| {
+                section_title(ui, title);
+                // Each cell draws its share of the rule, reaching half the column gap
+                // either side so the shares join.
+                let rect = ui.max_rect();
+                let gap = ui.spacing().item_spacing.x / 2.0;
+                ui.painter().hline(
+                    (rect.left() - gap)..=(rect.right() + gap),
+                    rect.bottom() - 0.5,
+                    Stroke::new(1.0_f32, theme::BORDER_HI),
+                );
+            });
+        }
+    })
+}
+
+/// A numbered one-column [`page_table`] of linked values (block hashes, addresses),
+/// each drawn by `cell`.
+pub fn link_table(
+    ui: &mut Ui,
+    id: &str,
+    title: &str,
+    rows: &[String],
+    max_height: f32,
+    cell: impl Fn(&mut Ui, &str),
+) {
+    ui.push_id(id, |ui| {
+        let row_height = table_row_height(ui);
+        let table = page_table(ui, max_height)
+            .column(Column::auto().at_least(24.0))
+            .column(Column::remainder().at_least(120.0));
+        table_header(table, &["#", title]).body(|body| {
+            body.rows(row_height, rows.len(), |mut row| {
+                let i = row.index();
+                row.col(|ui| {
+                    ui.label(RichText::new(i.to_string()).weak());
+                });
+                row.col(|ui| cell(ui, &rows[i]));
+            });
+        });
+    });
 }
 
 /// Greyed-out placeholder text, e.g. "Waiting for data…".

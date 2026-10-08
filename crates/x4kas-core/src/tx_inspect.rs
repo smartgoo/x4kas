@@ -180,6 +180,17 @@ pub enum ScriptClass {
     NonStandard,
 }
 
+impl ScriptClass {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::PubKey => "P2PK",
+            Self::PubKeyEcdsa => "P2PK (ECDSA)",
+            Self::ScriptHash => "P2SH",
+            Self::NonStandard => "non-standard",
+        }
+    }
+}
+
 const OP_DATA_32: u8 = 0x20;
 const OP_DATA_33: u8 = 0x21;
 const OP_EQUAL: u8 = 0x87;

@@ -4,8 +4,8 @@ use std::time::Duration;
 use anyhow::Result;
 use kaspa_rpc_core::api::rpc::RpcApi;
 use kaspa_rpc_core::{
-    GetVirtualChainFromBlockV2Response, RpcAddress, RpcDataVerbosityLevel, RpcHash, RpcHeader,
-    UtxosChangedNotification,
+    GetBlockRewardInfoResponse, GetVirtualChainFromBlockV2Response, RpcAddress, RpcBlock,
+    RpcDataVerbosityLevel, RpcHash, RpcHeader, RpcMempoolEntry, UtxosChangedNotification,
 };
 use kaspa_wrpc_client::prelude::*;
 use serde::Serialize;
@@ -543,6 +543,21 @@ impl RpcManager {
             .get_virtual_chain_from_block(start_hash, false, None)
             .await?;
         Ok(response.added_chain_block_hashes.to_vec())
+    }
+
+    /// A block with its transactions and verbose data, for the Explorer's block page.
+    pub async fn block(&self, hash: RpcHash) -> Result<RpcBlock> {
+        Ok(self.client.get_block(hash, true).await?)
+    }
+
+    /// A block's color, confirmations and reward.
+    pub async fn block_reward(&self, hash: RpcHash) -> Result<GetBlockRewardInfoResponse> {
+        Ok(self.client.get_block_reward_info(hash).await?)
+    }
+
+    /// A transaction waiting in the mempool (the orphan pool included).
+    pub async fn mempool_entry(&self, txid: RpcHash) -> Result<RpcMempoolEntry> {
+        Ok(self.client.get_mempool_entry(txid, true, false).await?)
     }
 
     /// A block's header timestamp in milliseconds.

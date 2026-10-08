@@ -13,19 +13,21 @@ use tokio::sync::{RwLock, mpsc, oneshot};
 use crate::analytics;
 use crate::app::{ActiveConnection, AddressView, App, ChainPhase, ConnectionStatus};
 use crate::chain_stream::{self, StreamStart};
+use crate::explorer::{self, AddressPageData, BlockView, ExplorerPage, PageData, TxView};
 use crate::index::export::{self, ExportFormat};
-use crate::index::query::{self, Cursor, FlowGraph};
-use crate::index::{self, IndexStore};
-use crate::labels;
+use crate::index::query::{self, AddressProfile, Cursor, FlowGraph};
+use crate::index::{self, IndexStore, parse_hex};
+use crate::labels::{self, LabelBook};
 use crate::polling::{PollingHandles, create_and_start_rpc, start_hashrate_polling};
 use crate::rpc::client::RpcManager;
+use crate::rpc::methods::parse_hash;
 use crate::watch::{self, Watchlist};
 
 /// Rows per page of an address's transactions.
 pub const ADDRESS_PAGE: usize = 50;
-/// Counterparties shown in the Address Info window.
+/// Counterparties shown on an address page.
 const ADDRESS_PEERS: usize = 10;
-/// Cluster members listed in the Address Info window.
+/// Cluster members listed on an address page.
 const CLUSTER_MEMBERS: usize = 50;
 /// Counterparties followed per node in the flow graph.
 pub const FLOW_TOP: usize = 12;
@@ -38,13 +40,14 @@ pub enum UiCommand {
     Disconnect,
     /// Run an RPC method with its arguments and store the result in `app.rpc_explorer`.
     ExecuteRpc { method: String, args: Vec<String> },
-    /// Fetch block info and store the result in `app.dag_selection`.
-    LookupBlock(String),
-    /// Load an address's profile, transactions, counterparties and balance into
-    /// `app.address` (the Address Info window).
-    LookupAddress(String),
-    /// Append the next (older) page of transactions to the open Address Info window.
+    /// Append the next (older) page of transactions to the address's loaded page
+    /// (`app.explorer`'s cache, shown by the info pane or an Explorer tab).
     AddressPage { address: String, before: Cursor },
+    /// Load a page into `app.explorer`'s cache (for the info pane or an Explorer tab):
+    /// a block from the node, an address's profile, transactions, counterparties and
+    /// balance, a transaction from the index, the mempool or the block it is known to
+    /// be in, or a lookup that may be either a block or a transaction.
+    ExplorerLoad(ExplorerPage),
     /// Expand the flow graph from `address` by `hops` counterparties (merged into
     /// `app.address.flows`).
     AddressFlows { address: String, hops: u8 },
@@ -154,9 +157,8 @@ impl Controller {
                 UiCommand::Connect(target) => self.connect(target).await,
                 UiCommand::Disconnect => self.disconnect().await,
                 UiCommand::ExecuteRpc { method, args } => self.execute_rpc(method, args),
-                UiCommand::LookupBlock(hash) => self.lookup_block(hash),
-                UiCommand::LookupAddress(address) => self.lookup_address(address).await,
                 UiCommand::AddressPage { address, before } => self.address_page(address, before),
+                UiCommand::ExplorerLoad(page) => self.explorer_load(page).await,
                 UiCommand::AddressFlows { address, hops } => self.address_flows(address, hops),
                 UiCommand::Export(request) => self.export(request).await,
                 UiCommand::WatchSet(list) => self.set_watchlist(list).await,
@@ -370,65 +372,6 @@ impl Controller {
         );
     }
 
-    /// Load everything the Address Info window shows: the index's profile, first page
-    /// and counterparties (in a blocking task, the store is synchronous) and the node's
-    /// balance.
-    async fn lookup_address(&mut self, address: String) {
-        let store = self.index.clone();
-        let key = address.clone();
-        let labels = self.app.read().await.labels.clone();
-        self.spawn_rpc(
-            move |rpc| async move {
-                let balance = match kaspa_rpc_core::RpcAddress::try_from(address.as_str()) {
-                    Ok(parsed) => rpc.balance(parsed).await.ok(),
-                    Err(e) => return Err(anyhow!("invalid address: {e}")),
-                };
-                let Some(store) = store else {
-                    return Err(anyhow!(
-                        "The address index needs a direct node connection (a URL), not the resolver"
-                    ));
-                };
-                tokio::task::spawn_blocking(move || -> Result<AddressView> {
-                    let profile = query::profile(&store, &address)?;
-                    let (page, peers, curve, cluster) = match profile.id {
-                        Some(id) => {
-                            let deltas = query::balance_deltas(&store, id, 0)?;
-                            (
-                                query::transactions(&store, id, None, ADDRESS_PAGE)?,
-                                query::counterparties(&store, id, ADDRESS_PEERS)?,
-                                query::balance_curve(&deltas, balance),
-                                Some(query::cluster(&store, &labels, id, CLUSTER_MEMBERS)?),
-                            )
-                        }
-                        None => (
-                            query::Page {
-                                items: Vec::new(),
-                                next: None,
-                            },
-                            Vec::new(),
-                            Vec::new(),
-                            None,
-                        ),
-                    };
-                    Ok(AddressView {
-                        profile,
-                        balance,
-                        page,
-                        peers,
-                        curve,
-                        cluster,
-                    })
-                })
-                .await
-                .map_err(|e| anyhow!("address lookup task: {e}"))?
-            },
-            move |app, result| {
-                app.address
-                    .set_view(&key, result.map_err(|e| format!("{e:#}")));
-            },
-        );
-    }
-
     fn address_page(&mut self, address: String, before: Cursor) {
         let store = self.index.clone();
         let key = address.clone();
@@ -445,10 +388,84 @@ impl Controller {
                 .map_err(|e| anyhow!("address page task: {e}"))?
             },
             move |app, result| {
-                app.address
-                    .append_page(&key, result.map_err(|e| format!("{e:#}")));
+                let result = result.map_err(|e| format!("{e:#}"));
+                if let Some(data) = app.explorer.address_page_mut(&key) {
+                    data.loading_more = false;
+                    match result {
+                        Ok(page) => {
+                            data.view.page.items.extend(page.items);
+                            data.view.page.next = page.next;
+                        }
+                        Err(e) => data.error = Some(e),
+                    }
+                }
             },
         );
+    }
+
+    /// Load an Explorer page; the outcome lands in `app.explorer`'s cache.
+    async fn explorer_load(&mut self, page: ExplorerPage) {
+        let store = self.index.clone();
+        let key = page.clone();
+        let done = move |app: &mut App, result: Result<PageData>| {
+            app.explorer
+                .set_loaded(key, result.map_err(|e| format!("{e:#}")));
+        };
+        match page {
+            ExplorerPage::Home => {}
+            ExplorerPage::Block(hash) => self.spawn_rpc(
+                move |rpc| async move { block_view(rpc, store, hash).await.map(PageData::Block) },
+                done,
+            ),
+            ExplorerPage::Address(address) => {
+                let labels = self.app.read().await.labels.clone();
+                self.spawn_rpc(
+                    move |rpc| async move {
+                        let view = address_view(rpc, store, labels, address).await?;
+                        Ok(PageData::Address(AddressPageData {
+                            view,
+                            loading_more: false,
+                            online_result: None,
+                            error: None,
+                        }))
+                    },
+                    done,
+                );
+            }
+            ExplorerPage::Transaction { txid, block } => self.spawn_rpc(
+                move |rpc| async move {
+                    tx_view(rpc, store, txid, block)
+                        .await
+                        .map(PageData::Transaction)
+                },
+                done,
+            ),
+            ExplorerPage::Lookup(ref id) => {
+                let (lookup, id) = (page.clone(), id.clone());
+                self.spawn_rpc(
+                    move |rpc| async move {
+                        // A block first: the node answers at once; a transaction may
+                        // need the index, the mempool and a block hint.
+                        if let Ok(block) = block_view(rpc.clone(), store.clone(), id.clone()).await
+                        {
+                            return Ok((ExplorerPage::Block(id), PageData::Block(block)));
+                        }
+                        match tx_view(rpc, store, id.clone(), None).await {
+                            Ok(tx) => {
+                                Ok((ExplorerPage::transaction(&id), PageData::Transaction(tx)))
+                            }
+                            Err(e) => Err(anyhow!(
+                                "No block has this hash, and no transaction has this id: {e:#}"
+                            )),
+                        }
+                    },
+                    move |app, result| match result {
+                        Ok((target, data)) => app.explorer.resolve(lookup, target, data),
+                        Err(e) => app.explorer.set_loaded(lookup, Err(format!("{e:#}"))),
+                    },
+                );
+            }
+        }
     }
 
     fn address_flows(&mut self, address: String, hops: u8) {
@@ -574,15 +591,13 @@ impl Controller {
                         book.apply_online(&address, entry);
                     }
                     app.labels = Arc::new(book);
-                    if let Some(window) = app.address.open.as_mut().filter(|w| w.address == address)
-                    {
-                        window.online_result = Some(entries);
+                    if let Some(page) = app.explorer.address_page_mut(&address) {
+                        page.online_result = Some(entries);
                     }
                 }
                 Err(e) => {
-                    if let Some(window) = app.address.open.as_mut().filter(|w| w.address == address)
-                    {
-                        window.error = Some(format!("online lookup: {e:#}"));
+                    if let Some(page) = app.explorer.address_page_mut(&address) {
+                        page.error = Some(format!("online lookup: {e:#}"));
                     }
                 }
             }
@@ -605,20 +620,150 @@ impl Controller {
             labels::refresh_kaspa_org(&app).await;
         });
     }
+}
 
-    fn lookup_block(&mut self, hash: String) {
-        self.spawn_rpc(
-            move |rpc| async move {
-                rpc.execute_rpc_call("get_block", &[hash, "true".to_string()])
-                    .await
+/// Everything the address info pane and the Explorer's address page show: the
+/// node's balance, and from the index (in a blocking task, the store is synchronous)
+/// the profile, first page of transactions, counterparties, balance curve and cluster.
+/// Without an index (the resolver) only the balance, with a note saying why.
+async fn address_view(
+    rpc: Arc<RpcManager>,
+    store: Option<Arc<IndexStore>>,
+    labels: Arc<LabelBook>,
+    address: String,
+) -> Result<AddressView> {
+    let balance = match kaspa_rpc_core::RpcAddress::try_from(address.as_str()) {
+        Ok(parsed) => rpc.balance(parsed).await.ok(),
+        Err(e) => return Err(anyhow!("invalid address: {e}")),
+    };
+    let Some(store) = store else {
+        return Ok(AddressView {
+            profile: AddressProfile::unindexed(&address),
+            balance,
+            page: query::Page {
+                items: Vec::new(),
+                next: None,
             },
-            |app, result| {
-                let detail = result.unwrap_or_else(|e| error_json(&e));
-                app.dag_selection.set_detail(Some(detail));
-                app.dag_selection.block_loading = false;
-            },
-        );
+            peers: Vec::new(),
+            curve: Vec::new(),
+            cluster: None,
+            index_note: Some(
+                "Transactions and totals need the address index, which runs with a direct \
+                 node connection (a URL), not the resolver."
+                    .to_string(),
+            ),
+        });
+    };
+    tokio::task::spawn_blocking(move || -> Result<AddressView> {
+        let profile = query::profile(&store, &address)?;
+        let (page, peers, curve, cluster) = match profile.id {
+            Some(id) => {
+                let deltas = query::balance_deltas(&store, id, 0)?;
+                (
+                    query::transactions(&store, id, None, ADDRESS_PAGE)?,
+                    query::counterparties(&store, id, ADDRESS_PEERS)?,
+                    query::balance_curve(&deltas, balance),
+                    Some(query::cluster(&store, &labels, id, CLUSTER_MEMBERS)?),
+                )
+            }
+            None => (
+                query::Page {
+                    items: Vec::new(),
+                    next: None,
+                },
+                Vec::new(),
+                Vec::new(),
+                None,
+            ),
+        };
+        Ok(AddressView {
+            profile,
+            balance,
+            page,
+            peers,
+            curve,
+            cluster,
+            index_note: None,
+        })
+    })
+    .await
+    .map_err(|e| anyhow!("address lookup task: {e}"))?
+}
+
+/// A block page: `get_block` and `get_block_reward_info` from the node, then the
+/// index's acceptance data for its transactions.
+async fn block_view(
+    rpc: Arc<RpcManager>,
+    store: Option<Arc<IndexStore>>,
+    hash: String,
+) -> Result<BlockView> {
+    let hash = parse_hash(&hash)?;
+    let (block, reward) = tokio::join!(rpc.block(hash), rpc.block_reward(hash));
+    let mut view = BlockView::from_rpc(&block?);
+    // Older nodes don't answer; the page just lacks the row.
+    view.reward = reward.ok().map(Into::into);
+    let Some(store) = store else {
+        return Ok(view);
+    };
+    tokio::task::spawn_blocking(move || {
+        explorer::enrich_block(&store, &mut view)?;
+        Ok(view)
+    })
+    .await
+    .map_err(|e| anyhow!("block enrich task: {e}"))?
+}
+
+/// A transaction page: from the index if it was accepted in the indexed window, else
+/// from the mempool, else from `block_hint` (a block it is known to be in). Inputs of
+/// a node transaction are resolved from the index where possible.
+async fn tx_view(
+    rpc: Arc<RpcManager>,
+    store: Option<Arc<IndexStore>>,
+    txid: String,
+    block_hint: Option<String>,
+) -> Result<TxView> {
+    let id = parse_hex(&txid).ok_or_else(|| anyhow!("a transaction id is 64 hex characters"))?;
+    if let Some(store) = store.clone() {
+        let found = tokio::task::spawn_blocking(move || query::transaction(&store, &id))
+            .await
+            .map_err(|e| anyhow!("transaction lookup task: {e}"))??;
+        if let Some(detail) = found {
+            return Ok(TxView::from_index(detail));
+        }
     }
+    let rpc_id = parse_hash(&txid)?;
+    let from_node = match rpc.mempool_entry(rpc_id).await {
+        Ok(entry) => Some(TxView::from_mempool(&entry)),
+        Err(_) => match block_hint {
+            Some(block) => {
+                let block = rpc.block(parse_hash(&block)?).await?;
+                TxView::from_block(&block, &txid)
+            }
+            None => None,
+        },
+    };
+    let Some(view) = from_node else {
+        return Err(anyhow!(match store {
+            Some(_) => {
+                "Not in the mempool and not accepted within the indexed window. \
+                 Open it from its block's page if you know the block."
+            }
+            None => {
+                "Not in the mempool. Accepted transactions need the address index, which \
+                 runs with a direct node connection (a URL), not the resolver."
+            }
+        }));
+    };
+    let Some(store) = store else {
+        return Ok(view);
+    };
+    let mut view = view;
+    tokio::task::spawn_blocking(move || {
+        explorer::enrich_tx(&store, &mut view)?;
+        Ok(view)
+    })
+    .await
+    .map_err(|e| anyhow!("transaction enrich task: {e}"))?
 }
 
 /// An error as a JSON object, for views that show JSON responses.

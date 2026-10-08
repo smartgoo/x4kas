@@ -144,6 +144,16 @@ pub fn kaspa_stream_block_url(hash: &str) -> String {
     format!("https://kaspa.stream/blocks/{hash}")
 }
 
+/// The transaction page on Kaspa Explorer, on the testnet-10 explorer if `testnet`.
+pub fn explorer_tx_url(txid: &str, testnet: bool) -> String {
+    format!("https://{}/txs/{txid}", explorer_host(testnet))
+}
+
+/// The transaction page on Kaspa Stream (mainnet).
+pub fn kaspa_stream_tx_url(txid: &str) -> String {
+    format!("https://kaspa.stream/transactions/{txid}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,6 +183,14 @@ mod tests {
         assert_eq!(
             kaspa_stream_block_url("ab12"),
             "https://kaspa.stream/blocks/ab12"
+        );
+        assert_eq!(
+            explorer_tx_url("ab12", true),
+            "https://explorer-tn10.kaspa.org/txs/ab12"
+        );
+        assert_eq!(
+            kaspa_stream_tx_url("ab12"),
+            "https://kaspa.stream/transactions/ab12"
         );
     }
 

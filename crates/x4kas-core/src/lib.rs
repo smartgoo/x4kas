@@ -7,6 +7,7 @@ pub mod chain_stream;
 pub mod config;
 pub mod controller;
 pub mod emission;
+pub mod explorer;
 pub mod format;
 pub mod index;
 pub mod labels;

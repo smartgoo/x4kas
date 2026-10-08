@@ -1,6 +1,6 @@
 use kaspa_rpc_core::{
-    GetBlockDagInfoResponse, GetCoinSupplyResponse, GetServerInfoResponse, RpcFeeEstimate,
-    RpcMempoolEntry,
+    GetBlockDagInfoResponse, GetBlockRewardInfoResponse, GetCoinSupplyResponse,
+    GetServerInfoResponse, RpcBlockColor, RpcFeeEstimate, RpcMempoolEntry,
 };
 
 #[derive(Debug, Clone)]
@@ -128,6 +128,52 @@ impl From<RpcFeeEstimate> for FeeEstimateInfo {
             priority_feerate: r.priority_bucket.feerate,
             normal_feerate: r.normal_buckets.first().map(|b| b.feerate),
             low_feerate: r.low_buckets.first().map(|b| b.feerate),
+        }
+    }
+}
+
+/// A block's standing in the DAG, from `get_block_reward_info`: whether it was merged
+/// blue or red, how deep it is, and what it earned.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BlockRewardInfo {
+    pub color: BlockColor,
+    /// Chain blocks on top of the one that merged it.
+    pub confirmations: Option<u64>,
+    /// The chain block that merged it.
+    pub merging_chain_block: Option<String>,
+    /// Sompi paid to its miner (blue blocks only).
+    pub reward: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockColor {
+    /// Not merged by the selected chain yet.
+    Unknown,
+    Blue,
+    Red,
+}
+
+impl BlockColor {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Unknown => "Not merged yet",
+            Self::Blue => "Blue",
+            Self::Red => "Red",
+        }
+    }
+}
+
+impl From<GetBlockRewardInfoResponse> for BlockRewardInfo {
+    fn from(r: GetBlockRewardInfoResponse) -> Self {
+        Self {
+            color: match r.block_color {
+                RpcBlockColor::Unknown => BlockColor::Unknown,
+                RpcBlockColor::Blue => BlockColor::Blue,
+                RpcBlockColor::Red => BlockColor::Red,
+            },
+            confirmations: r.confirmation_count,
+            merging_chain_block: r.merging_chain_block_hash.map(|h| h.to_string()),
+            reward: r.reward_amount,
         }
     }
 }

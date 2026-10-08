@@ -5,10 +5,12 @@ mod analytics;
 mod blockdag;
 mod connection;
 mod dashboard;
+mod explorer;
 mod flows;
 mod help;
 mod mempool;
 mod monitoring;
+mod pane;
 mod rpc_explorer;
 mod settings;
 mod terminal;
@@ -24,10 +26,11 @@ use eframe::egui::{self, Event, Key, Modifiers, RichText, Stroke, ViewportComman
 use tokio::sync::{RwLock, oneshot};
 
 use crate::Args;
-use address::AddressWindowUi;
 use connection::ConnectionWindow;
+use explorer::ExplorerUi;
 use flows::FlowWindowUi;
 use monitoring::MonitoringTab;
+use pane::InfoPane;
 use settings::SettingsPage;
 use terminal::TerminalPane;
 use toasts::Toasts;
@@ -117,8 +120,9 @@ struct GuiApp {
     connection: ConnectionWindow,
     terminal: TerminalPane,
     monitoring: MonitoringTab,
+    explorer: ExplorerUi,
     settings: SettingsPage,
-    address_window: AddressWindowUi,
+    pane: InfoPane,
     flow_window: FlowWindowUi,
     toasts: Toasts,
 }
@@ -134,8 +138,9 @@ impl GuiApp {
             connection,
             terminal: TerminalPane::new(),
             monitoring: MonitoringTab::default(),
+            explorer: ExplorerUi::default(),
             settings: SettingsPage::default(),
-            address_window: AddressWindowUi::default(),
+            pane: InfoPane::default(),
             flow_window: FlowWindowUi::default(),
             toasts: Toasts::default(),
         }
@@ -167,14 +172,9 @@ impl GuiApp {
         }
     }
 
-    /// A window or popup that Esc would close first is on show.
-    fn any_window_open(&self, app: &App) -> bool {
-        self.show_help
-            || self.connection.open
-            || app.address.open.is_some()
-            || app.address.flows.open
-            || app.dag_selection.block_loading
-            || app.dag_selection.block_detail.is_some()
+    /// A modal window that closes itself on Esc is on show.
+    fn modal_open(&self, app: &App) -> bool {
+        self.show_help || self.connection.open || app.address.flows.open
     }
 
     fn is_shutting_down(&self) -> bool {
@@ -200,6 +200,7 @@ impl eframe::App for GuiApp {
             &mut self.show_help,
             &mut self.settings.open,
             &mut self.terminal,
+            &mut self.explorer,
         );
         let testnet = app
             .node
@@ -232,6 +233,12 @@ impl eframe::App for GuiApp {
             // Esc belongs to the shell (vim etc.), not the popups drawn below.
             ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
         }
+        // Before the windows draw: they close themselves on Esc, which then shouldn't
+        // also close the pane or Settings.
+        let modal_open = self.modal_open(&app);
+        // The info pane slides in over the right of the tab, between the bars and above
+        // the terminal, without moving what is behind it.
+        self.pane.show(ctx, &mut app, &self.cmd_tx);
 
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.settings.open {
@@ -240,8 +247,9 @@ impl eframe::App for GuiApp {
             }
             match app.active_tab {
                 Tab::Dashboard => dashboard::show(ui, &mut app),
+                Tab::Explorer => self.explorer.show(ui, &mut app, &self.cmd_tx),
                 Tab::Monitoring => self.monitoring.show(ui, &mut app, &self.cmd_tx),
-                Tab::Mempool => mempool::show(ui, &mut app),
+                Tab::Mempool => mempool::show(ui, &app),
                 Tab::RpcExplorer => rpc_explorer::show(ui, &mut app, &self.cmd_tx),
             }
         });
@@ -250,19 +258,29 @@ impl eframe::App for GuiApp {
             let _ = self.cmd_tx.send(UiCommand::SetLabel { address, name });
         }
 
-        // A click on any block hash (or a block in the DAG visualizer) opens Block Info here, whatever
-        // the tab.
-        if let Some(hash) = widgets::take_block_request(ctx) {
-            app.dag_selection.request(hash.clone());
-            let _ = self.cmd_tx.send(UiCommand::LookupBlock(hash));
+        // "Open in Explorer" from anywhere (a right-click menu, the info pane): switch
+        // to the tab, close the pane, and show the page.
+        let requests = widgets::take_explorer_requests(ctx);
+        if !requests.is_empty() {
+            app.active_tab = Tab::Explorer;
+            self.settings.open = false;
+            app.explorer.close_pane();
         }
-        blockdag::block_window(ctx, &mut app);
-        // Likewise any address opens Address Info.
-        if let Some(address) = widgets::take_address_request(ctx) {
-            app.address.request(address.clone());
-            let _ = self.cmd_tx.send(UiCommand::LookupAddress(address));
+        for (page, new_tab) in requests {
+            if new_tab {
+                app.explorer.open_tab(page);
+            } else {
+                app.explorer.navigate(page);
+            }
         }
-        self.address_window.show(ctx, &mut app, &self.cmd_tx);
+
+        // A click on any address, block hash (or a block in the DAG visualizer) or
+        // transaction id outside the Explorer shows it in the info pane, whatever the
+        // tab; the pane draws it next frame.
+        if let Some(page) = widgets::take_pane_request(ctx) {
+            app.explorer.open_pane(page);
+            ctx.request_repaint();
+        }
         self.flow_window.show(ctx, &mut app, &self.cmd_tx);
         // Watchlist alerts pop up over any tab.
         self.toasts.collect(&app);
@@ -270,13 +288,13 @@ impl eframe::App for GuiApp {
 
         self.connection.show(ctx, &mut app, &self.cmd_tx);
         help::show(ctx, &mut self.show_help);
-        // Esc leaves Settings once no popup is left to close.
-        if self.settings.open
-            && !self.any_window_open(&app)
-            && !ctx.wants_keyboard_input()
-            && ctx.input(|i| i.key_pressed(Key::Escape))
-        {
-            self.settings.open = false;
+        // Esc closes the info pane once no window is left to close, then leaves Settings.
+        if !modal_open && !ctx.wants_keyboard_input() && ctx.input(|i| i.key_pressed(Key::Escape)) {
+            if app.explorer.pane.is_some() {
+                app.explorer.close_pane();
+            } else if self.settings.open {
+                self.settings.open = false;
+            }
         }
 
         if self.is_shutting_down() {
@@ -302,14 +320,22 @@ fn handle_shortcuts(
     show_help: &mut bool,
     settings_open: &mut bool,
     terminal: &mut TerminalPane,
+    explorer: &mut ExplorerUi,
 ) {
-    const TAB_KEYS: [Key; 4] = [Key::Num1, Key::Num2, Key::Num3, Key::Num4];
+    const TAB_KEYS: [Key; 5] = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5];
 
     // Works even while the terminal or a text field has focus.
     if ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, Key::Backtick)) {
         terminal.toggle();
     }
-    if terminal.has_focus() || ctx.wants_keyboard_input() {
+    if terminal.has_focus() {
+        return;
+    }
+    // Modifier combinations type nothing, so they work from the search field too.
+    if app.active_tab == Tab::Explorer && !*settings_open {
+        explorer.handle_shortcuts(ctx, app);
+    }
+    if ctx.wants_keyboard_input() {
         return;
     }
 
@@ -400,12 +426,7 @@ fn top_bar(
                 ui.label(RichText::new("|").color(theme::BORDER_HI));
             }
             let selected = app.active_tab == *tab && !settings.open;
-            // Alerts raised while the Monitoring tab wasn't on show.
-            let badge = match tab {
-                Tab::Monitoring if !selected => app.watch.unread_alerts,
-                _ => 0,
-            };
-            if tab_button(ui, tab.label(), selected, badge)
+            if tab_button(ui, tab.label(), selected)
                 .on_hover_text(format!("Shortcut: {}", i + 1))
                 .clicked()
             {
@@ -445,21 +466,15 @@ fn brand(ui: &mut egui::Ui) {
     ui.label(RichText::new("kas").color(theme::TEXT_BRIGHT).size(15.0));
 }
 
-/// A tab in the strip: the name, then a count (unread alerts) when `badge` is non-zero.
-/// The active tab is inverted; a hovered one is raised on a lighter surface.
-fn tab_button(ui: &mut egui::Ui, label: &str, selected: bool, badge: usize) -> egui::Response {
+/// A tab in the strip (also the Explorer's sub tabs). The active tab is inverted; a
+/// hovered one is raised on a lighter surface.
+pub(super) fn tab_button(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
     let padding = egui::vec2(6.0, 2.0);
     let font = egui::TextStyle::Button.resolve(ui.style());
     let text = ui
         .painter()
-        .layout_no_wrap(label.to_owned(), font.clone(), theme::TEXT);
-    let badge = (badge > 0).then(|| {
-        ui.painter()
-            .layout_no_wrap(format!(" {badge}"), font, theme::WARN)
-    });
-    let text_width = text.size().x;
-    let badge_width = badge.as_ref().map_or(0.0, |b| b.size().x);
-    let size = egui::vec2(text_width + badge_width, text.size().y) + 2.0 * padding;
+        .layout_no_wrap(label.to_owned(), font, theme::TEXT);
+    let size = text.size() + 2.0 * padding;
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
     response.widget_info(|| {
         egui::WidgetInfo::selected(
@@ -481,11 +496,7 @@ fn tab_button(ui: &mut egui::Ui, label: &str, selected: bool, badge: usize) -> e
         if fill != egui::Color32::TRANSPARENT {
             painter.rect_filled(rect, 2.0, fill);
         }
-        let pos = rect.min + padding;
-        painter.galley_with_override_text_color(pos, text, color);
-        if let Some(badge) = badge {
-            painter.galley(pos + egui::vec2(text_width, 0.0), badge, theme::WARN);
-        }
+        painter.galley_with_override_text_color(rect.min + padding, text, color);
     }
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
@@ -549,17 +560,21 @@ fn node_chip(ui: &mut egui::Ui, app: &App) {
     });
 }
 
-/// The chain pipeline indicator ("DAG …"): the stream's phase and catch-up progress,
-/// with the stream's and the index writer's details (position, coverage, speed, disk)
-/// and a Resync button on hover.
+/// The chain pipeline indicator ("Analyzing DAG (73%)", "Analyzer synced"…): the
+/// stream's catch-up progress, with its phase, the stream's and the index writer's
+/// details (position, coverage, speed, disk) and a Resync button on hover.
 fn chain_chip(ui: &mut egui::Ui, app: &App, cmd_tx: &CommandSender) {
     match app.connection {
         ActiveConnection::None => return,
         ActiveConnection::Resolver => {
             widgets::divider(ui);
-            widgets::status_chip(ui, "chain_status", "○ DAG n/a", theme::TEXT_DIM, |ui| {
-                kv(ui, "Status", "Needs a direct node (URL), not the resolver")
-            });
+            widgets::status_chip(
+                ui,
+                "chain_status",
+                "○ Analyzer n/a",
+                theme::TEXT_DIM,
+                |ui| kv(ui, "Status", "Needs a direct node (URL), not the resolver"),
+            );
             return;
         }
         ActiveConnection::Url(_) => {}
@@ -568,52 +583,65 @@ fn chain_chip(ui: &mut egui::Ui, app: &App, cmd_tx: &CommandSender) {
     let status = &app.chain;
     let tip = app.node.server_info.as_ref().map(|s| s.virtual_daa_score);
     let fraction = tip.and_then(|tip| status.fraction(tip));
-    let (text, color, summary) = match status.phase {
+    // The chip keeps to a few words; the phase and what it is doing go in the hover.
+    let (text, color, phase, summary) = match status.phase {
         ChainPhase::Idle => return,
-        _ if app.paused => ("⏸ DAG paused".into(), theme::TEXT_DIM, "Paused"),
-        ChainPhase::Opening => (
-            "◌ DAG opening".into(),
+        _ if app.paused => (
+            "⏸ Analyzer paused".into(),
             theme::TEXT_DIM,
+            "Paused",
+            "Not fetching until resumed",
+        ),
+        ChainPhase::Opening => (
+            "◌ Analyzing DAG".into(),
+            theme::TEXT_DIM,
+            "Opening",
             "Opening the index store",
         ),
         ChainPhase::WaitingForNode => (
-            "◌ DAG waiting".into(),
+            "◌ Analyzing DAG".into(),
             theme::TEXT_DIM,
+            "Waiting for node",
             "Waiting for the node to connect and sync",
         ),
         ChainPhase::Seeking => (
-            "◐ DAG seeking".into(),
+            "◐ Analyzing DAG".into(),
             theme::WARN,
+            "Seeking",
             "Skipping to the last 24 hours",
         ),
         ChainPhase::CatchingUp => (
             match fraction {
-                Some(f) => format!("◐ DAG {:.0}%", f * 100.0),
-                None => "◐ DAG".into(),
+                Some(f) => format!("◐ Analyzing DAG ({:.0}%)", f * 100.0),
+                None => "◐ Analyzing DAG".into(),
             },
             theme::WARN,
+            "Catching up",
             "Catching up to the DAG tip",
         ),
         ChainPhase::Live if status.backlog > 0 => (
-            "● DAG writing".into(),
+            "● Analyzer writing".into(),
             theme::OK,
+            "Live",
             "Up to date; writing the latest batches",
         ),
-        ChainPhase::Live => ("● DAG synced".into(), theme::OK, "Up to date"),
+        ChainPhase::Live => ("● Analyzer synced".into(), theme::OK, "Live", "Up to date"),
         ChainPhase::Error(_) => (
-            "× DAG error".into(),
+            "× Analyzer error".into(),
             theme::ERROR,
+            "Error",
             "Request failed, retrying",
         ),
     };
-    let (text, color) = match status.write_error {
-        Some(_) => ("× DAG write error".to_string(), theme::ERROR),
-        None => (text, color),
+    let (text, color, phase) = match status.write_error {
+        Some(_) => ("× Analyzer error".to_string(), theme::ERROR, "Write error"),
+        None => (text, color, phase),
     };
 
     widgets::divider(ui);
     let can_resync = !matches!(status.phase, ChainPhase::Opening);
     let details = |ui: &mut egui::Ui| {
+        kv(ui, "Phase", phase);
         // Distance to the tip once known, otherwise what the task is doing.
         match tip.and_then(|tip| status.behind(tip)) {
             Some((daa, time)) => kv(

@@ -35,6 +35,21 @@ pub struct AddressProfile {
     pub peel_chain: Option<PeelChain>,
 }
 
+impl AddressProfile {
+    /// A profile for an address no index was asked about (no store, e.g. with the
+    /// resolver): nothing indexed.
+    pub fn unindexed(address: &str) -> Self {
+        Self {
+            address: address.to_string(),
+            id: None,
+            stats: AddrStats::default(),
+            coverage: None,
+            cluster_size: 0,
+            peel_chain: None,
+        }
+    }
+}
+
 /// An address's likely-owner cluster.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClusterInfo {

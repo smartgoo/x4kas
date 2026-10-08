@@ -10,7 +10,7 @@ pub use super::analytics::wide_table;
 use super::theme;
 use x4kas_core::app::{ActiveConnection, App};
 use x4kas_core::format::{explorer_address_url, kaspa_stream_address_url, shorten_middle};
-use x4kas_core::labels::LabelBook;
+use x4kas_core::labels::{Label, LabelBook, LabelSource};
 use x4kas_core::rpc::hash_links::HashLink;
 
 /// Vertical space between stacked cards.
@@ -517,16 +517,19 @@ fn linked_value(ui: &mut Ui, value: &str, kind: LinkKind, selected: bool) -> boo
         LinkKind::Block => "Copy hash",
     };
 
-    // A known address shows its label first (see [`set_labels`]).
+    // A known address shows its label first (see [`set_labels`]); a click on the chip,
+    // or the right-click menu, edits the user's own label in place.
     let rtl = ui.layout().prefer_right_to_left();
-    let label = match kind {
-        LinkKind::Address => labels(ui.ctx()).and_then(|book| book.name(value).map(str::to_string)),
+    let book = match kind {
+        LinkKind::Address => labels(ui.ctx()),
         LinkKind::Block => None,
     };
-    if let Some(ref name) = label
-        && !rtl
-    {
-        label_chip(ui, name);
+    let label = book.as_ref().and_then(|book| book.get(value).cloned());
+    let user_label = book
+        .as_ref()
+        .and_then(|book| book.user_labels().get(value).cloned());
+    if !rtl {
+        label_slot(ui, id, value, label.as_ref());
     }
 
     // Leave room for the label's padding and the copy icon.
@@ -540,16 +543,18 @@ fn linked_value(ui: &mut Ui, value: &str, kind: LinkKind, selected: bool) -> boo
         copy_button(ui, id, value, copy_hint);
     }
 
-    // Same hover and selected look as list items; addresses also stay selected while their
-    // menu is open.
+    // Same hover and selected look as list items; addresses also stay selected while a
+    // menu of theirs is open.
     let menu_id = id.with("menu");
-    let menu_open = egui::Popup::is_id_open(ui.ctx(), menu_id);
+    let context_id = id.with("context");
+    let menu_open =
+        egui::Popup::is_id_open(ui.ctx(), menu_id) || egui::Popup::is_id_open(ui.ctx(), context_id);
     let response = icon_gap(ui, rtl, |ui| {
         ui.selectable_label(selected || menu_open, shown.as_str())
     })
     .on_hover_cursor(egui::CursorIcon::PointingHand);
     let hint = match kind {
-        LinkKind::Address => Some("Click for address info"),
+        LinkKind::Address => Some("Click for address info, right-click to label"),
         LinkKind::Block => Some("Click for block info"),
     };
     let response = match (shown != value, hint) {
@@ -575,6 +580,24 @@ fn linked_value(ui: &mut Ui, value: &str, kind: LinkKind, selected: bool) -> boo
                     }
                 }
             });
+            // Right click: the user's own label (over any public one).
+            egui::Popup::context_menu(&response)
+                .id(context_id)
+                .show(|ui| match user_label.as_deref() {
+                    Some(current) => {
+                        if ui.button("Edit Address Label").clicked() {
+                            start_label_edit(ui.ctx(), id, current);
+                        }
+                        if ui.button("Remove Address Label").clicked() {
+                            request_label(ui.ctx(), value, None);
+                        }
+                    }
+                    None => {
+                        if ui.button("Add Address Label").clicked() {
+                            start_label_edit(ui.ctx(), id, "");
+                        }
+                    }
+                });
         }
         LinkKind::Block => {
             if response.clicked() {
@@ -587,29 +610,156 @@ fn linked_value(ui: &mut Ui, value: &str, kind: LinkKind, selected: bool) -> boo
     if !rtl {
         icon_gap(ui, true, |ui| copy_button(ui, id, value, copy_hint));
     }
-    if let Some(ref name) = label
-        && rtl
-    {
-        label_chip(ui, name);
+    if rtl {
+        label_slot(ui, id, value, label.as_ref());
     }
     get_block
 }
 
-/// A known address's label, as a small accent chip before the address.
-fn label_chip(ui: &mut Ui, name: &str) {
-    egui::Frame::new()
+/// The place of an address's label chip: the inline editor while this widget is editing
+/// the label (see [`start_label_edit`]), else the chip for a known address, else nothing.
+fn label_slot(ui: &mut Ui, widget: egui::Id, address: &str, label: Option<&Label>) {
+    if let Some(mut edit) = label_edit(ui.ctx()).filter(|e| e.widget == widget) {
+        let response = ui.add(
+            TextEdit::singleline(&mut edit.draft)
+                .hint_text("label")
+                .font(FontId::monospace(theme::SMALL_FONT_SIZE))
+                .desired_width(LABEL_EDIT_WIDTH)
+                .margin(Margin::symmetric(4, 1)),
+        );
+        if edit.fresh {
+            response.request_focus();
+            edit.fresh = false;
+        }
+        if response.lost_focus() {
+            // Enter saves (an empty name removes the user's label); Esc or a click
+            // elsewhere abandons the edit.
+            if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                request_label(
+                    ui.ctx(),
+                    address,
+                    Some(edit.draft.trim().to_string()).filter(|d| !d.is_empty()),
+                );
+            }
+            clear_label_edit(ui.ctx());
+        } else if !response.has_focus() {
+            // Never got the focus (the widget was off screen when the edit started).
+            clear_label_edit(ui.ctx());
+        } else {
+            set_label_edit(ui.ctx(), Some(edit));
+        }
+        return;
+    }
+    if let Some(label) = label {
+        label_chip(ui, widget, label);
+    }
+}
+
+/// A known address's label, as a small accent chip before the address. A click edits
+/// the user's label in place, starting from the name shown.
+fn label_chip(ui: &mut Ui, widget: egui::Id, label: &Label) {
+    let response = egui::Frame::new()
         .fill(theme::ACCENT_DIM)
         .corner_radius(3)
         .inner_margin(Margin::symmetric(4, 1))
         .show(ui, |ui| {
-            ui.label(
-                RichText::new(name)
-                    .color(theme::ACCENT_BRIGHT)
-                    .size(theme::SMALL_FONT_SIZE),
-            );
+            ui.add(
+                egui::Label::new(
+                    RichText::new(&label.name)
+                        .color(theme::ACCENT_BRIGHT)
+                        .size(theme::SMALL_FONT_SIZE),
+                )
+                .sense(egui::Sense::click()),
+            )
         })
-        .response
-        .on_hover_text("Known address (see Address Info for the source)");
+        .inner
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(format!(
+            "{}\nClick to edit your label",
+            match label.source {
+                LabelSource::User => "Your label".to_string(),
+                source => format!("Label from {}", source.label()),
+            }
+        ));
+    if response.clicked() {
+        start_label_edit(ui.ctx(), widget, &label.name);
+    }
+}
+
+/// Width of the inline label editor.
+const LABEL_EDIT_WIDTH: f32 = 140.0;
+
+/// The one inline label edit in progress, if any: which [`address`] widget shows it.
+#[derive(Clone)]
+struct LabelEdit {
+    widget: egui::Id,
+    draft: String,
+    /// Not yet focused (set on the frame the edit starts).
+    fresh: bool,
+}
+
+impl Default for LabelEdit {
+    fn default() -> Self {
+        Self {
+            widget: egui::Id::NULL,
+            draft: String::new(),
+            fresh: false,
+        }
+    }
+}
+
+fn label_edit_id() -> egui::Id {
+    egui::Id::new("address_label_edit")
+}
+
+fn label_edit(ctx: &egui::Context) -> Option<LabelEdit> {
+    ctx.data(|d| d.get_temp(label_edit_id()))
+}
+
+fn set_label_edit(ctx: &egui::Context, edit: Option<LabelEdit>) {
+    ctx.data_mut(|d| match edit {
+        Some(edit) => d.insert_temp(label_edit_id(), edit),
+        None => {
+            d.remove_temp::<LabelEdit>(label_edit_id());
+        }
+    });
+}
+
+fn clear_label_edit(ctx: &egui::Context) {
+    set_label_edit(ctx, None);
+}
+
+/// Turn the label chip of the [`address`] widget `widget` into an editor, starting
+/// from `initial`. Only one edit runs at a time.
+fn start_label_edit(ctx: &egui::Context, widget: egui::Id, initial: &str) {
+    set_label_edit(
+        ctx,
+        Some(LabelEdit {
+            widget,
+            draft: initial.to_string(),
+            fresh: true,
+        }),
+    );
+}
+
+fn label_request_id() -> egui::Id {
+    egui::Id::new("address_label_requests")
+}
+
+/// Ask to set (or with `None`, remove) the user's label for `address`, from anywhere.
+/// The GUI frame loop picks it up with [`take_label_requests`] and sends `SetLabel`.
+pub fn request_label(ctx: &egui::Context, address: &str, name: Option<String>) {
+    let request = (address.trim().to_string(), name);
+    ctx.data_mut(|d| {
+        d.get_temp_mut_or_default::<Vec<(String, Option<String>)>>(label_request_id())
+            .push(request);
+    });
+}
+
+/// The label changes requested this frame.
+pub fn take_label_requests(ctx: &egui::Context) -> Vec<(String, Option<String>)> {
+    ctx.data_mut(|d| d.remove_temp(label_request_id()))
+        .unwrap_or_default()
 }
 
 fn address_request_id() -> egui::Id {

@@ -438,7 +438,10 @@ Everything in Phases 0–5 is built, with these deviations from the proposal:
   file), so the first event after adding an address never counts as "after idle".
 - **Online labels:** kas.fyi and KNS lookups are on demand ("Look up" per address),
   never automatic, and cached with negative answers for a week. The opt-in toggles live
-  on the Monitoring tab (Label Sources), not in the connection window.
+  on the Settings page (Address Labels), not in the connection window.
+- **User labels** are edited in place anywhere an address appears: a click on its label
+  chip, or "Add/Edit/Remove Address Label" in its right-click menu. The Settings page
+  lists the whole saved list and adds, edits and removes entries.
 - **Heuristic labels** are the burn address of every network and "Mining pool (<tag>)"
   for a payout address once the analytics sink has seen it mine 25 coinbases; they are
   per session (not saved) and sit below every other source.

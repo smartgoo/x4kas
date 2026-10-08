@@ -24,7 +24,9 @@ pub fn show(ctx: &egui::Context, open: &mut bool) {
         ui.label(
             RichText::new(
                 "Click the connection status in the status bar to switch nodes. \
-                     Click any address for its info, history and watch settings. \
+                     Click any address for its info, history and watch settings; \
+                     right-click it to label it, or click its label to edit it. \
+                     The ⚙ button opens Settings. \
                      Shortcuts are ignored while a text field or the terminal has focus; \
                      click outside the terminal to leave it.",
             )

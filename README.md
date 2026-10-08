@@ -131,7 +131,7 @@ Besides the node you connect to, x4kas contacts:
 
 - the CoinGecko API every 60s for market data ([data provided by CoinGecko](https://www.coingecko.com/en/api))
 - `api.kaspa.org/addresses/names` once a day for the public address labels (the whole list, so nothing about which addresses you look at leaves your machine)
-- `api.kas.fyi` and `api.knsdomains.org`, only if you enable them (Monitoring tab → Label Sources) and only for the address you press "Look up" on; answers are cached for a week
+- `api.kas.fyi` and `api.knsdomains.org`, only if you enable them (⚙ Settings → Address Labels) and only for the address you press "Look up" on; answers are cached for a week
 - the public Kaspa resolver, only when you choose it (or run `x4kas-cli` without `--url`)
 
 ### Files
@@ -187,6 +187,7 @@ crates/
       mod.rs              GuiApp: frame loop, top bar, shortcuts, quit
       dashboard.rs        Dashboard tab: card layout and node-backed cards
       monitoring.rs       Monitoring tab: watchlist, alerts, activity
+      settings.rs         Settings page: address label sources and your labels
       address.rs          Address Info window
       flows.rs            Flow graph window
       blockdag.rs         DAG visualizer, BlockDAG card, Block Info window

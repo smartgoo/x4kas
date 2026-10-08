@@ -19,7 +19,6 @@ use x4kas_core::format::{
 };
 use x4kas_core::index::export::ExportFormat;
 use x4kas_core::index::query::TxRow;
-use x4kas_core::labels::LabelSource;
 use x4kas_core::watch::{AlertRules, WatchEntry};
 
 /// The window's editable state, kept across frames.
@@ -28,6 +27,9 @@ pub struct AddressWindowUi {
     /// Which address the fields below were filled for.
     for_address: String,
     label: String,
+    /// The user's saved label when `label` was last filled, to notice edits made
+    /// elsewhere (a chip, the Settings page) and refill.
+    saved_label: Option<String>,
     watch: WatchEntry,
     /// Threshold fields in KAS, as typed.
     received_min: String,
@@ -43,8 +45,12 @@ impl AddressWindowUi {
         let Some(window) = app.address.open.clone() else {
             return;
         };
+        let saved = app.labels.user_labels().get(&window.address).cloned();
         if self.for_address != window.address {
             self.fill(app, &window.address);
+        } else if saved != self.saved_label {
+            self.label = saved.clone().unwrap_or_default();
+            self.saved_label = saved;
         }
         let win = egui::Window::new("Address Info")
             .default_size([860.0, 640.0])
@@ -61,12 +67,8 @@ impl AddressWindowUi {
 
     fn fill(&mut self, app: &App, addr: &str) {
         self.for_address = addr.to_string();
-        self.label = app
-            .labels
-            .get(addr)
-            .filter(|l| l.source == LabelSource::User)
-            .map(|l| l.name.clone())
-            .unwrap_or_default();
+        self.saved_label = app.labels.user_labels().get(addr).cloned();
+        self.label = self.saved_label.clone().unwrap_or_default();
         self.watch = app
             .watch
             .entry(addr)
@@ -238,9 +240,11 @@ fn header(
                 .on_hover_text(if enabled {
                     "Ask kas.fyi and/or KNS about this address (sends it to them)"
                 } else {
-                    "Enable kas.fyi or KNS lookups on the Monitoring tab first"
+                    "Enable kas.fyi or KNS lookups in Settings → Address Labels first"
                 })
-                .on_disabled_hover_text("Enable kas.fyi or KNS lookups on the Monitoring tab first")
+                .on_disabled_hover_text(
+                    "Enable kas.fyi or KNS lookups in Settings → Address Labels first",
+                )
                 .clicked()
             {
                 let _ = cmd_tx.send(UiCommand::LookupLabelOnline(addr.clone()));

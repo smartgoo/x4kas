@@ -10,6 +10,7 @@ mod help;
 mod mempool;
 mod monitoring;
 mod rpc_explorer;
+mod settings;
 mod terminal;
 mod theme;
 mod toasts;
@@ -27,6 +28,7 @@ use address::AddressWindowUi;
 use connection::ConnectionWindow;
 use flows::FlowWindowUi;
 use monitoring::MonitoringTab;
+use settings::SettingsPage;
 use terminal::TerminalPane;
 use toasts::Toasts;
 use widgets::kv;
@@ -113,6 +115,7 @@ struct GuiApp {
     connection: ConnectionWindow,
     terminal: TerminalPane,
     monitoring: MonitoringTab,
+    settings: SettingsPage,
     address_window: AddressWindowUi,
     flow_window: FlowWindowUi,
     toasts: Toasts,
@@ -129,6 +132,7 @@ impl GuiApp {
             connection,
             terminal: TerminalPane::new(),
             monitoring: MonitoringTab::default(),
+            settings: SettingsPage::default(),
             address_window: AddressWindowUi::default(),
             flow_window: FlowWindowUi::default(),
             toasts: Toasts::default(),
@@ -161,6 +165,16 @@ impl GuiApp {
         }
     }
 
+    /// A window or popup that Esc would close first is on show.
+    fn any_window_open(&self, app: &App) -> bool {
+        self.show_help
+            || self.connection.open
+            || app.address.open.is_some()
+            || app.address.flows.open
+            || app.dag_selection.block_loading
+            || app.dag_selection.block_detail.is_some()
+    }
+
     fn is_shutting_down(&self) -> bool {
         self.shutdown_rx.is_some() || self.shutdown_complete
     }
@@ -173,7 +187,13 @@ impl eframe::App for GuiApp {
         let app_state = self.app.clone();
         let mut app = app_state.blocking_write();
 
-        handle_shortcuts(ctx, &mut app, &mut self.show_help, &mut self.terminal);
+        handle_shortcuts(
+            ctx,
+            &mut app,
+            &mut self.show_help,
+            &mut self.settings.open,
+            &mut self.terminal,
+        );
         let testnet = app
             .node
             .server_info
@@ -186,7 +206,13 @@ impl eframe::App for GuiApp {
             .frame(bar_frame())
             .exact_height(TITLE_BAR_HEIGHT)
             .show(ctx, |ui| {
-                top_bar(ui, &mut app, &mut self.show_help, &mut self.terminal)
+                top_bar(
+                    ui,
+                    &mut app,
+                    &mut self.show_help,
+                    &mut self.settings,
+                    &mut self.terminal,
+                )
             });
         // Added before the terminal so it stays at the very bottom, below it.
         egui::TopBottomPanel::bottom("status_bar")
@@ -198,12 +224,22 @@ impl eframe::App for GuiApp {
             ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| match app.active_tab {
-            Tab::Dashboard => dashboard::show(ui, &mut app),
-            Tab::Monitoring => self.monitoring.show(ui, &mut app, &self.cmd_tx),
-            Tab::Mempool => mempool::show(ui, &mut app),
-            Tab::RpcExplorer => rpc_explorer::show(ui, &mut app, &self.cmd_tx),
+        egui::CentralPanel::default().show(ctx, |ui| {
+            if self.settings.open {
+                self.settings.show(ui, &mut app, &self.cmd_tx);
+                return;
+            }
+            match app.active_tab {
+                Tab::Dashboard => dashboard::show(ui, &mut app),
+                Tab::Monitoring => self.monitoring.show(ui, &mut app, &self.cmd_tx),
+                Tab::Mempool => mempool::show(ui, &mut app),
+                Tab::RpcExplorer => rpc_explorer::show(ui, &mut app, &self.cmd_tx),
+            }
         });
+        // Label edits from any address widget (chip, right-click menu, Settings).
+        for (address, name) in widgets::take_label_requests(ctx) {
+            let _ = self.cmd_tx.send(UiCommand::SetLabel { address, name });
+        }
 
         // A click on any block hash (or a block in the DAG visualizer) opens Block Info here, whatever
         // the tab.
@@ -225,6 +261,14 @@ impl eframe::App for GuiApp {
 
         self.connection.show(ctx, &mut app, &self.cmd_tx);
         help::show(ctx, &mut self.show_help);
+        // Esc leaves Settings once no popup is left to close.
+        if self.settings.open
+            && !self.any_window_open(&app)
+            && !ctx.wants_keyboard_input()
+            && ctx.input(|i| i.key_pressed(Key::Escape))
+        {
+            self.settings.open = false;
+        }
 
         if self.is_shutting_down() {
             egui::Modal::new(egui::Id::new("shutdown_modal")).show(ctx, |ui| {
@@ -247,6 +291,7 @@ fn handle_shortcuts(
     ctx: &egui::Context,
     app: &mut App,
     show_help: &mut bool,
+    settings_open: &mut bool,
     terminal: &mut TerminalPane,
 ) {
     const TAB_KEYS: [Key; 4] = [Key::Num1, Key::Num2, Key::Num3, Key::Num4];
@@ -268,6 +313,7 @@ fn handle_shortcuts(
         for (key, tab) in TAB_KEYS.iter().zip(Tab::all()) {
             if i.key_pressed(*key) {
                 app.active_tab = *tab;
+                *settings_open = false;
             }
         }
         if i.modifiers.ctrl && i.key_pressed(Key::Tab) {
@@ -276,6 +322,7 @@ fn handle_shortcuts(
             } else {
                 app.next_tab();
             }
+            *settings_open = false;
         }
         if i.key_pressed(Key::P) {
             app.paused = !app.paused;
@@ -322,8 +369,14 @@ fn title_bar_drag(ui: &mut egui::Ui) {
     }
 }
 
-/// Brand prompt, tmux-style tab strip, and the terminal/help buttons.
-fn top_bar(ui: &mut egui::Ui, app: &mut App, show_help: &mut bool, terminal: &mut TerminalPane) {
+/// Brand prompt, tmux-style tab strip, and the terminal/help/settings buttons.
+fn top_bar(
+    ui: &mut egui::Ui,
+    app: &mut App,
+    show_help: &mut bool,
+    settings: &mut SettingsPage,
+    terminal: &mut TerminalPane,
+) {
     title_bar_drag(ui);
     ui.horizontal_centered(|ui| {
         if cfg!(target_os = "macos") {
@@ -334,7 +387,7 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App, show_help: &mut bool, terminal: &mu
 
         ui.spacing_mut().item_spacing.x = 2.0;
         for (i, tab) in Tab::all().iter().enumerate() {
-            let selected = app.active_tab == *tab;
+            let selected = app.active_tab == *tab && !settings.open;
             // Alerts raised while the Monitoring tab wasn't on show.
             let badge = match tab {
                 Tab::Monitoring if !selected => app.watch.unread_alerts,
@@ -345,11 +398,19 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App, show_help: &mut bool, terminal: &mu
                 .clicked()
             {
                 app.active_tab = *tab;
+                settings.open = false;
             }
         }
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
+            if ui
+                .selectable_label(settings.open, "⚙")
+                .on_hover_text("Settings")
+                .clicked()
+            {
+                settings.toggle();
+            }
             if ui.button("?").on_hover_text("Help (? / F1)").clicked() {
                 *show_help = !*show_help;
             }

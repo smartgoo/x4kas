@@ -23,8 +23,6 @@ pub struct MonitoringTab {
     input: String,
     /// The label matches popup is showing under the field.
     search_open: bool,
-    /// The API key field, filled from the settings on first show.
-    key_input: Option<String>,
 }
 
 impl MonitoringTab {
@@ -43,76 +41,7 @@ impl MonitoringTab {
                 card(left, "Alerts", |ui| alerts(ui, app));
                 card(right, "Activity", |ui| activity(ui, app));
             });
-            ui.add_space(CARD_GAP);
-            card(ui, "Label Sources", |ui| {
-                self.label_sources(ui, app, cmd_tx)
-            });
         });
-    }
-
-    /// The public list is always on; per-address online lookups are opt-in because they
-    /// reveal which addresses the user looks at.
-    fn label_sources(&mut self, ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
-        let book = app.labels.clone();
-        ui.label(
-            RichText::new(format!(
-                "{} labels known: your own, the public api.kaspa.org list (fetched in bulk, refreshed daily) and the bundled snapshot.",
-                book.len()
-            ))
-            .weak(),
-        );
-        ui.horizontal(|ui| {
-            if ui.button("Refresh public list").clicked() {
-                let _ = cmd_tx.send(UiCommand::RefreshLabels);
-            }
-            if let Some(at) = book.kaspa_org_refreshed {
-                ui.label(
-                    RichText::new(format!(
-                        "fetched {} ago",
-                        format_duration(at.elapsed().unwrap_or_default())
-                    ))
-                    .weak(),
-                );
-            }
-        });
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new(
-                "Per-address lookups below send the address you open to that service. Off until you enable them.",
-            )
-            .weak()
-            .small(),
-        );
-        if self.key_input.is_none() {
-            self.key_input = Some(
-                app.label_settings
-                    .kas_fyi_api_key
-                    .clone()
-                    .unwrap_or_default(),
-            );
-        }
-        let mut changed = false;
-        let mut settings = app.label_settings.clone();
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("kas.fyi API key:").color(theme::LABEL));
-            let key = self.key_input.get_or_insert_with(String::new);
-            let response = ui.add(
-                TextEdit::singleline(key)
-                    .password(true)
-                    .hint_text("from developer.kas.fyi")
-                    .desired_width(260.0),
-            );
-            if response.lost_focus() {
-                settings.kas_fyi_api_key = Some(key.trim().to_string()).filter(|k| !k.is_empty());
-                changed = true;
-            }
-            changed |= ui
-                .checkbox(&mut settings.kns, "Resolve .kas names (KNS)")
-                .changed();
-        });
-        if changed {
-            let _ = cmd_tx.send(UiCommand::SetLabelSettings(settings));
-        }
     }
 
     fn watchlist(&mut self, ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {

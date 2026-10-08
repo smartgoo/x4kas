@@ -1,11 +1,11 @@
 //! Address labels: who an address belongs to. Sources, by precedence: the user's own
-//! labels (`~/.x4kas/labels/user.toml`), the public list at `api.kaspa.org`
-//! (exchanges, pools, funds, bridges; refreshed daily and cached at
-//! `~/.x4kas/labels/kaspa_org.json`), and a snapshot of that list bundled with the app
-//! so labels show offline. The kaspa.org list is fetched in bulk, so looking up an
-//! address never tells anyone which one. Below all of these sit heuristics: the burn
-//! address of every network, and mining pools detected from the coinbases the chain
-//! stream sees ([`MinerTally`]).
+//! labels (`~/.x4kas/labels/user.toml`) and the public list at `api.kaspa.org`
+//! (exchanges, pools, funds, bridges; fetched when the app starts and every
+//! [`REFRESH_EVERY`] after, cached at `~/.x4kas/labels/kaspa_org.json` so the last
+//! list shows until the fetch lands). Nothing is bundled with the build. The kaspa.org
+//! list is fetched in bulk, so looking up an address never tells anyone which one.
+//! Below all of these sit heuristics: the burn address of every network, and mining
+//! pools detected from the coinbases the chain stream sees ([`MinerTally`]).
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -21,10 +21,10 @@ use crate::config;
 use crate::emission;
 
 const KASPA_ORG_NAMES_URL: &str = "https://api.kaspa.org/addresses/names";
-/// Snapshot of the kaspa.org list, so labels show before (and without) a refresh.
-const BUNDLED: &str = include_str!("../assets/kaspa_org_names.json");
-/// How old the cached kaspa.org list may be before it is fetched again.
-pub const REFRESH_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
+/// How often the running app fetches the kaspa.org list again.
+pub const REFRESH_EVERY: Duration = Duration::from_secs(60 * 60);
+/// How long after a failed fetch the next try waits.
+pub const RETRY_AFTER: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LabelSource {
@@ -34,7 +34,6 @@ pub enum LabelSource {
     KaspaOrg,
     /// A `.kas` name from the KNS indexer (opt-in).
     Kns,
-    Bundled,
     /// Derived locally: the burn address, a pool seen mining many blocks.
     Heuristic,
 }
@@ -46,7 +45,6 @@ impl LabelSource {
             Self::KasFyi => "kas.fyi",
             Self::KaspaOrg => "api.kaspa.org",
             Self::Kns => "KNS",
-            Self::Bundled => "bundled list",
             Self::Heuristic => "heuristic",
         }
     }
@@ -58,14 +56,13 @@ impl LabelSource {
         !matches!(self, Self::User | Self::Kns)
     }
 
-    /// Precedence: a label only replaces one of a weaker (or the same) source. The
-    /// bundled snapshot is the kaspa.org list, so a fresh list replaces it and KNS
-    /// doesn't.
+    /// Precedence: a label only replaces one of a weaker (or the same) source, so a
+    /// fresh kaspa.org list replaces the cached one and KNS doesn't.
     fn rank(&self) -> u8 {
         match self {
             Self::User => 5,
             Self::KasFyi => 4,
-            Self::KaspaOrg | Self::Bundled => 3,
+            Self::KaspaOrg => 3,
             Self::Kns => 2,
             Self::Heuristic => 1,
         }
@@ -255,13 +252,14 @@ pub struct LabelBook {
 
 impl Default for LabelBook {
     fn default() -> Self {
-        Self::bundled()
+        Self::base()
     }
 }
 
 impl LabelBook {
-    /// The bundled snapshot and the burn address of every network.
-    pub fn bundled() -> Self {
+    /// Nothing but the burn address of every network: what is known offline before
+    /// any list is fetched.
+    pub fn base() -> Self {
         let mut book = Self {
             map: HashMap::new(),
             entity: HashMap::new(),
@@ -269,9 +267,6 @@ impl LabelBook {
             heuristic: BTreeMap::new(),
             kaspa_org_refreshed: None,
         };
-        if let Ok(list) = serde_json::from_str::<Vec<AddressName>>(BUNDLED) {
-            book.apply_list(&list, LabelSource::Bundled);
-        }
         for network in config::valid_networks() {
             if let Some(burn) = emission::burn_address(network) {
                 book.heuristic
@@ -282,19 +277,19 @@ impl LabelBook {
         book
     }
 
-    /// The bundled snapshot, the cached kaspa.org list if any, the fresh online
-    /// answers, and the user's labels.
+    /// The cached kaspa.org list if any, the fresh online answers, and the user's
+    /// labels.
     pub fn load() -> Self {
-        let mut book = Self::bundled();
+        let mut book = Self::base();
         book.user = UserLabels::load().unwrap_or_default();
         book.rebuild();
         book
     }
 
-    /// Reapply every source over a fresh bundled book, keeping the user's and the
+    /// Reapply every source over a fresh base book, keeping the user's and the
     /// heuristic labels: how a removed label falls back to the next source.
     fn rebuild(&mut self) {
-        let mut rebuilt = Self::bundled();
+        let mut rebuilt = Self::base();
         if let Ok((list, saved_at)) = load_kaspa_org_cache() {
             rebuilt.apply_list(&list, LabelSource::KaspaOrg);
             rebuilt.kaspa_org_refreshed = saved_at;
@@ -355,12 +350,11 @@ impl LabelBook {
         &self.user.labels
     }
 
-    /// Addresses named by the public list (the fetched api.kaspa.org list, or the
-    /// bundled snapshot of it), whatever is shown over them.
+    /// Addresses named by the public api.kaspa.org list, whatever is shown over them.
     pub fn public_len(&self) -> usize {
         self.entity
             .values()
-            .filter(|l| matches!(l.source, LabelSource::KaspaOrg | LabelSource::Bundled))
+            .filter(|l| l.source == LabelSource::KaspaOrg)
             .count()
     }
 
@@ -538,21 +532,6 @@ fn load_kaspa_org_cache() -> Result<(Vec<AddressName>, Option<SystemTime>)> {
     Ok((serde_json::from_str(&text)?, saved_at))
 }
 
-/// Whether the cached kaspa.org list is missing or older than [`REFRESH_AFTER`].
-pub fn kaspa_org_cache_is_stale() -> bool {
-    let saved_at = std::fs::metadata(kaspa_org_cache_path())
-        .and_then(|m| m.modified())
-        .ok();
-    is_stale(saved_at, SystemTime::now())
-}
-
-/// Whether a list saved at `saved_at` (none: never) needs fetching again at `now`.
-pub fn is_stale(saved_at: Option<SystemTime>, now: SystemTime) -> bool {
-    saved_at
-        .map(|t| now.duration_since(t).unwrap_or_default())
-        .is_none_or(|age| age > REFRESH_AFTER)
-}
-
 /// Fetch the kaspa.org list and cache it.
 pub async fn fetch_kaspa_org_names() -> Result<Vec<AddressName>> {
     let client = reqwest::Client::builder()
@@ -690,43 +669,85 @@ fn kns_name(body: &serde_json::Value) -> Option<String> {
     walk(body.pointer("/data/assets")?)
 }
 
-/// Refresh the kaspa.org list in `app.labels` now if the cache is stale, then daily.
-/// Independent of the node connection, like market polling.
+/// Fetch the kaspa.org list when the app starts and every [`REFRESH_EVERY`] after
+/// (sooner, [`RETRY_AFTER`], after a failure), replacing the app's book. Runs for the
+/// app's lifetime, whatever the connection; it never touches node data.
 pub fn start_label_refresh(app: Arc<RwLock<App>>) {
     tokio::spawn(async move {
         loop {
-            if kaspa_org_cache_is_stale()
-                && let Ok(list) = fetch_kaspa_org_names().await
-            {
-                let mut app = app.write().await;
-                let mut book = (*app.labels).clone();
-                book.apply_kaspa_org(&list, SystemTime::now());
-                app.labels = Arc::new(book);
-                app.mark_dirty();
-            }
-            tokio::time::sleep(REFRESH_AFTER).await;
+            let ok = refresh_kaspa_org(&app).await;
+            tokio::time::sleep(if ok { REFRESH_EVERY } else { RETRY_AFTER }).await;
         }
     });
+}
+
+/// One fetch of the kaspa.org list into the app's book, with its progress and
+/// outcome in `App::label_refresh`. Returns whether it succeeded.
+pub async fn refresh_kaspa_org(app: &RwLock<App>) -> bool {
+    {
+        let mut app = app.write().await;
+        app.label_refresh.fetching = true;
+        app.mark_dirty();
+    }
+    let result = fetch_kaspa_org_names().await;
+    let mut app = app.write().await;
+    app.label_refresh.fetching = false;
+    let ok = match result {
+        Ok(list) => {
+            let mut book = (*app.labels).clone();
+            book.apply_kaspa_org(&list, SystemTime::now());
+            app.labels = Arc::new(book);
+            app.label_refresh.last_error = None;
+            true
+        }
+        Err(e) => {
+            app.label_refresh.last_error = Some(format!("{e:#}"));
+            false
+        }
+    };
+    app.mark_dirty();
+    ok
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    const BURN: &str = "kaspa:qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqkx9awp4e";
+
+    /// A base book with a small public list applied, as after the first fetch.
+    fn listed() -> LabelBook {
+        let mut book = LabelBook::base();
+        let named = |address: &str, name: &str| AddressName {
+            address: address.into(),
+            name: name.into(),
+        };
+        book.apply_kaspa_org(
+            &[named(BURN, "Burn Address"), named("kaspa:qbybit", "Bybit")],
+            SystemTime::now(),
+        );
+        book
+    }
+
     #[test]
-    fn bundled_list_has_known_entities() {
-        let book = LabelBook::bundled();
-        assert!(book.len() > 100);
-        let burn = "kaspa:qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqkx9awp4e";
-        assert_eq!(book.name(burn), Some("Burn Address"));
-        assert_eq!(book.get(burn).unwrap().source, LabelSource::Bundled);
+    fn base_book_knows_only_burn_addresses_until_a_list_lands() {
+        let base = LabelBook::base();
+        assert_eq!(base.public_len(), 0);
+        assert_eq!(base.name(BURN), Some("Burn address"));
+        assert_eq!(base.get(BURN).unwrap().source, LabelSource::Heuristic);
+        assert!(base.search("bybit").is_empty());
+
+        let book = listed();
+        assert_eq!(book.public_len(), 2);
+        assert_eq!(book.name(BURN), Some("Burn Address"));
+        assert_eq!(book.get(BURN).unwrap().source, LabelSource::KaspaOrg);
         assert!(!book.search("bybit").is_empty());
         assert!(book.search("").is_empty());
     }
 
     #[test]
     fn user_labels_take_precedence_in_memory() {
-        let mut book = LabelBook::bundled();
+        let mut book = listed();
         let burn = "kaspa:qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqkx9awp4e";
         book.user
             .labels
@@ -747,7 +768,7 @@ mod tests {
 
     #[test]
     fn online_labels_respect_precedence_and_ttl() {
-        let mut book = LabelBook::bundled();
+        let mut book = listed();
         let burn = "kaspa:qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqkx9awp4e";
         let kns = OnlineEntry {
             source: LabelSource::Kns,
@@ -756,7 +777,7 @@ mod tests {
             categories: Vec::new(),
             fetched_at_ms: 0,
         };
-        // KNS is weaker than the bundled list; kas.fyi is stronger.
+        // KNS is weaker than the public list; kas.fyi is stronger.
         book.apply_online(burn, &kns);
         assert_eq!(book.name(burn), Some("Burn Address"));
         book.apply_online(
@@ -820,7 +841,7 @@ mod tests {
         assert_eq!(entry.name.as_deref(), Some("Bybit"));
         assert_eq!(entry.link.as_deref(), Some("https://www.bybit.com"));
         assert_eq!(entry.categories, ["exchange", "cex"]);
-        let mut book = LabelBook::bundled();
+        let mut book = listed();
         book.apply_online("kaspa:q", &entry);
         let label = book.get("kaspa:q").unwrap();
         assert_eq!(label.link.as_deref(), Some("https://www.bybit.com"));
@@ -834,11 +855,11 @@ mod tests {
 
     #[test]
     fn heuristics_are_the_weakest_source() {
-        let mut book = LabelBook::bundled();
+        let mut book = listed();
         // The mainnet burn address is on the public list, which wins; the testnet one
         // is only known by heuristic.
         let burn = "kaspa:qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqkx9awp4e";
-        assert_eq!(book.get(burn).unwrap().source, LabelSource::Bundled);
+        assert_eq!(book.get(burn).unwrap().source, LabelSource::KaspaOrg);
         let testnet_burn = emission::burn_address("testnet-10").unwrap().to_string();
         assert_eq!(book.name(&testnet_burn), Some("Burn address"));
         assert_eq!(
@@ -851,7 +872,7 @@ mod tests {
         // Nothing changes when the same heuristic is set again, or for a listed address.
         assert!(!book.set_heuristic("kaspa:qpool", "Mining pool (x)"));
         assert!(!book.set_heuristic(burn, "Mining pool"));
-        assert_eq!(book.get(burn).unwrap().source, LabelSource::Bundled);
+        assert_eq!(book.get(burn).unwrap().source, LabelSource::KaspaOrg);
         // Every other source overrides it.
         book.apply_kaspa_org(
             &[AddressName {
@@ -887,21 +908,8 @@ mod tests {
     }
 
     #[test]
-    fn kaspa_org_cache_expiry() {
-        let now = SystemTime::now();
-        assert!(is_stale(None, now));
-        assert!(!is_stale(Some(now - Duration::from_secs(60)), now));
-        assert!(is_stale(
-            Some(now - REFRESH_AFTER - Duration::from_secs(1)),
-            now
-        ));
-        // A file from the future (clock change) is not stale.
-        assert!(!is_stale(Some(now + Duration::from_secs(60)), now));
-    }
-
-    #[test]
     fn entity_labels_outlive_user_and_kns_names() {
-        let mut book = LabelBook::bundled();
+        let mut book = listed();
         let burn = "kaspa:qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqkx9awp4e";
         assert_eq!(book.entity_name(burn), Some("Burn Address"));
         book.user
@@ -947,7 +955,7 @@ mod tests {
 
     #[test]
     fn cluster_name_is_the_strongest_then_most_common_label() {
-        let mut book = LabelBook::bundled();
+        let mut book = listed();
         book.apply_kaspa_org(
             &[
                 AddressName {

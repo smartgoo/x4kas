@@ -576,13 +576,7 @@ impl Controller {
     fn refresh_labels(&mut self) {
         let app = self.app.clone();
         self.polling.spawn_request(async move {
-            if let Ok(list) = labels::fetch_kaspa_org_names().await {
-                let mut app = app.write().await;
-                let mut book = (*app.labels).clone();
-                book.apply_kaspa_org(&list, std::time::SystemTime::now());
-                app.labels = Arc::new(book);
-                app.mark_dirty();
-            }
+            labels::refresh_kaspa_org(&app).await;
         });
     }
 

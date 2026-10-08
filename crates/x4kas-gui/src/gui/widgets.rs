@@ -503,11 +503,25 @@ pub fn address_bare(ui: &mut Ui, addr: &str) {
 }
 
 /// The label chip of `addr` on its own (nothing when it has none): a click edits the
-/// user's label in place, as on the chip before an [`address`].
+/// user's label in place, as on the chip after an [`address`].
 pub fn label_cell(ui: &mut Ui, addr: &str) {
-    let id = ui.id().with(("label_cell", addr));
     let label = labels(ui.ctx()).and_then(|book| book.get(addr).cloned());
-    label_slot(ui, id, addr, label.as_ref());
+    label_slot(ui, label_cell_id(addr), addr, label.as_ref());
+}
+
+/// One per address: a table shows each address once, and the edit button of its row
+/// (see [`edit_label_cell`]) sits in another cell.
+fn label_cell_id(addr: &str) -> egui::Id {
+    egui::Id::new(("label_cell", addr))
+}
+
+/// Turn the [`label_cell`] of `addr` into an editor with the cursor in it, starting
+/// from the name shown (or nothing when it has none).
+pub fn edit_label_cell(ctx: &egui::Context, addr: &str) {
+    let initial = labels(ctx)
+        .and_then(|book| book.name(addr).map(str::to_string))
+        .unwrap_or_default();
+    start_label_edit(ctx, label_cell_id(addr), &initial);
 }
 
 /// A block hash, like [`address`] but a click opens the Block Info window for it (see
@@ -532,8 +546,8 @@ fn linked_value(ui: &mut Ui, value: &str, kind: LinkKind, selected: bool, chip: 
         LinkKind::Block => "Copy hash",
     };
 
-    // A known address shows its label first (see [`set_labels`]); a click on the chip,
-    // or the right-click menu, edits the user's own label in place.
+    // A known address shows its label after it (see [`set_labels`]); a click on the
+    // chip, or the right-click menu, edits the user's own label in place.
     let rtl = ui.layout().prefer_right_to_left();
     let book = match kind {
         LinkKind::Address => labels(ui.ctx()),
@@ -546,17 +560,22 @@ fn linked_value(ui: &mut Ui, value: &str, kind: LinkKind, selected: bool, chip: 
     let user_label = book
         .as_ref()
         .and_then(|book| book.user_labels().get(value).cloned());
-    if !rtl && chip {
+    // In a right-to-left row (a right-aligned value) the first widget lands rightmost,
+    // so add the chip, then the icon, to keep them after the value.
+    if rtl && chip {
         label_slot(ui, id, value, label.as_ref());
     }
 
-    // Leave room for the label's padding and the copy icon.
+    // Leave room for the label's padding, the copy icon and the chip that follows.
     let padding = 2.0 * ui.spacing().button_padding.x;
-    let room = ui.available_width() - padding - COPY_ICON_SIZE - COPY_ICON_GAP;
+    let chip_room = if chip && !rtl {
+        label_slot_width(ui, id, label.as_ref())
+    } else {
+        0.0
+    };
+    let room = ui.available_width() - padding - COPY_ICON_SIZE - COPY_ICON_GAP - chip_room;
     let shown = fit_text(ui, value, room);
 
-    // In a right-to-left row (a right-aligned value) the first widget lands rightmost, so
-    // add the icon first to keep it after the value.
     if rtl {
         copy_button(ui, id, value, copy_hint);
     }
@@ -627,11 +646,32 @@ fn linked_value(ui: &mut Ui, value: &str, kind: LinkKind, selected: bool, chip: 
 
     if !rtl {
         icon_gap(ui, true, |ui| copy_button(ui, id, value, copy_hint));
-    }
-    if rtl && chip {
-        label_slot(ui, id, value, label.as_ref());
+        if chip {
+            label_slot(ui, id, value, label.as_ref());
+        }
     }
     get_block
+}
+
+/// The width [`label_slot`] will take for this widget (with the item spacing before
+/// it), so the address can be fitted around it; zero when it draws nothing.
+fn label_slot_width(ui: &Ui, widget: egui::Id, label: Option<&Label>) -> f32 {
+    let spacing = ui.spacing().item_spacing.x;
+    if label_edit(ui.ctx()).is_some_and(|e| e.widget == widget) {
+        return LABEL_EDIT_WIDTH + 8.0 + spacing;
+    }
+    match label {
+        Some(label) => {
+            let font = FontId::monospace(theme::SMALL_FONT_SIZE);
+            let text = ui.fonts_mut(|f| {
+                f.layout_no_wrap(label.name.clone(), font, theme::ACCENT_BRIGHT)
+                    .size()
+                    .x
+            });
+            text + 8.0 + spacing
+        }
+        None => 0.0,
+    }
 }
 
 /// The place of an address's label chip: the inline editor while this widget is editing
@@ -673,7 +713,7 @@ fn label_slot(ui: &mut Ui, widget: egui::Id, address: &str, label: Option<&Label
     }
 }
 
-/// A known address's label, as a small accent chip before the address. A click edits
+/// A known address's label, as a small accent chip after the address. A click edits
 /// the user's label in place, starting from the name shown.
 fn label_chip(ui: &mut Ui, widget: egui::Id, label: &Label) {
     let response = egui::Frame::new()

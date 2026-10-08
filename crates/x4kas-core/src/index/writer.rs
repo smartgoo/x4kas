@@ -709,7 +709,7 @@ mod tests {
     }
 
     fn writer() -> TempWriter {
-        writer_with(LabelBook::bundled())
+        writer_with(LabelBook::base())
     }
 
     fn writer_with(labels: LabelBook) -> TempWriter {
@@ -997,7 +997,7 @@ mod tests {
         w.apply(&r).unwrap();
         let store = w.store();
         let id = |n: u32| store.lookup(&address(n).to_string()).unwrap().unwrap();
-        let book = LabelBook::bundled();
+        let book = LabelBook::base();
         let c = query::cluster(store, &book, id(1), 10).unwrap();
         assert_eq!(c.size, 3);
         let mut members = c.members.clone();
@@ -1040,7 +1040,7 @@ mod tests {
     #[test]
     fn guards_keep_strangers_apart() {
         use crate::labels::AddressName;
-        let mut book = LabelBook::bundled();
+        let mut book = LabelBook::base();
         let named = |n: u32, name: &str| AddressName {
             address: address(n).to_string(),
             name: name.to_string(),

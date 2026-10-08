@@ -19,7 +19,7 @@ Built with [egui/eframe](https://github.com/emilk/egui) and [rusty-kaspa](https:
   - **Flow graph**: follow the money hop by hop from any address; click a node to expand it, fold pass-through chains (peel chains) into one hop-counted edge, export the graph as CSV or JSON
   - **Peel chains**: Address Info shows which link of a chain of single-input, two-output spends an address is, with what each spend peeled off
   - **Export**: an address's indexed transactions and any flow graph as CSV or JSON, under `~/.x4kas/exports/`
-  - **Labels** from the public api.kaspa.org list (exchanges, pools, funds, bridges; bundled and refreshed daily) and your own, shown as chips wherever an address appears; opt-in per-address lookups on kas.fyi (API key, with the entity's link and categories) and KNS `.kas` names; pools that mine many blocks are labelled from their coinbase tags as the chain streams in
+  - **Labels** from the public api.kaspa.org list (exchanges, pools, funds, bridges; fetched on launch and hourly, nothing bundled) and your own, shown as chips wherever an address appears; opt-in per-address lookups on kas.fyi (API key, with the entity's link and categories) and KNS `.kas` names; pools that mine many blocks are labelled from their coinbase tags as the chain streams in
 - **Mempool**: live transaction table; click a row for details
 - **RPC Cmds**: run any of 36 read-only RPC methods (with argument forms for those that take a hash, address or number) and inspect formatted responses
 - **Connection switcher**: connect to a node by URL or through the public resolver, from inside the app
@@ -130,7 +130,7 @@ x4kas-cli labels online kaspa:qq…            # ask the enabled online sources
 Besides the node you connect to, x4kas contacts:
 
 - the CoinGecko API every 60s for market data ([data provided by CoinGecko](https://www.coingecko.com/en/api))
-- `api.kaspa.org/addresses/names` once a day for the public address labels (the whole list, so nothing about which addresses you look at leaves your machine)
+- `api.kaspa.org/addresses/names` on launch and hourly for the public address labels (the whole list, so nothing about which addresses you look at leaves your machine)
 - `api.kas.fyi` and `api.knsdomains.org`, only if you enable them (`x4kas-cli labels key` / `labels kns on`) and only for the address you press "Look up" on; answers are cached for a week
 - the public Kaspa resolver, only when you choose it (or run `x4kas-cli` without `--url`)
 
@@ -171,7 +171,7 @@ crates/
     analytics_streaming.rs The analytics engine as a chain-stream sink
     index/                The address index (fjall store, writer, queries) and its writer task
     watch.rs              Watchlist, UtxosChanged events and alert rules
-    labels.rs             Address labels (user, kas.fyi, api.kaspa.org, KNS, bundled snapshot, heuristics)
+    labels.rs             Address labels (user, kas.fyi, api.kaspa.org, KNS, heuristics)
     emission.rs           Block reward schedule and burn address
     format.rs             Formatting helpers
     tx_inspect.rs         Per-transaction classification (scripts, opcodes, protocols)

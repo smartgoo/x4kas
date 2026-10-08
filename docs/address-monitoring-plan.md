@@ -243,8 +243,8 @@ Sources, each a `LabelSource` with its own cache file under `~/.x4kas/labels/`:
 
 | Source | Mode | Privacy | Default |
 |---|---|---|---|
-| Bundled snapshot of `api.kaspa.org/addresses/names` + burn addresses | compiled in | none | on |
-| `api.kaspa.org/addresses/names` | bulk refresh every 24 h (and on demand) | none (bulk) | on |
+| Burn addresses | derived locally | none | on |
+| `api.kaspa.org/addresses/names` | bulk fetch on launch, hourly after (and on demand); nothing bundled | none (bulk) | on |
 | `api.kas.fyi …/tag` | per address on view, cached 7 days (404 cached as negative) | leaks the viewed address | off until the user enters an API key |
 | KNS reverse lookup | per address on view, cached 24 h | leaks the viewed address | off; toggle "Resolve .kas names" |
 | User labels (`~/.x4kas/labels/user.toml`) | editable in the GUI and CLI | none | on |
@@ -364,8 +364,8 @@ subscription, rules, Monitoring tab, toasts, `address watch`. Works through the
 resolver when the node has `--utxoindex`. Tests: rule matching, event building
 from notifications, persistence.
 
-**Phase 3: Address Info and labels (2 weeks).** `labels.rs` with the bundled
-snapshot, kaspa.org bulk refresh, user labels; the Address Info window with
+**Phase 3: Address Info and labels (2 weeks).** `labels.rs` with the
+kaspa.org bulk fetch and user labels; the Address Info window with
 profile, balance history, transactions, counterparties; label chips on every
 `widgets::address`. Tests: precedence, cache expiry, balance replay.
 

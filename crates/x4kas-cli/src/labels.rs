@@ -1,5 +1,5 @@
 //! `x4kas-cli labels …`: the address labels the GUI shows (user labels, the public
-//! api.kaspa.org list and the bundled snapshot). No node needed.
+//! api.kaspa.org list as last fetched). No node needed.
 
 use anyhow::Result;
 use clap::Subcommand;

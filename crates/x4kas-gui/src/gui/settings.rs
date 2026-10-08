@@ -9,13 +9,13 @@ use egui_extras::{Column, TableBuilder};
 use super::monitoring::looks_like_address;
 use super::theme;
 use super::widgets::{
-    CARD_GAP, address_bare, card, card_with_header, copy_value, kv, kv_grid, label_cell,
-    placeholder, primary_button, section_title,
+    CARD_GAP, address_bare, card, card_with_header, edit_label_cell, kv_grid, kv_with, label_cell,
+    placeholder, primary_button, request_label, section_title,
 };
 use x4kas_core::app::App;
 use x4kas_core::controller::{CommandSender, UiCommand};
 use x4kas_core::format::{format_duration, format_number};
-use x4kas_core::labels::{LabelSource, UserLabels};
+use x4kas_core::labels::LabelSource;
 
 /// Width of the section navigation.
 const NAV_WIDTH: f32 = 170.0;
@@ -117,11 +117,17 @@ impl SettingsPage {
         );
     }
 
-    /// The public list: where it comes from and when it was last fetched.
+    /// The public list: its count, where it comes from and how its fetch is going.
     fn sources(&mut self, ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
         let book = app.labels.clone();
         ui.horizontal(|ui| {
-            if ui.button("Refresh public list").clicked() {
+            if ui
+                .add_enabled(
+                    !app.label_refresh.fetching,
+                    egui::Button::new("Refresh public list"),
+                )
+                .clicked()
+            {
                 let _ = cmd_tx.send(UiCommand::RefreshLabels);
             }
             ui.label(format!(
@@ -131,22 +137,23 @@ impl SettingsPage {
         });
         ui.add_space(4.0);
         kv_grid(ui, "label_sources", |ui| {
-            kv(
-                ui,
-                "api.kaspa.org",
-                match book.kaspa_org_refreshed {
-                    Some(at) => format!(
-                        "/addresses/names, fetched {} ago; refreshed daily",
-                        format_duration(at.elapsed().unwrap_or_default())
-                    ),
-                    None => "/addresses/names, not fetched yet; refreshed daily".to_string(),
-                },
-            );
-            kv(
-                ui,
-                "Bundled snapshot",
-                "the same list as shipped with this build, until the first fetch",
-            );
+            kv_with(ui, "api.kaspa.org", |ui| {
+                ui.label("/addresses/names, fetched on launch and hourly");
+                if app.label_refresh.fetching {
+                    ui.spinner();
+                    ui.label(RichText::new("fetching…").weak());
+                } else if let Some(err) = &app.label_refresh.last_error {
+                    ui.label(RichText::new(format!("fetch failed: {err}")).color(theme::ERROR));
+                } else if let Some(at) = book.kaspa_org_refreshed {
+                    ui.label(
+                        RichText::new(format!(
+                            "fetched {} ago",
+                            format_duration(at.elapsed().unwrap_or_default())
+                        ))
+                        .weak(),
+                    );
+                }
+            });
         });
     }
 
@@ -181,20 +188,11 @@ impl SettingsPage {
             }
         });
         ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.add(
-                TextEdit::singleline(&mut self.filter)
-                    .hint_text("filter by label, address or source")
-                    .desired_width(260.0),
-            );
-            ui.label(
-                RichText::new(
-                    "Click a label to edit it (Enter saves, Esc cancels); right-click an address to add or remove one.",
-                )
-                .weak()
-                .small(),
-            );
-        });
+        ui.add(
+            TextEdit::singleline(&mut self.filter)
+                .hint_text("filter by label, address or source")
+                .desired_width(260.0),
+        );
         ui.add_space(4.0);
 
         let filter = self.filter.trim().to_lowercase();
@@ -206,6 +204,7 @@ impl SettingsPage {
                 address: address.to_string(),
                 name: label.name.clone(),
                 source: source_name(label.source),
+                manual: label.source == LabelSource::User,
             })
             .filter(|r| {
                 filter.is_empty()
@@ -226,11 +225,6 @@ impl SettingsPage {
         } else {
             labels_table(ui, &rows);
         }
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Manual labels are saved in").weak().small());
-            copy_value(ui, &UserLabels::path().display().to_string(), "Copy path");
-        });
     }
 }
 
@@ -238,6 +232,8 @@ struct LabelRow {
     address: String,
     name: String,
     source: &'static str,
+    /// The user's own, so it can be deleted.
+    manual: bool,
 }
 
 /// How a label's source reads in the table: "manual" for the user's own.
@@ -248,7 +244,8 @@ fn source_name(source: LabelSource) -> &'static str {
     }
 }
 
-/// Every known label: the chip (click to edit), the address and the source.
+/// Every known label: the chip (click to edit), the address, the source, and edit and
+/// delete buttons.
 fn labels_table(ui: &mut Ui, rows: &[LabelRow]) {
     ui.push_id("known_labels", |ui| {
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
@@ -262,10 +259,12 @@ fn labels_table(ui: &mut Ui, rows: &[LabelRow]) {
             .column(Column::auto().at_least(120.0).clip(true))
             .column(Column::remainder().at_least(200.0).clip(true))
             .column(Column::auto().at_least(90.0))
+            .column(Column::exact(52.0))
             .header(theme::ROW_HEIGHT + 4.0, |mut h| {
                 for title in ["Label", "Address", "Source"] {
                     h.col(|ui| section_title(ui, title));
                 }
+                h.col(|_| {});
             })
             .body(|body| {
                 body.rows(row_height, rows.len(), |mut row| {
@@ -274,6 +273,26 @@ fn labels_table(ui: &mut Ui, rows: &[LabelRow]) {
                     row.col(|ui| address_bare(ui, &r.address));
                     row.col(|ui| {
                         ui.label(RichText::new(r.source).weak());
+                    });
+                    row.col(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        if ui
+                            .small_button("✏")
+                            .on_hover_text("Edit the label (Enter saves, Esc cancels)")
+                            .clicked()
+                        {
+                            edit_label_cell(ui.ctx(), &r.address);
+                        }
+                        if ui
+                            .add_enabled(r.manual, egui::Button::new("🗑").small())
+                            .on_hover_text("Delete this label")
+                            .on_disabled_hover_text(
+                                "Public labels come from api.kaspa.org; edit one to override it",
+                            )
+                            .clicked()
+                        {
+                            request_label(ui.ctx(), &r.address, None);
+                        }
                     });
                 });
             });

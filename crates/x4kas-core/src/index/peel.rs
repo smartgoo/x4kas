@@ -328,7 +328,7 @@ mod tests {
     fn follows_a_chain_in_both_directions() {
         let store = temp_store();
         let mut writer =
-            IndexWriter::new(store.store.clone(), Arc::new(LabelBook::bundled())).unwrap();
+            IndexWriter::new(store.store.clone(), Arc::new(LabelBook::base())).unwrap();
         // 1 gets 100 KAS; 10 is an exchange deposit address seen before the chain.
         // Then 1 → 2 → 3 → 4, peeling 10 KAS to 10 each time; 5 pays 6 with change
         // once, which is no chain; 7 batches to 8 and 9.

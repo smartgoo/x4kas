@@ -60,7 +60,7 @@ pub enum Command {
     },
     /// Follow addresses live: one JSON line per balance change and alert, until Ctrl+C
     Watch(WatchArgs),
-    /// Address labels: yours, the public api.kaspa.org list and the bundled snapshot
+    /// Address labels: yours and the public api.kaspa.org list
     Labels {
         #[command(subcommand)]
         cmd: LabelsCommand,

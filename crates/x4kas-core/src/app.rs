@@ -872,6 +872,8 @@ pub struct App {
     pub labels: Arc<LabelBook>,
     /// Opt-in online label sources.
     pub label_settings: LabelSettings,
+    /// The public list fetch (on launch and periodically, `labels::start_label_refresh`).
+    pub label_refresh: LabelRefresh,
     pub dag_selection: DagSelection,
     pub market_data: Option<MarketData>,
 
@@ -885,6 +887,14 @@ pub struct App {
     /// Called by `mark_dirty()` so a frontend can wake up and redraw.
     pub repaint: Option<RepaintFn>,
     pub connection: ActiveConnection,
+}
+
+/// The state of the public label list's fetch.
+#[derive(Debug, Clone, Default)]
+pub struct LabelRefresh {
+    pub fetching: bool,
+    /// Why the last fetch failed; cleared by the next success.
+    pub last_error: Option<String>,
 }
 
 impl App {

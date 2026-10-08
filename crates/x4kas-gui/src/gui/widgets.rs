@@ -490,8 +490,9 @@ enum LinkKind {
     Block,
 }
 
-/// A Kaspa address: fitted like [`fit_label`], with a copy icon, a hover highlight and a
-/// click menu to open it in a block explorer. Use this for every address shown.
+/// A Kaspa address: fitted like [`fit_label`], with a copy icon and a hover highlight. A
+/// click opens its Address Info; the right-click menu labels it or opens it in a block
+/// explorer. Use this for every address shown.
 pub fn address(ui: &mut Ui, addr: &str) {
     linked_value(ui, addr, LinkKind::Address, false, true);
 }
@@ -580,18 +581,16 @@ fn linked_value(ui: &mut Ui, value: &str, kind: LinkKind, selected: bool, chip: 
         copy_button(ui, id, value, copy_hint);
     }
 
-    // Same hover and selected look as list items; addresses also stay selected while a
-    // menu of theirs is open.
-    let menu_id = id.with("menu");
+    // Same hover and selected look as list items; addresses also stay selected while
+    // their menu is open.
     let context_id = id.with("context");
-    let menu_open =
-        egui::Popup::is_id_open(ui.ctx(), menu_id) || egui::Popup::is_id_open(ui.ctx(), context_id);
+    let menu_open = egui::Popup::is_id_open(ui.ctx(), context_id);
     let response = icon_gap(ui, rtl, |ui| {
         ui.selectable_label(selected || menu_open, shown.as_str())
     })
     .on_hover_cursor(egui::CursorIcon::PointingHand);
     let hint = match kind {
-        LinkKind::Address => Some("Click for address info, right-click to label"),
+        LinkKind::Address => Some("Click for address info, right-click for more"),
         LinkKind::Block => Some("Click for block info"),
     };
     let response = match (shown != value, hint) {
@@ -604,34 +603,35 @@ fn linked_value(ui: &mut Ui, value: &str, kind: LinkKind, selected: bool, chip: 
     let mut get_block = false;
     match kind {
         LinkKind::Address => {
-            egui::Popup::menu(&response).id(menu_id).show(|ui| {
-                if ui.button("Address info").clicked() {
-                    request_address(ui.ctx(), value);
-                }
-                for (name, url) in [
-                    ("Open in Kaspa Explorer", explorer_address_url(value)),
-                    ("Open in Kaspa Stream", kaspa_stream_address_url(value)),
-                ] {
-                    if ui.button(name).clicked() {
-                        ui.ctx().open_url(egui::OpenUrl::new_tab(url));
-                    }
-                }
-            });
-            // Right click: the user's own label (over any public one).
+            if response.clicked() {
+                request_address(ui.ctx(), value);
+            }
+            // Right click: the user's own label (over any public one), and the explorers.
             egui::Popup::context_menu(&response)
                 .id(context_id)
-                .show(|ui| match user_label.as_deref() {
-                    Some(current) => {
-                        if ui.button("Edit Address Label").clicked() {
-                            start_label_edit(ui.ctx(), id, current);
+                .show(|ui| {
+                    match user_label.as_deref() {
+                        Some(current) => {
+                            if ui.button("Edit Address Label").clicked() {
+                                start_label_edit(ui.ctx(), id, current);
+                            }
+                            if ui.button("Remove Address Label").clicked() {
+                                request_label(ui.ctx(), value, None);
+                            }
                         }
-                        if ui.button("Remove Address Label").clicked() {
-                            request_label(ui.ctx(), value, None);
+                        None => {
+                            if ui.button("Add Address Label").clicked() {
+                                start_label_edit(ui.ctx(), id, "");
+                            }
                         }
                     }
-                    None => {
-                        if ui.button("Add Address Label").clicked() {
-                            start_label_edit(ui.ctx(), id, "");
+                    ui.separator();
+                    for (name, url) in [
+                        ("Open in Kaspa Explorer", explorer_address_url(value)),
+                        ("Open in Kaspa Stream", kaspa_stream_address_url(value)),
+                    ] {
+                        if ui.button(name).clicked() {
+                            ui.ctx().open_url(egui::OpenUrl::new_tab(url));
                         }
                     }
                 });

@@ -134,6 +134,13 @@ struct Prefs {
     active_tab: Tab,
     /// The analytics cards' time windows, by `AnalyticsPanel`.
     windows: Option<[x4kas_core::app::TimeWindow; 6]>,
+    /// The Explorer's recently viewed pane is open (it is until closed).
+    #[serde(default = "yes")]
+    recents_open: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 const PREFS_KEY: &str = "prefs";
@@ -167,12 +174,14 @@ impl GuiApp {
         connection: ConnectionWindow,
         storage: Option<&dyn eframe::Storage>,
     ) -> Self {
+        let mut explorer = ExplorerUi::default();
         if let Some(prefs) = storage.and_then(|s| eframe::get_value::<Prefs>(s, PREFS_KEY)) {
             let mut state = app.blocking_write();
             state.active_tab = prefs.active_tab;
             if let Some(windows) = prefs.windows {
                 state.analytics.windows = windows;
             }
+            explorer.recents_open = prefs.recents_open;
         }
         Self {
             app,
@@ -185,7 +194,7 @@ impl GuiApp {
             connection,
             terminal: TerminalPane::new(),
             monitoring: MonitoringTab::default(),
-            explorer: ExplorerUi::default(),
+            explorer,
             settings: SettingsPage::default(),
             pane: InfoPane::default(),
             flow_window: FlowWindowUi::default(),
@@ -271,6 +280,7 @@ impl eframe::App for GuiApp {
         let prefs = Prefs {
             active_tab: app.active_tab,
             windows: Some(app.analytics.windows),
+            recents_open: self.explorer.recents_open,
         };
         eframe::set_value(storage, PREFS_KEY, &prefs);
     }

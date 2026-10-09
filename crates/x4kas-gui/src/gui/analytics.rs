@@ -524,12 +524,18 @@ pub fn wide_table_with_lead<const N: usize>(
         let bounce = overscroll(ui, bounce_id, &output);
         if bounce != 0.0 {
             let shapes = first_shape..next_shape();
+            let shift = egui::vec2(0.0, bounce);
+            let viewport = output.inner_rect;
             ctx.graphics_mut(|g| {
                 let list = g.entry(layer);
                 for i in shapes {
-                    // Only the shapes move: their clip rect stays the body's, so rows
-                    // don't spill over the header or out of the card.
-                    list.mutate_shape(ShapeIdx(i), |s| s.shape.translate(egui::vec2(0.0, bounce)));
+                    // Every cell is clipped to its own rect, so its clip moves with it
+                    // (else the text slides out of its cell and vanishes), but never past
+                    // the body: rows don't spill over the header or out of the card.
+                    list.mutate_shape(ShapeIdx(i), |s| {
+                        s.shape.translate(shift);
+                        s.clip_rect = s.clip_rect.translate(shift).intersect(viewport);
+                    });
                 }
             });
         }

@@ -58,7 +58,6 @@ const TAB_CLOSE_SIZE: f32 = 15.0;
 const TAB_RADIUS: u8 = 5;
 
 /// The tab's own state: the search drafts and the address page's forms.
-#[derive(Default)]
 pub struct ExplorerUi {
     /// Per sub tab id: the page the draft was set from, and the draft.
     drafts: HashMap<u64, (ExplorerPage, String)>,
@@ -66,8 +65,9 @@ pub struct ExplorerUi {
     search_open: bool,
     /// Focus the search field on the next frame (Ctrl+L).
     pub focus_search: bool,
-    /// The recently viewed pane on the left is open.
-    recents_open: bool,
+    /// The recently viewed pane on the left is open: by default, and remembered across
+    /// launches (`Prefs`).
+    pub recents_open: bool,
     /// The active sub tab last frame, to scroll a newly active one into view.
     shown_tab: Option<u64>,
     /// A page's Retry was clicked (the pages draw with `&App`; `show` reloads it).
@@ -75,6 +75,21 @@ pub struct ExplorerUi {
     /// "Clear" on a Recently viewed card was clicked.
     clear_recent: bool,
     forms: AddressForms,
+}
+
+impl Default for ExplorerUi {
+    fn default() -> Self {
+        Self {
+            drafts: HashMap::new(),
+            search_open: false,
+            focus_search: false,
+            recents_open: true,
+            shown_tab: None,
+            reload: None,
+            clear_recent: false,
+            forms: AddressForms::default(),
+        }
+    }
 }
 
 impl ExplorerUi {

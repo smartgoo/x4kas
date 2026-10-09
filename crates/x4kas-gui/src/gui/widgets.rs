@@ -314,20 +314,24 @@ pub fn section_title(ui: &mut Ui, title: &str) {
     ui.label(RichText::new(title).color(theme::ACCENT));
 }
 
-/// Show `window` centered and non-collapsible, closing with its X button or Esc.
-/// Returns false once closed. Size and resizability stay with the caller's `window`.
+/// Show `window` centered and non-collapsible, above the info pane, closing with its
+/// X button or when the frame loop hands it this frame's Esc (`close`: only the
+/// topmost window takes it). Returns false once closed. Size and resizability stay
+/// with the caller's `window`.
 pub fn modal_window(
     ctx: &egui::Context,
     window: egui::Window<'_>,
+    close: bool,
     add_contents: impl FnOnce(&mut Ui),
 ) -> bool {
     let mut open = true;
     window
         .open(&mut open)
         .collapsible(false)
+        .order(egui::Order::Foreground)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, add_contents);
-    open && !ctx.input(|i| i.key_pressed(egui::Key::Escape))
+    open && !close
 }
 
 /// `value` formatted with `f`, or an em dash when there is none.

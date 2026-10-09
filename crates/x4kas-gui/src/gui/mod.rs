@@ -19,7 +19,7 @@ mod toasts;
 mod widgets;
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use eframe::egui::{self, Event, Key, Modifiers, RichText, Stroke, ViewportCommand};
@@ -110,12 +110,31 @@ pub fn run(rt: &tokio::runtime::Runtime, args: Args) -> Result<()> {
     .map_err(|e| anyhow::anyhow!("GUI error: {e}"))
 }
 
+/// What this frame's Esc closes: one thing, the topmost. Windows first (in the order
+/// they draw, so the one on top), then the info pane, then Settings.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EscTarget {
+    Help,
+    Connection,
+    Flows,
+    Pane,
+    Settings,
+}
+
+/// How long the shutdown waits before offering to quit without finishing.
+const SHUTDOWN_PATIENCE: Duration = Duration::from_secs(5);
+
 struct GuiApp {
     app: Arc<RwLock<App>>,
     cmd_tx: CommandSender,
     /// Set once a close was requested; resolves when the controller has shut down.
     shutdown_rx: Option<oneshot::Receiver<()>>,
+    shutdown_since: Option<Instant>,
     shutdown_complete: bool,
+    /// A text field had focus or a popup (a menu) was open at the end of the last
+    /// frame: egui gives this frame's Esc to them (it clears the focus before the frame
+    /// runs, so this is the only way to know), and nothing else should take it.
+    esc_taken: bool,
     show_help: bool,
     connection: ConnectionWindow,
     terminal: TerminalPane,
@@ -133,7 +152,9 @@ impl GuiApp {
             app,
             cmd_tx,
             shutdown_rx: None,
+            shutdown_since: None,
             shutdown_complete: false,
+            esc_taken: false,
             show_help: false,
             connection,
             terminal: TerminalPane::new(),
@@ -147,13 +168,18 @@ impl GuiApp {
     }
 
     /// Defer window close until the controller has disconnected and saved state.
+    /// Cmd+Q (Ctrl+Q elsewhere) asks for the same close, so it takes the same path.
     fn handle_close(&mut self, ctx: &egui::Context) {
+        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Q)) {
+            ctx.send_viewport_cmd(ViewportCommand::Close);
+        }
         if ctx.input(|i| i.viewport().close_requested()) && !self.shutdown_complete {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
             if self.shutdown_rx.is_none() {
                 let (tx, rx) = oneshot::channel();
                 let _ = self.cmd_tx.send(UiCommand::Shutdown(tx));
                 self.shutdown_rx = Some(rx);
+                self.shutdown_since = Some(Instant::now());
             }
         }
 
@@ -172,9 +198,29 @@ impl GuiApp {
         }
     }
 
-    /// A modal window that closes itself on Esc is on show.
+    /// A window (Help, Connection, the flow graph) is on show.
     fn modal_open(&self, app: &App) -> bool {
         self.show_help || self.connection.open || app.address.flows.open
+    }
+
+    /// What this frame's Esc closes, if anything.
+    fn esc_target(&self, ctx: &egui::Context, app: &App) -> Option<EscTarget> {
+        if self.esc_taken || !ctx.input(|i| i.key_pressed(Key::Escape)) {
+            return None;
+        }
+        if self.show_help {
+            Some(EscTarget::Help)
+        } else if self.connection.open {
+            Some(EscTarget::Connection)
+        } else if app.address.flows.open {
+            Some(EscTarget::Flows)
+        } else if app.explorer.pane.is_some() {
+            Some(EscTarget::Pane)
+        } else if self.settings.open {
+            Some(EscTarget::Settings)
+        } else {
+            None
+        }
     }
 
     fn is_shutting_down(&self) -> bool {
@@ -194,6 +240,7 @@ impl eframe::App for GuiApp {
         let app_state = self.app.clone();
         let mut app = app_state.blocking_write();
 
+        let modal_open = self.modal_open(&app);
         handle_shortcuts(
             ctx,
             &mut app,
@@ -201,6 +248,7 @@ impl eframe::App for GuiApp {
             &mut self.settings.open,
             &mut self.terminal,
             &mut self.explorer,
+            modal_open,
         );
         let testnet = app
             .node
@@ -233,9 +281,13 @@ impl eframe::App for GuiApp {
             // Esc belongs to the shell (vim etc.), not the popups drawn below.
             ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
         }
-        // Before the windows draw: they close themselves on Esc, which then shouldn't
-        // also close the pane or Settings.
-        let modal_open = self.modal_open(&app);
+        // One thing closes per Esc: the topmost window, else the pane, else Settings.
+        let esc = self.esc_target(ctx, &app);
+        if esc == Some(EscTarget::Pane) {
+            app.explorer.close_pane();
+        } else if esc == Some(EscTarget::Settings) {
+            self.settings.open = false;
+        }
         // The info pane slides in over the right of the tab, between the bars and above
         // the terminal, without moving what is behind it.
         self.pane.show(ctx, &mut app, &self.cmd_tx);
@@ -283,30 +335,51 @@ impl eframe::App for GuiApp {
             app.explorer.open_pane(page);
             ctx.request_repaint();
         }
-        self.flow_window.show(ctx, &mut app, &self.cmd_tx);
+        self.flow_window
+            .show(ctx, &mut app, &self.cmd_tx, esc == Some(EscTarget::Flows));
         // Watchlist alerts pop up over any tab.
         self.toasts.collect(&app);
         self.toasts.show(ctx, &app);
 
-        self.connection.show(ctx, &mut app, &self.cmd_tx);
-        help::show(ctx, &mut self.show_help);
-        // Esc closes the info pane once no window is left to close, then leaves Settings.
-        if !modal_open && !ctx.wants_keyboard_input() && ctx.input(|i| i.key_pressed(Key::Escape)) {
-            if app.explorer.pane.is_some() {
-                app.explorer.close_pane();
-            } else if self.settings.open {
-                self.settings.open = false;
-            }
-        }
+        self.connection.show(
+            ctx,
+            &mut app,
+            &self.cmd_tx,
+            esc == Some(EscTarget::Connection),
+        );
+        help::show(ctx, &mut self.show_help, esc == Some(EscTarget::Help));
 
         if self.is_shutting_down() {
+            let waited = self.shutdown_since.map_or(Duration::ZERO, |t| t.elapsed());
             egui::Modal::new(egui::Id::new("shutdown_modal")).show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.spinner();
                     ui.label("Shutting down…");
                 });
+                // The controller is finishing the index writer's last batch and
+                // disconnecting; if that takes too long, let the user leave anyway.
+                if waited > SHUTDOWN_PATIENCE {
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new("Still finishing the last index batch and disconnecting.")
+                            .weak(),
+                    );
+                    if ui
+                        .button("Quit now")
+                        .on_hover_text(
+                            "Close without waiting; the index is written in atomic batches",
+                        )
+                        .clicked()
+                    {
+                        self.shutdown_rx = None;
+                        self.shutdown_complete = true;
+                        ctx.send_viewport_cmd(ViewportCommand::Close);
+                    }
+                }
             });
         }
+        // For the next frame's Esc (see `esc_taken`).
+        self.esc_taken = ctx.memory(|m| m.focused().is_some()) || egui::Popup::is_any_open(ctx);
 
         // Keep time-based values (seconds behind the tip, "ago" times) ticking. Wake on the
         // next whole second rather than 1s from now, so they tick evenly even when
@@ -316,6 +389,8 @@ impl eframe::App for GuiApp {
     }
 }
 
+/// `modal_open`: a window is on show, so the page behind it keeps its keys (the tab
+/// numbers, pause) to itself; only the terminal toggle and the help toggle still work.
 fn handle_shortcuts(
     ctx: &egui::Context,
     app: &mut App,
@@ -323,6 +398,7 @@ fn handle_shortcuts(
     settings_open: &mut bool,
     terminal: &mut TerminalPane,
     explorer: &mut ExplorerUi,
+    modal_open: bool,
 ) {
     const TAB_KEYS: [Key; 5] = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5];
 
@@ -333,17 +409,21 @@ fn handle_shortcuts(
     if terminal.has_focus() {
         return;
     }
+    if !ctx.wants_keyboard_input() {
+        let question = ctx.input_mut(|i| take_text_event(i, "?"));
+        if question || ctx.input(|i| i.key_pressed(Key::F1)) {
+            *show_help = !*show_help;
+        }
+    }
+    if modal_open {
+        return;
+    }
     // Modifier combinations type nothing, so they work from the search field too.
     if app.active_tab == Tab::Explorer && !*settings_open {
         explorer.handle_shortcuts(ctx, app);
     }
     if ctx.wants_keyboard_input() {
         return;
-    }
-
-    let question = ctx.input_mut(|i| take_text_event(i, "?"));
-    if question || ctx.input(|i| i.key_pressed(Key::F1)) {
-        *show_help = !*show_help;
     }
 
     ctx.input(|i| {

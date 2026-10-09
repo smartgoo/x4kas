@@ -27,20 +27,32 @@ fn shortcuts(ctx: &egui::Context) -> Vec<(String, &'static str)> {
         ("P".to_string(), "Pause / resume polling"),
         ("Ctrl+`".to_string(), "Show / hide the terminal"),
         ("? / F1".to_string(), "Toggle this help"),
-        ("Esc".to_string(), "Close the info pane, a popup or help"),
+        (
+            "Esc".to_string(),
+            "Close one thing: a menu or field, else the top window, else the info pane, else Settings",
+        ),
+        (
+            format!("{cmd}+Q"),
+            "Quit (finishes writing the index first)",
+        ),
     ]
 }
 
-pub fn show(ctx: &egui::Context, open: &mut bool) {
+/// `close`: this frame's Esc is for this window.
+pub fn show(ctx: &egui::Context, open: &mut bool, close: bool) {
     if !*open {
         return;
     }
-    *open = modal_window(ctx, egui::Window::new("Help").resizable(false), |ui| {
-        section(ui, "Shortcuts", &shortcuts(ctx));
-        ui.add_space(8.0);
-        ui.label(
-            RichText::new(
-                "Click the connection status in the status bar to switch nodes. \
+    *open = modal_window(
+        ctx,
+        egui::Window::new("Help").resizable(false),
+        close,
+        |ui| {
+            section(ui, "Shortcuts", &shortcuts(ctx));
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(
+                    "Click the connection status in the status bar to switch nodes. \
                      Click any address for its info, history and watch settings; \
                      right-click it to label it, open it in the Explorer tab or in a web \
                      explorer, or click its label to edit it. A transaction id opens its \
@@ -49,10 +61,11 @@ pub fn show(ctx: &egui::Context, open: &mut bool) {
                      The ⚙ button opens Settings. \
                      Shortcuts are ignored while a text field or the terminal has focus; \
                      click outside the terminal to leave it.",
-            )
-            .weak(),
-        );
-    });
+                )
+                .weak(),
+            );
+        },
+    );
 }
 
 fn section(ui: &mut egui::Ui, title: &str, rows: &[(String, &str)]) {

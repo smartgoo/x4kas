@@ -38,7 +38,14 @@ impl ConnectionWindow {
         self.connecting = false;
     }
 
-    pub fn show(&mut self, ctx: &egui::Context, app: &mut App, cmd_tx: &CommandSender) {
+    /// `close`: this frame's Esc is for this window.
+    pub fn show(
+        &mut self,
+        ctx: &egui::Context,
+        app: &mut App,
+        cmd_tx: &CommandSender,
+        close: bool,
+    ) {
         if !self.open {
             return;
         }
@@ -51,7 +58,7 @@ impl ConnectionWindow {
         let window = egui::Window::new("Connection")
             .resizable(false)
             .default_width(440.0);
-        let still_open = modal_window(ctx, window, |ui| self.contents(ui, app, cmd_tx));
+        let still_open = modal_window(ctx, window, close, |ui| self.contents(ui, app, cmd_tx));
         if !still_open {
             self.open = false;
             self.connecting = false;

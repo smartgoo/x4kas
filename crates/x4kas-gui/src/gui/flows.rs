@@ -33,7 +33,14 @@ const NODE_MAX_RADIUS: f32 = 22.0;
 const SETTLE_STEPS: u32 = 240;
 
 impl FlowWindowUi {
-    pub fn show(&mut self, ctx: &egui::Context, app: &mut App, cmd_tx: &CommandSender) {
+    /// `close`: this frame's Esc is for this window.
+    pub fn show(
+        &mut self,
+        ctx: &egui::Context,
+        app: &mut App,
+        cmd_tx: &CommandSender,
+        close: bool,
+    ) {
         if !app.address.flows.open {
             return;
         }
@@ -44,7 +51,7 @@ impl FlowWindowUi {
         let window = egui::Window::new(title)
             .default_size([900.0, 620.0])
             .resizable(true);
-        let open = modal_window(ctx, window, |ui| self.contents(ui, app, cmd_tx));
+        let open = modal_window(ctx, window, close, |ui| self.contents(ui, app, cmd_tx));
         if !open {
             app.address.flows.close();
         }

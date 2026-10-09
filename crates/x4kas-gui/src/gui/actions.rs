@@ -1,8 +1,9 @@
 //! The action bar over an address, block or transaction page: a row of flat buttons,
 //! like an application's menu bar, at the top of the Explorer's page and of the info
-//! pane. The web explorers (one menu) first, then what can be done with an address: its label and
-//! watchlist settings (dialogs, see `gui/dialogs.rs`) and its flow graph. It needs only
-//! the page (not its data), so it is there while the page loads or when it wasn't found.
+//! pane. An Open menu (the web explorers, an address's flow graph) first, then what
+//! an address can be given (its label and watchlist settings: dialogs, see
+//! `gui/dialogs.rs`) and its export. It needs only the page (not its data), so it is
+//! there while the page loads or when it wasn't found.
 
 use eframe::egui::containers::menu::MenuButton;
 use eframe::egui::{self, Button, OpenUrl, Ui};
@@ -42,13 +43,34 @@ pub fn bar(ui: &mut Ui, app: &mut App, page: &ExplorerPage, cmd_tx: &CommandSend
     };
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 2.0;
-        MenuButton::from_button(action_button("Open Explorer ▾")).ui(ui, |ui| {
+        // Open: the web explorers, and for an address its flow graph.
+        let mut flows = false;
+        MenuButton::from_button(action_button("Open ▾")).ui(ui, |ui| {
             menu_link(ui, "Kaspa Explorer ↗", &explorer);
             if let Some(stream) = &stream {
                 menu_link(ui, "Kaspa Stream ↗", stream);
             }
+            if matches!(page, ExplorerPage::Address(_)) {
+                ui.separator();
+                // The flow graph reads the index, which only a direct node fills.
+                let direct = app.connection.is_direct();
+                if ui
+                    .add_enabled(direct, Button::new("Flow graph"))
+                    .on_hover_text("Follow the money: counterparties of counterparties")
+                    .on_disabled_hover_text(
+                        "Needs a direct node: the flow graph reads the address index",
+                    )
+                    .clicked()
+                {
+                    flows = true;
+                    ui.close();
+                }
+            }
         });
         if let ExplorerPage::Address(addr) = page {
+            if flows {
+                open_flow_graph(app, addr, cmd_tx);
+            }
             ui.separator();
             address_actions(ui, app, addr, cmd_tx);
         }
@@ -62,8 +84,7 @@ pub fn bar(ui: &mut Ui, app: &mut App, page: &ExplorerPage, cmd_tx: &CommandSend
     ui.add_space(CARD_GAP);
 }
 
-/// The address's own actions: the Add/Edit menu (label, watchlist), flow graph and
-/// export. Their wording follows the address's state (a label to add or edit, a
+/// The address's own actions: the Add/Edit menu (label, watchlist) and export. Their wording follows the address's state (a label to add or edit, a
 /// watchlist to join or settings to change).
 fn address_actions(ui: &mut Ui, app: &mut App, addr: &str, cmd_tx: &CommandSender) {
     // One menu for what the address can be given: a label and a watchlist entry. Its
@@ -101,16 +122,7 @@ fn address_actions(ui: &mut Ui, app: &mut App, addr: &str, cmd_tx: &CommandSende
         }
     });
     response.on_hover_text("A label of your own, or a place on the watchlist");
-    // The flow graph reads the index, which only a direct node fills.
-    let direct = app.connection.is_direct();
-    if ui
-        .add_enabled(direct, action_button("Flow graph"))
-        .on_hover_text("Follow the money: counterparties of counterparties")
-        .on_disabled_hover_text("Needs a direct node: the flow graph reads the address index")
-        .clicked()
-    {
-        open_flow_graph(app, addr, cmd_tx);
-    }
+    ui.separator();
     // Export needs the page: its transactions come from the index, so there is
     // nothing to export until it is loaded with some.
     let page = ExplorerPage::Address(addr.to_string());

@@ -546,8 +546,9 @@ pub fn wide_table_with_lead<const N: usize>(
 /// `(1 - 1 / (x * C / d + 1)) * d` for a viewport `d` tall, so it gets harder the further
 /// it goes and never reaches `d`.
 const RUBBER_BAND_C: f32 = 0.55;
-/// Pulled rows are released once scrolling has stopped for this long, in seconds.
-const RELEASE_AFTER: f64 = 0.06;
+/// Pulled rows are released once scrolling has stopped for this long, in seconds: a
+/// frame or two, so a pause between wheel steps doesn't let go, a lifted finger does.
+const RELEASE_AFTER: f64 = 0.04;
 /// Angular frequency of the critically damped spring back (2π / ~0.4s response).
 const SPRING_OMEGA: f32 = 16.0;
 
@@ -560,6 +561,9 @@ struct Overscroll {
     velocity: f32,
     /// When scrolling last pulled the rows.
     last_pull: f64,
+    /// The last scroll delta that pulled, to tell a trackpad's momentum (a run of
+    /// shrinking deltas after the fingers lift) from fingers still scrolling.
+    last_delta: f32,
     /// Last frame's body viewport, to catch scrolling back before the table does.
     viewport: Option<egui::Rect>,
 }
@@ -629,11 +633,18 @@ fn overscroll(ui: &Ui, id: egui::Id, output: &ScrollAreaOutput<()>) -> f32 {
         let leftover = ui
             .ctx()
             .input_mut(|i| std::mem::take(&mut i.smooth_scroll_delta.y));
-        if leftover != 0.0 {
+        // A trackpad keeps scrolling by itself after the fingers lift, in shrinking
+        // steps for a second or more. Those don't hold the rows (iOS lets go the moment
+        // the finger does): only a step as large as the last one is a finger.
+        let momentum = state.offset != 0.0 && leftover.abs() < state.last_delta.abs();
+        if leftover != 0.0 && !momentum {
             let pull = rubber_band_pull(state.offset, d) + leftover;
             state.offset = rubber_band(pull, d);
             state.velocity = 0.0;
             state.last_pull = now;
+        }
+        if leftover != 0.0 {
+            state.last_delta = leftover;
         }
     }
     if state.offset != 0.0 && now - state.last_pull > RELEASE_AFTER {

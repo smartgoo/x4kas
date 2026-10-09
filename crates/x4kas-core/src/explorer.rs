@@ -18,7 +18,6 @@ use crate::app::AddressView;
 use crate::format::shorten_middle;
 use crate::index::query::{self, TxDetail};
 use crate::index::{IndexStore, parse_hex};
-use crate::labels::OnlineEntry;
 use crate::rpc::types::BlockRewardInfo;
 use crate::tx_inspect::{
     TransactionProtocol, coinbase_miner_tag, coinbase_node_version, detect_protocol, script_class,
@@ -217,9 +216,7 @@ pub struct AddressPageData {
     pub view: AddressView,
     /// An older page of transactions is on its way (`UiCommand::AddressPage`).
     pub loading_more: bool,
-    /// What the online label sources said, once asked.
-    pub online_result: Option<Vec<OnlineEntry>>,
-    /// A later request (more rows, the online lookup) failed.
+    /// A later request (more rows) failed.
     pub error: Option<String>,
 }
 

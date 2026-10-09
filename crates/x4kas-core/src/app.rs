@@ -7,7 +7,7 @@ use crate::analytics::{AggregatedView, TxHistogram};
 use crate::emission::{BlockReward, Emission};
 use crate::explorer::ExplorerState;
 use crate::index::query::{AddressProfile, ClusterInfo, FlowGraph, Page, Peer, TxRow};
-use crate::labels::{LabelBook, LabelSettings};
+use crate::labels::LabelBook;
 use crate::rpc::hash_links::{HashLink, block_hash_links};
 use crate::rpc::methods::{RPC_METHODS, RpcMethod};
 use crate::rpc::types::*;
@@ -800,8 +800,6 @@ pub struct App {
     pub explorer: ExplorerState,
     /// Known address labels; replaced as a whole when a source changes.
     pub labels: Arc<LabelBook>,
-    /// Opt-in online label sources.
-    pub label_settings: LabelSettings,
     /// The public list fetch (on launch and periodically, `labels::start_label_refresh`).
     pub label_refresh: LabelRefresh,
     pub market_data: Option<MarketData>,

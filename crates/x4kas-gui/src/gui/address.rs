@@ -1,6 +1,6 @@
 //! The pieces of an address page, shared by the info pane (opened from any address, see
-//! `widgets::request_address`) and the Explorer tab: `header` (the address, its label
-//! and the online lookup), `body` (the cards: summary with balance and indexed totals,
+//! `widgets::request_address`) and the Explorer tab: `header` (the address and its
+//! label), `body` (the cards: summary with balance and indexed totals,
 //! balance history, transactions, counterparties, cluster and peel chain) and
 //! `watch_card` (the watchlist entry, for a watched address). The actions on an address
 //! (label, watchlist, flow graph, export) are the action bar's (`gui/actions.rs`).
@@ -19,22 +19,15 @@ use x4kas_core::app::{AddressView, App, ExportOrigin, ExportStatus};
 use x4kas_core::controller::{CommandSender, UiCommand};
 use x4kas_core::format::{format_duration, format_kas, format_number, now_ms};
 use x4kas_core::index::query::TxRow;
-use x4kas_core::labels::OnlineEntry;
 
 /// Rows of the transactions table before it scrolls.
 const TXS_HEIGHT: f32 = 260.0;
 /// Height of the cluster members and peel chain lists before they scroll.
 const LIST_HEIGHT: f32 = 120.0;
 
-/// The address card's rows: the address, its label (the user's over a public one,
-/// edited through the action bar's label dialog) and the online lookup.
-pub(super) fn header(
-    ui: &mut Ui,
-    app: &App,
-    addr: &str,
-    online_result: Option<&[OnlineEntry]>,
-    cmd_tx: &CommandSender,
-) {
+/// The address card's rows: the address and its label (the user's over a public one,
+/// edited through the action bar's label dialog).
+pub(super) fn header(ui: &mut Ui, app: &App, addr: &str) {
     kv_grid(ui, "address_header", |ui| {
         kv_with(ui, "Address", |ui| copy_value(ui, addr, "Copy address"));
         kv_with(ui, "Label", |ui| {
@@ -54,39 +47,6 @@ pub(super) fn header(
                 }
                 None => {
                     ui.label(RichText::new("none (Add label above)").weak());
-                }
-            }
-        });
-        kv_with(ui, "Online", |ui| {
-            // Right to left: the button, then what was learned.
-            let enabled = app.label_settings.any_enabled();
-            if ui
-                .add_enabled(enabled, egui::Button::new("Look up"))
-                .on_hover_text(if enabled {
-                    "Ask KNS for this address's .kas name (sends it the address)"
-                } else {
-                    "Enable KNS lookups first: x4kas-cli labels kns on"
-                })
-                .on_disabled_hover_text("Enable KNS lookups first: x4kas-cli labels kns on")
-                .clicked()
-            {
-                let _ = cmd_tx.send(UiCommand::LookupLabelOnline(addr.to_string()));
-            }
-            match online_result {
-                None => {
-                    ui.label(RichText::new("not asked").weak());
-                }
-                Some([]) => {
-                    ui.label(RichText::new("no online source enabled").weak());
-                }
-                Some(entries) => {
-                    for entry in entries {
-                        let text = match &entry.name {
-                            Some(name) => format!("{}: {name}", entry.source.label()),
-                            None => format!("{}: no label", entry.source.label()),
-                        };
-                        ui.label(RichText::new(text).color(theme::TEXT));
-                    }
                 }
             }
         });

@@ -63,10 +63,6 @@ pub enum UiCommand {
     },
     /// Fetch the public label list now.
     RefreshLabels,
-    /// Ask the enabled online sources (kas.fyi, KNS) about an address.
-    LookupLabelOnline(String),
-    /// Save the online label settings.
-    SetLabelSettings(labels::LabelSettings),
     /// Discard the index store (and with it the Dashboard's analytics) and rebuild it
     /// from the node, from scratch. Only with a direct node.
     Resync,
@@ -149,7 +145,6 @@ impl Controller {
             let mut app = self.app.write().await;
             app.watch.list = Watchlist::load().unwrap_or_default();
             app.labels = Arc::new(labels::LabelBook::load());
-            app.label_settings = labels::LabelSettings::load();
         }
         // Connect on startup if `--url` was given; otherwise wait for the user to pick.
         self.connect_remote().await;
@@ -168,8 +163,6 @@ impl Controller {
                 UiCommand::WatchSet(list) => self.set_watchlist(list).await,
                 UiCommand::SetLabel { address, name } => self.set_label(address, name).await,
                 UiCommand::RefreshLabels => self.refresh_labels(),
-                UiCommand::LookupLabelOnline(address) => self.lookup_label_online(address),
-                UiCommand::SetLabelSettings(settings) => self.set_label_settings(settings).await,
                 UiCommand::Resync => self.resync().await,
                 UiCommand::Shutdown(done) => {
                     self.stop_all().await;
@@ -452,7 +445,6 @@ impl Controller {
                         Ok(PageData::Address(AddressPageData {
                             view,
                             loading_more: false,
-                            online_result: None,
                             error: None,
                         }))
                     },
@@ -611,42 +603,6 @@ impl Controller {
             app.watch.status.last_error = Some(format!("save labels: {e}"));
         }
         app.labels = Arc::new(book);
-        app.mark_dirty();
-    }
-
-    fn lookup_label_online(&mut self, address: String) {
-        let app = self.app.clone();
-        self.polling.spawn_request(async move {
-            let settings = app.read().await.label_settings.clone();
-            let result = labels::lookup_online(&settings, &address).await;
-            let mut app = app.write().await;
-            match result {
-                Ok(entries) => {
-                    let mut book = (*app.labels).clone();
-                    for entry in &entries {
-                        book.apply_online(&address, entry);
-                    }
-                    app.labels = Arc::new(book);
-                    if let Some(page) = app.explorer.address_page_mut(&address) {
-                        page.online_result = Some(entries);
-                    }
-                }
-                Err(e) => {
-                    if let Some(page) = app.explorer.address_page_mut(&address) {
-                        page.error = Some(format!("online lookup: {e:#}"));
-                    }
-                }
-            }
-            app.mark_dirty();
-        });
-    }
-
-    async fn set_label_settings(&mut self, settings: labels::LabelSettings) {
-        let mut app = self.app.write().await;
-        if let Err(e) = settings.save() {
-            app.watch.status.last_error = Some(format!("save label settings: {e}"));
-        }
-        app.label_settings = settings;
         app.mark_dirty();
     }
 

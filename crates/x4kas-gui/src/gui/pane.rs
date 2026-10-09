@@ -267,7 +267,7 @@ impl InfoPane {
     }
 }
 
-/// The address page's cards: header (address, label, online lookup), the body's and,
+/// The address page's cards: header (address and label), the body's and,
 /// for a watched address, the watch card, as in the Explorer.
 fn address_page(
     ui: &mut Ui,
@@ -277,7 +277,7 @@ fn address_page(
     cmd_tx: &CommandSender,
 ) {
     card(ui, "Address", |ui| {
-        address::header(ui, app, addr, data.online_result.as_deref(), cmd_tx);
+        address::header(ui, app, addr);
         if let Some(error) = &data.error {
             ui.label(RichText::new(error).color(theme::ERROR));
         }

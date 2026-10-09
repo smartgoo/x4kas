@@ -120,7 +120,7 @@ impl ExplorerUi {
                         });
                 });
         }
-        actions::bar(ui, app, &page, cmd_tx);
+        actions::bar(ui, app, &page, cmd_tx, false);
         // One scroll position per page of each sub tab, so a page opens at its top and
         // comes back (through the history) where it was.
         let tab_id = app.explorer.active_tab().id;

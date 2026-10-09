@@ -21,8 +21,9 @@ use x4kas_core::format::{
 use x4kas_core::index::export::ExportFormat;
 
 /// Draw the bar for `page`, if it is a page with actions (an address, a block or a
-/// transaction), with a rule under it and the gap to the first card.
-pub fn bar(ui: &mut Ui, app: &mut App, page: &ExplorerPage, cmd_tx: &CommandSender) {
+/// transaction), with a rule under it and the gap to the first card. `compact` (the
+/// info pane) folds the web explorers into one "Open Explorer ▾" menu.
+pub fn bar(ui: &mut Ui, app: &mut App, page: &ExplorerPage, cmd_tx: &CommandSender, compact: bool) {
     let testnet = is_testnet(ui.ctx());
     // Kaspa Stream only covers mainnet.
     let (explorer, stream) = match page {
@@ -42,9 +43,18 @@ pub fn bar(ui: &mut Ui, app: &mut App, page: &ExplorerPage, cmd_tx: &CommandSend
     };
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 2.0;
-        link(ui, "Kaspa Explorer ↗", &explorer);
-        if let Some(stream) = stream {
-            link(ui, "Kaspa Stream ↗", &stream);
+        if compact {
+            MenuButton::from_button(action_button("Open Explorer ▾")).ui(ui, |ui| {
+                menu_link(ui, "Kaspa Explorer ↗", &explorer);
+                if let Some(stream) = &stream {
+                    menu_link(ui, "Kaspa Stream ↗", stream);
+                }
+            });
+        } else {
+            link(ui, "Kaspa Explorer ↗", &explorer);
+            if let Some(stream) = &stream {
+                link(ui, "Kaspa Stream ↗", stream);
+            }
         }
         if let ExplorerPage::Address(addr) = page {
             ui.separator();
@@ -133,6 +143,14 @@ fn address_actions(ui: &mut Ui, app: &mut App, addr: &str, cmd_tx: &CommandSende
 fn link(ui: &mut Ui, text: &str, url: &str) {
     if button(ui, text).on_hover_text(url).clicked() {
         ui.ctx().open_url(OpenUrl::new_tab(url));
+    }
+}
+
+/// [`link`] as a menu item.
+fn menu_link(ui: &mut Ui, text: &str, url: &str) {
+    if ui.button(text).on_hover_text(url).clicked() {
+        ui.ctx().open_url(OpenUrl::new_tab(url));
+        ui.close();
     }
 }
 

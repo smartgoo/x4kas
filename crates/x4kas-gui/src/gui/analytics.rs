@@ -555,6 +555,8 @@ const SPRING_OMEGA: f32 = 20.0;
 const MOMENTUM_STEPS: u8 = 2;
 /// A step this far under the pull's largest is momentum, however it got there.
 const MOMENTUM_FRACTION: f32 = 0.6;
+/// Steps further apart than this, in seconds, are separate gestures.
+const GESTURE_GAP: f64 = 0.25;
 
 /// A table's overscroll, between frames.
 #[derive(Clone, Copy, Default)]
@@ -573,8 +575,10 @@ struct Overscroll {
     /// Shrinking steps in a row.
     shrinking: u8,
     /// The steps are momentum: none holds the rows until one grows past the peak (a
-    /// push) or the rows have sprung back.
+    /// push) or the gesture ends (a pause in the steps, or the other direction).
     momentum: bool,
+    /// When the last step came, pulling or not.
+    last_step: f64,
     /// Last frame's body viewport, to catch scrolling back before the table does.
     viewport: Option<egui::Rect>,
 }
@@ -624,7 +628,14 @@ fn overscroll_unwind(ui: &Ui, id: egui::Id) {
         unwound
     };
     state.velocity = 0.0;
-    state.last_pull = ui.input(|i| i.time);
+    let now = ui.input(|i| i.time);
+    state.last_pull = now;
+    // Scrolling back is a gesture of its own.
+    state.last_step = now;
+    state.last_delta = delta;
+    state.peak_delta = 0.0;
+    state.shrinking = 0;
+    state.momentum = false;
     ui.ctx().input_mut(|i| i.smooth_scroll_delta.y = rest);
     ui.data_mut(|d| d.insert_temp(id, state));
 }
@@ -650,11 +661,16 @@ fn overscroll(ui: &Ui, id: egui::Id, output: &ScrollAreaOutput<()>) -> f32 {
         // pull's largest, is momentum, and it stays momentum until a step larger than
         // any before (a push) or the rows are back.
         if leftover != 0.0 {
-            if state.offset == 0.0 || leftover.signum() != state.offset.signum() {
+            // A new gesture: the steps paused, or changed direction. Not the rows
+            // coming to rest: momentum goes on after they do, and must not pull them
+            // down again (a double bounce).
+            if leftover.signum() != state.last_delta.signum() || now - state.last_step > GESTURE_GAP
+            {
                 state.peak_delta = 0.0;
                 state.shrinking = 0;
                 state.momentum = false;
             }
+            state.last_step = now;
             let size = leftover.abs();
             if size < state.last_delta.abs() {
                 state.shrinking += 1;
@@ -686,10 +702,9 @@ fn overscroll(ui: &Ui, id: egui::Id, output: &ScrollAreaOutput<()>) -> f32 {
         state.velocity += accel * dt;
         state.offset += state.velocity * dt;
         if state.offset.abs() < 0.1 && state.velocity.abs() < 5.0 {
-            state = Overscroll {
-                viewport: state.viewport,
-                ..Default::default()
-            };
+            // At rest; the gesture's memory stays, see `momentum`.
+            state.offset = 0.0;
+            state.velocity = 0.0;
         }
     }
     if state.offset != 0.0 {

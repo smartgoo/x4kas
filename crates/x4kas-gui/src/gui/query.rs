@@ -1497,7 +1497,7 @@ impl QueryTab {
             }
         }
         ui.horizontal(|ui| {
-            field_label(ui, "Order");
+            field_label(ui, "Sort");
             let mut remove = None;
             for o in &mut self.draft.order {
                 let current = options
@@ -1530,7 +1530,7 @@ impl QueryTab {
             }
             if self.draft.order.len() < MAX_ORDER
                 && let Some((target, _)) = options.first()
-                && ui.small_button("+ order").clicked()
+                && ui.small_button("+ sort").clicked()
             {
                 self.next_key += 1;
                 self.draft.order.push(OrderDraft {
@@ -2585,6 +2585,88 @@ fn cell_ui(ui: &mut Ui, cell: &Cell) {
     }
 }
 
+/// How a group combines its conditions, with its negation folded in.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GroupMode {
+    All,
+    Any,
+    None,
+    NotAll,
+}
+
+impl GroupMode {
+    const ALL: [Self; 4] = [Self::All, Self::Any, Self::None, Self::NotAll];
+
+    fn of(any: bool, not: bool) -> Self {
+        match (any, not) {
+            (false, false) => Self::All,
+            (true, false) => Self::Any,
+            (true, true) => Self::None,
+            (false, true) => Self::NotAll,
+        }
+    }
+
+    /// `(any, not)`.
+    fn flags(self) -> (bool, bool) {
+        match self {
+            Self::All => (false, false),
+            Self::Any => (true, false),
+            Self::None => (true, true),
+            Self::NotAll => (false, true),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "all of",
+            Self::Any => "any of",
+            Self::None => "none of",
+            Self::NotAll => "not all of",
+        }
+    }
+
+    fn doc(self) -> &'static str {
+        match self {
+            Self::All => "Every condition must hold (and)",
+            Self::Any => "At least one condition must hold (or)",
+            Self::None => "No condition may hold (not … or …)",
+            Self::NotAll => "At least one condition must fail (not … and …)",
+        }
+    }
+}
+
+/// The operators the row's combo offers for `kind`, as `(op, negated)`: every
+/// operator of the kind, plus the negation of those that have no opposite of their
+/// own (`!=` is `=`'s, `not in` is `in`'s, `is not null` is `is null`'s).
+fn op_entries(kind: FieldKind) -> Vec<(Op, bool)> {
+    let mut entries: Vec<(Op, bool)> = kind.operators().iter().map(|op| (*op, false)).collect();
+    for op in kind.operators() {
+        if matches!(op, Op::Contains | Op::StartsWith | Op::Between) {
+            entries.push((*op, true));
+        }
+    }
+    entries
+}
+
+/// The label of `op`, negated or not, as the row's combo shows it.
+fn op_label(op: Op, not: bool) -> String {
+    if !not {
+        return op.label().to_string();
+    }
+    match op {
+        Op::Eq => Op::Ne.label().to_string(),
+        Op::Ne => Op::Eq.label().to_string(),
+        Op::In => Op::NotIn.label().to_string(),
+        Op::NotIn => Op::In.label().to_string(),
+        Op::IsNull => Op::IsNotNull.label().to_string(),
+        Op::IsNotNull => Op::IsNull.label().to_string(),
+        Op::Contains => "doesn't contain".to_string(),
+        Op::StartsWith => "doesn't start with".to_string(),
+        Op::Between => "not between".to_string(),
+        other => format!("not {}", other.label()),
+    }
+}
+
 /// The builder's filter tree. Returns whether anything changed. `remove` is set to
 /// the group's key when its × is clicked (a nested group only).
 fn group_ui(
@@ -2614,35 +2696,20 @@ fn group_ui(
         if root {
             field_label(ui, "Where");
         }
-        if ui
-            .selectable_label(*not, "not")
-            .on_hover_text("Negate the group")
-            .clicked()
-        {
-            *not = !*not;
-            changed = true;
-        }
-        let current = if *any { "any of" } else { "all of" };
+        // How the group's conditions combine, negation included: "none of" is
+        // `not (a or b)`, "not all of" is `not (a and b)`.
+        let mut mode = GroupMode::of(*any, *not);
         ComboBox::from_id_salt(("qgroup", key))
-            .selected_text(current)
+            .selected_text(mode.label())
             .show_ui(ui, |ui| {
-                changed |= ui.selectable_value(any, false, "all of").changed();
-                changed |= ui.selectable_value(any, true, "any of").changed();
+                for candidate in GroupMode::ALL {
+                    changed |= ui
+                        .selectable_value(&mut mode, candidate, candidate.label())
+                        .on_hover_text(candidate.doc())
+                        .changed();
+                }
             });
-        if ui
-            .small_button("+ condition")
-            .on_hover_text("Add a condition to this group")
-            .clicked()
-        {
-            add_cond = true;
-        }
-        if ui
-            .small_button("+ group")
-            .on_hover_text("Add a nested group (any of / all of)")
-            .clicked()
-        {
-            add_group = true;
-        }
+        (*any, *not) = mode.flags();
         if children.is_empty() {
             ui.label(RichText::new("(every row)").weak());
         }
@@ -2666,6 +2733,22 @@ fn group_ui(
                 }
             }
         }
+        ui.horizontal(|ui| {
+            if ui
+                .small_button("+ condition")
+                .on_hover_text("Add a condition to this group")
+                .clicked()
+            {
+                add_cond = true;
+            }
+            if ui
+                .small_button("+ group")
+                .on_hover_text("Add a nested group (any of / all of / none of)")
+                .clicked()
+            {
+                add_group = true;
+            }
+        });
     });
     if let Some(k) = remove_child {
         children.retain(|c| c.key() != k);
@@ -2719,14 +2802,6 @@ fn condition_ui(ui: &mut Ui, node: &mut Node, entity: Entity, remove: &mut Optio
     let key = *key;
     let mut changed = false;
     ui.horizontal(|ui| {
-        if ui
-            .selectable_label(*not, "not")
-            .on_hover_text("Negate the condition")
-            .clicked()
-        {
-            *not = !*not;
-            changed = true;
-        }
         let before = *field;
         ComboBox::from_id_salt(("qfield", key))
             .selected_text(field.label())
@@ -2753,15 +2828,22 @@ fn condition_ui(ui: &mut Ui, node: &mut Node, entity: Entity, remove: &mut Optio
             }
         }
         let kind = field.kind();
+        // The operator, negation included: "doesn't contain" is `not (x contains v)`.
+        let mut choice = (*op, *not);
         ComboBox::from_id_salt(("qop", key))
-            .selected_text(op.label())
+            .selected_text(op_label(*op, *not))
             .show_ui(ui, |ui| {
-                for candidate in kind.operators() {
+                for candidate in op_entries(kind) {
                     changed |= ui
-                        .selectable_value(op, *candidate, candidate.label())
+                        .selectable_value(
+                            &mut choice,
+                            candidate,
+                            op_label(candidate.0, candidate.1),
+                        )
                         .changed();
                 }
             });
+        (*op, *not) = choice;
         let arity = op.arity();
         if arity != Arity::None {
             changed |= value_ui(ui, key, kind, arity, value, kas, search_open, 0);

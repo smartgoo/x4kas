@@ -1,8 +1,9 @@
 //! The action bar over an address, block or transaction page: a row of flat buttons,
 //! like an application's menu bar, at the top of the Explorer's page and of the info
 //! pane. An Open menu (the web explorers, an address's flow graph) first, then what
-//! an address can be given (its label and watchlist settings: dialogs, see
-//! `gui/dialogs.rs`) and its export, or a block's export. It needs only the page (not its data), so it is
+//! an address can be given (its label, and the watchlist until it is on it: dialogs,
+//! see `gui/dialogs.rs`), a watched address's Watchlist menu (settings, removal) and
+//! its export, or a block's export. It needs only the page (not its data), so it is
 //! there while the page loads or when it wasn't found.
 
 use eframe::egui::containers::menu::MenuButton;
@@ -91,11 +92,12 @@ pub fn bar(ui: &mut Ui, app: &mut App, page: &ExplorerPage, cmd_tx: &CommandSend
     ui.add_space(CARD_GAP);
 }
 
-/// The address's own actions: the Add/Edit menu (label, watchlist) and export. Their wording follows the address's state (a label to add or edit, a
-/// watchlist to join or settings to change).
+/// The address's own actions: the Add menu (a label; the watchlist while it isn't on
+/// it), the Watchlist menu once it is (its settings, removal) and export.
 fn address_actions(ui: &mut Ui, app: &mut App, addr: &str, cmd_tx: &CommandSender) {
-    // One menu for what the address can be given: a label and a watchlist entry. Its
-    // items say add or edit by what it has; the button says "Add…" until it has both.
+    // What the address can be given: a label, and a watchlist entry while it has none
+    // (once watched, the Watchlist menu takes over). The items say add or edit by what
+    // it has; the button says "Add…" until everything in it is an edit.
     let labelled = app.labels.user_labels().contains_key(addr);
     let watched = app.watch.entry(addr).is_some();
     let menu = if labelled && watched {
@@ -104,16 +106,6 @@ fn address_actions(ui: &mut Ui, app: &mut App, addr: &str, cmd_tx: &CommandSende
         "Add ▾"
     };
     let label = if labelled { "Edit label" } else { "Add label" };
-    let watch = if watched {
-        "Watch settings"
-    } else {
-        "Add to watchlist"
-    };
-    let watch_hint = if watched {
-        "Alerts on or off, the rules, or remove it from the watchlist"
-    } else {
-        "Follow its balance and get alerts on activity"
-    };
     let (response, _) = MenuButton::from_button(action_button(menu)).ui(ui, |ui| {
         if ui
             .button(label)
@@ -123,12 +115,49 @@ fn address_actions(ui: &mut Ui, app: &mut App, addr: &str, cmd_tx: &CommandSende
             dialogs::request_label(ui.ctx(), addr);
             ui.close();
         }
-        if ui.button(watch).on_hover_text(watch_hint).clicked() {
+        if !watched
+            && ui
+                .button("Add to watchlist")
+                .on_hover_text("Follow its balance and get alerts on activity")
+                .clicked()
+        {
             dialogs::request_watch(ui.ctx(), addr);
             ui.close();
         }
     });
-    response.on_hover_text("A label of your own, or a place on the watchlist");
+    response.on_hover_text(if watched {
+        "A label of your own"
+    } else {
+        "A label of your own, or a place on the watchlist"
+    });
+    if watched {
+        ui.separator();
+        let mut remove = false;
+        let (response, _) = MenuButton::from_button(action_button("Watchlist ▾")).ui(ui, |ui| {
+            if ui
+                .button("Edit settings")
+                .on_hover_text("Alerts on or off, and the rules that raise them")
+                .clicked()
+            {
+                dialogs::request_watch(ui.ctx(), addr);
+                ui.close();
+            }
+            if ui
+                .button("Remove")
+                .on_hover_text("Stop following this address; its events stay listed")
+                .clicked()
+            {
+                remove = true;
+                ui.close();
+            }
+        });
+        response.on_hover_text("This address is on the watchlist");
+        if remove {
+            let mut list = app.watch.list.clone();
+            list.entries.retain(|e| e.address != addr);
+            let _ = cmd_tx.send(UiCommand::WatchSet(list));
+        }
+    }
     ui.separator();
     // Export needs the page: its transactions come from the index, so there is
     // nothing to export until it is loaded with some.

@@ -81,6 +81,9 @@ pub fn run(rt: &tokio::runtime::Runtime, args: Args) -> Result<()> {
     };
 
     let options = eframe::NativeOptions {
+        // Window geometry and egui's own memory (panel sizes) persist here, next to the
+        // app's other files, with the preferences `GuiApp::save` keeps.
+        persistence_path: Some(x4kas_core::config::data_dir().join("gui.ron")),
         viewport: egui::ViewportBuilder::default()
             .with_title("x4kas")
             .with_inner_size([1280.0, 820.0])
@@ -104,7 +107,7 @@ pub fn run(rt: &tokio::runtime::Runtime, args: Args) -> Result<()> {
             theme::apply(&cc.egui_ctx);
             let ctx = cc.egui_ctx.clone();
             app.blocking_write().repaint = Some(Arc::new(move || ctx.request_repaint()));
-            Ok(Box::new(GuiApp::new(app, cmd_tx, connection)))
+            Ok(Box::new(GuiApp::new(app, cmd_tx, connection, cc.storage)))
         }),
     )
     .map_err(|e| anyhow::anyhow!("GUI error: {e}"))
@@ -123,6 +126,17 @@ enum EscTarget {
 
 /// How long the shutdown waits before offering to quit without finishing.
 const SHUTDOWN_PATIENCE: Duration = Duration::from_secs(5);
+
+/// What the GUI remembers between launches, beyond what eframe keeps by itself (the
+/// window's size and position, panel sizes). Saved through `eframe::App::save`.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct Prefs {
+    active_tab: Tab,
+    /// The analytics cards' time windows, by `AnalyticsPanel`.
+    windows: Option<[x4kas_core::app::TimeWindow; 6]>,
+}
+
+const PREFS_KEY: &str = "prefs";
 
 struct GuiApp {
     app: Arc<RwLock<App>>,
@@ -147,7 +161,19 @@ struct GuiApp {
 }
 
 impl GuiApp {
-    fn new(app: Arc<RwLock<App>>, cmd_tx: CommandSender, connection: ConnectionWindow) -> Self {
+    fn new(
+        app: Arc<RwLock<App>>,
+        cmd_tx: CommandSender,
+        connection: ConnectionWindow,
+        storage: Option<&dyn eframe::Storage>,
+    ) -> Self {
+        if let Some(prefs) = storage.and_then(|s| eframe::get_value::<Prefs>(s, PREFS_KEY)) {
+            let mut state = app.blocking_write();
+            state.active_tab = prefs.active_tab;
+            if let Some(windows) = prefs.windows {
+                state.analytics.windows = windows;
+            }
+        }
         Self {
             app,
             cmd_tx,
@@ -232,6 +258,21 @@ impl eframe::App for GuiApp {
     /// Opaque: the window is transparent only to lose macOS's frame highlight.
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         theme::BG.to_normalized_gamma_f32()
+    }
+
+    /// Called by eframe every `auto_save_interval` and on exit.
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        // `try_write`: the frame loop holds the lock while drawing, but `save` runs
+        // between frames on the same thread, so this only fails if a background task
+        // has it; then this save is skipped and the next one catches up.
+        let Ok(app) = self.app.try_write() else {
+            return;
+        };
+        let prefs = Prefs {
+            active_tab: app.active_tab,
+            windows: Some(app.analytics.windows),
+        };
+        eframe::set_value(storage, PREFS_KEY, &prefs);
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {

@@ -32,7 +32,7 @@ async-channel = "2"
 indexmap = { version = "2", features = ["serde"] }
 fjall = "3"
 tempfile = "3"
-eframe = "0.33"
+eframe = { version = "0.33", features = ["persistence"] }
 egui_extras = "0.33"
 # Integrated terminal widget, vendored with patches (see vendor/egui_term/Cargo.toml).
 egui_term = { path = "vendor/egui_term" }

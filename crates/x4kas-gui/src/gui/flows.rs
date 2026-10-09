@@ -101,6 +101,7 @@ impl FlowWindowUi {
             None => "Flows".to_string(),
         };
         let window = egui::Window::new(title)
+            .id(egui::Id::new("flows_window"))
             .default_size([900.0, 620.0])
             .resizable(true);
         let open = modal_window(ctx, window, close, |ui| self.contents(ui, app, cmd_tx));

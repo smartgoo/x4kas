@@ -140,6 +140,7 @@ impl LabelDialog {
             "Add label"
         };
         let window = egui::Window::new(title)
+            .id(egui::Id::new("label_dialog"))
             .resizable(false)
             .default_width(420.0);
         let mut done = false;
@@ -261,6 +262,7 @@ impl WatchDialog {
             format!("Add to watchlist · {}", shorten_middle(&self.address, 20))
         };
         let window = egui::Window::new(title)
+            .id(egui::Id::new("watch_dialog"))
             .resizable(false)
             .default_width(460.0);
         let mut done = false;

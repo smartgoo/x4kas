@@ -338,6 +338,21 @@ pub fn modal_window(
     open && !close
 }
 
+/// A label that is green or red when `text` is a signed amount (a `+` or `-` before a
+/// digit, e.g. `+12.50`), else the default color: balance changes read at a glance.
+pub fn signed_label(ui: &mut Ui, text: &str) {
+    let mut chars = text.chars();
+    let color = match (chars.next(), chars.next()) {
+        (Some('+'), Some(c)) if c.is_ascii_digit() => Some(theme::OK),
+        (Some('-'), Some(c)) if c.is_ascii_digit() => Some(theme::ERROR),
+        _ => None,
+    };
+    match color {
+        Some(color) => ui.label(RichText::new(text).color(color)),
+        None => ui.label(text),
+    };
+}
+
 /// `value` formatted with `f`, or an em dash when there is none.
 pub fn or_dash<T>(value: Option<T>, f: impl FnOnce(T) -> String) -> String {
     value.map_or_else(|| "—".to_string(), f)

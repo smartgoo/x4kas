@@ -7,7 +7,7 @@ use egui_extras::{Column, TableBuilder};
 use super::theme;
 use super::widgets::{
     address, card_with_header, direct_node_placeholder, fit_label, kv, kv_columns, kv_grid,
-    kv_with, or_dash, placeholder, request_address, section_title, subheader,
+    kv_with, or_dash, placeholder, request_address, section_title, signed_label, subheader,
 };
 use x4kas_core::analytics::{AggregatedView, InspectionCounts, ScriptClassCounts};
 use x4kas_core::app::{AnalyticsPanel, App, ChainPhase, TimeWindow};
@@ -394,7 +394,8 @@ pub(super) fn addresses(ui: &mut Ui, app: &App, entries: Option<&[(String, u64)]
 
 /// Full-width table: the first column takes the remaining width and is drawn by
 /// `first_cell`, which fits it to that width (e.g. [`fit_label`], [`address`]). The other
-/// columns are right-aligned, so values sit against the right edge of the card. The body
+/// columns are right-aligned, so values sit against the right edge of the card, and a
+/// signed amount among them is green or red ([`signed_label`]). The body
 /// is always [`TABLE_HEIGHT`] tall (scrolling beyond), with `empty` in its first row
 /// while there are no rows, so the card keeps its size as rows arrive.
 pub fn wide_table<const N: usize>(
@@ -508,9 +509,7 @@ pub fn wide_table_with_lead<const N: usize>(
                             lead(ui, index);
                             first_cell(ui, cell);
                         } else {
-                            right_after_first(ui, i, |ui| {
-                                ui.label(cell);
-                            });
+                            right_after_first(ui, i, |ui| signed_label(ui, cell));
                         }
                     });
                 }

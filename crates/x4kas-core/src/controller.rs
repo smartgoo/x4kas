@@ -11,7 +11,7 @@ use anyhow::{Result, anyhow};
 use tokio::sync::{RwLock, mpsc, oneshot};
 
 use crate::analytics;
-use crate::app::{ActiveConnection, AddressView, App, ChainPhase, ConnectionStatus};
+use crate::app::{ActiveConnection, AddressView, App, ChainPhase, ConnectionStatus, ExportOrigin};
 use crate::chain_stream::{self, StreamStart};
 use crate::explorer::{self, AddressPageData, BlockView, ExplorerPage, PageData, TxView};
 use crate::index::export::{self, ExportFormat};
@@ -157,7 +157,9 @@ impl Controller {
                 UiCommand::Connect(target) => self.connect(target).await,
                 UiCommand::Disconnect => self.disconnect().await,
                 UiCommand::ExecuteRpc { method, args } => self.execute_rpc(method, args),
-                UiCommand::AddressPage { address, before } => self.address_page(address, before),
+                UiCommand::AddressPage { address, before } => {
+                    self.address_page(address, before).await
+                }
                 UiCommand::ExplorerLoad(page) => self.explorer_load(page).await,
                 UiCommand::AddressFlows { address, hops } => self.address_flows(address, hops),
                 UiCommand::Export(request) => self.export(request).await,
@@ -372,9 +374,19 @@ impl Controller {
         );
     }
 
-    fn address_page(&mut self, address: String, before: Cursor) {
+    async fn address_page(&mut self, address: String, before: Cursor) {
         let store = self.index.clone();
         let key = address.clone();
+        {
+            // One page at a time: the button shows a spinner meanwhile.
+            let mut app = self.app.write().await;
+            match app.explorer.address_page_mut(&key) {
+                Some(data) if data.loading_more => return,
+                Some(data) => data.loading_more = true,
+                None => return,
+            }
+            app.mark_dirty();
+        }
         self.spawn_rpc(
             move |_rpc| async move {
                 let store = store.ok_or_else(|| anyhow!("no address index"))?;
@@ -393,8 +405,21 @@ impl Controller {
                     data.loading_more = false;
                     match result {
                         Ok(page) => {
-                            data.view.page.items.extend(page.items);
+                            // A page asked for twice (the same cursor) must not
+                            // double its rows.
+                            let have: std::collections::HashSet<String> = data
+                                .view
+                                .page
+                                .items
+                                .iter()
+                                .map(|t| t.txid.clone())
+                                .collect();
+                            data.view
+                                .page
+                                .items
+                                .extend(page.items.into_iter().filter(|t| !have.contains(&t.txid)));
                             data.view.page.next = page.next;
+                            data.error = None;
                         }
                         Err(e) => data.error = Some(e),
                     }
@@ -497,9 +522,13 @@ impl Controller {
     /// Write the export in a blocking task (the store and the disk are synchronous).
     async fn export(&mut self, request: ExportRequest) {
         let store = self.index.clone();
+        let origin = match &request {
+            ExportRequest::Transactions { address, .. } => ExportOrigin::Address(address.clone()),
+            ExportRequest::Flows { .. } => ExportOrigin::Flows,
+        };
         let labels = {
             let mut app = self.app.write().await;
-            app.address.export.start();
+            app.address.export.start(origin);
             app.mark_dirty();
             app.labels.clone()
         };

@@ -10,11 +10,11 @@ use egui_extras::Column;
 use super::monitoring::network;
 use super::theme;
 use super::widgets::{
-    CARD_GAP, address, block_hash, card, card_with_header, copy_value, is_testnet, kv, kv_columns,
-    kv_grid, kv_with, link_table, or_dash, page_table, placeholder, primary_button, subheader,
-    table_header, table_row_height, transaction_id, weighted_columns,
+    CARD_GAP, address, block_hash, card, card_with_header, copy_value, kv, kv_columns, kv_grid,
+    kv_with, link_table, or_dash, page_table, placeholder, primary_button, subheader, table_header,
+    table_row_height, transaction_id, weighted_columns,
 };
-use x4kas_core::app::{AddressView, App, ExportStatus};
+use x4kas_core::app::{AddressView, App, ExportOrigin, ExportStatus};
 use x4kas_core::controller::{CommandSender, ExportRequest, UiCommand};
 use x4kas_core::format::{
     explorer_address_url, format_duration, format_kas, format_number, kaspa_stream_address_url,
@@ -96,7 +96,6 @@ impl AddressForms {
         cmd_tx: &CommandSender,
     ) {
         let label = &mut self.label;
-        let _ = is_testnet(ui.ctx());
         kv_grid(ui, "address_header", |ui| {
             kv_with(ui, "Address", |ui| copy_value(ui, addr, "Copy address"));
             kv_with(ui, "View on", |ui| {
@@ -139,17 +138,19 @@ impl AddressForms {
             });
             kv_with(ui, "Label", |ui| {
                 // Right to left: the button, then the field, then the known label.
-                if ui.button("Save").clicked() {
+                let save = ui.button("Save").on_hover_text("Save (Enter)").clicked();
+                let field = ui.add(
+                    TextEdit::singleline(label)
+                        .hint_text("your label")
+                        .desired_width(180.0),
+                );
+                let entered = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if save || entered {
                     let _ = cmd_tx.send(UiCommand::SetLabel {
                         address: addr.to_string(),
                         name: Some(label.clone()).filter(|l| !l.trim().is_empty()),
                     });
                 }
-                ui.add(
-                    TextEdit::singleline(label)
-                        .hint_text("your label")
-                        .desired_width(180.0),
-                );
                 if let Some(known) = app.labels.get(addr) {
                     if let Some(link) = &known.link {
                         ui.hyperlink_to("↗", link).on_hover_text(link);
@@ -185,41 +186,72 @@ impl AddressForms {
                 let _ = cmd_tx.send(UiCommand::WatchSet(list));
             }
         });
+        // A threshold field saves when left (Enter, Tab, a click elsewhere) if its value
+        // changed; Esc puts the saved value back. Text that isn't a number is marked
+        // and saved as no threshold.
+        let mut reverted = false;
         if watched {
             ui.horizontal_wrapped(|ui| {
                 changed |= ui
                     .checkbox(&mut self.watch.rules.any_activity, "Any activity")
                     .changed();
-                for (label, field, hint) in [
-                    ("Received ≥", &mut self.received_min, "KAS"),
-                    ("Sent ≥", &mut self.sent_min, "KAS"),
-                    ("Balance <", &mut self.balance_below, "KAS"),
-                    ("Balance >", &mut self.balance_above, "KAS"),
-                    ("Active after ≥", &mut self.idle_hours, "hours idle"),
+                for (label, field, hint, is_hours) in [
+                    ("Received ≥", &mut self.received_min, "KAS", false),
+                    ("Sent ≥", &mut self.sent_min, "KAS", false),
+                    ("Balance <", &mut self.balance_below, "KAS", false),
+                    ("Balance >", &mut self.balance_above, "KAS", false),
+                    ("Active after ≥", &mut self.idle_hours, "hours idle", true),
                 ] {
                     ui.label(RichText::new(label).color(theme::LABEL));
-                    if ui
-                        .add(
-                            TextEdit::singleline(field)
-                                .hint_text(hint)
-                                .desired_width(90.0),
-                        )
-                        .lost_focus()
-                    {
-                        changed = true;
+                    let invalid = !field.trim().is_empty()
+                        && if is_hours {
+                            parse_hours(field).is_none()
+                        } else {
+                            parse_kas(field).is_none()
+                        };
+                    let mut edit = TextEdit::singleline(field)
+                        .hint_text(hint)
+                        .desired_width(90.0);
+                    if invalid {
+                        edit = edit.text_color(theme::ERROR);
+                    }
+                    let response = ui.add(edit);
+                    let response = if invalid {
+                        response.on_hover_text("Not a number; no threshold is set")
+                    } else {
+                        response
+                    };
+                    if response.lost_focus() {
+                        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                            reverted = true;
+                        } else {
+                            changed = true;
+                        }
                     }
                 }
             });
         }
+        if reverted {
+            self.fill(app, addr);
+            return;
+        }
         if changed {
-            self.watch.rules = AlertRules {
+            let rules = AlertRules {
                 any_activity: self.watch.rules.any_activity,
                 received_min: parse_kas(&self.received_min),
                 sent_min: parse_kas(&self.sent_min),
                 balance_below: parse_kas(&self.balance_below),
                 balance_above: parse_kas(&self.balance_above),
-                idle_hours: self.idle_hours.trim().parse().ok().filter(|h| *h > 0),
+                idle_hours: parse_hours(&self.idle_hours),
             };
+            // Leaving a field without changing anything (tabbing through) is no save:
+            // every save restarts the watch task.
+            let saved = app.watch.entry(addr);
+            let same = saved.is_some_and(|e| e.rules == rules && e.enabled == self.watch.enabled);
+            if same {
+                return;
+            }
+            self.watch.rules = rules;
             let mut list = app.watch.list.clone();
             match list.entries.iter_mut().find(|e| e.address == addr) {
                 Some(entry) => *entry = self.watch.clone(),
@@ -228,6 +260,11 @@ impl AddressForms {
             let _ = cmd_tx.send(UiCommand::WatchSet(list));
         }
     }
+}
+
+/// Hours as typed; empty, zero or invalid is no threshold.
+fn parse_hours(s: &str) -> Option<u32> {
+    s.trim().parse().ok().filter(|h| *h > 0)
 }
 
 /// The cards below the header for a loaded address: summary, balance history,
@@ -264,7 +301,9 @@ pub(super) fn body(
             |ui, _| export_buttons(ui, addr, view, cmd_tx),
             |ui, _| {
                 transactions(ui, addr, view, loading_more, cmd_tx);
-                export_status(ui, &app.address.export);
+                if let Some(status) = app.address.export.of(&ExportOrigin::Address(addr.into())) {
+                    export_status(ui, status);
+                }
             },
         );
         card_with_header(

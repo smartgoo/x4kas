@@ -10,7 +10,7 @@ use eframe::egui::{self, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2, pos2, ve
 use super::address::export_status;
 use super::theme;
 use super::widgets::{address, modal_window, placeholder, request_address};
-use x4kas_core::app::App;
+use x4kas_core::app::{App, ExportOrigin};
 use x4kas_core::controller::{CommandSender, ExportRequest, UiCommand};
 use x4kas_core::format::{format_kas, shorten_middle};
 use x4kas_core::index::export::ExportFormat;
@@ -106,7 +106,9 @@ impl FlowWindowUi {
         if let Some(ref err) = flows.error {
             ui.label(RichText::new(err).color(theme::ERROR));
         }
-        export_status(ui, &app.address.export);
+        if let Some(status) = app.address.export.of(&ExportOrigin::Flows) {
+            export_status(ui, status);
+        }
         let flows = &mut app.address.flows;
         flows.collapse = collapse;
         if flows.shown().nodes.is_empty() {

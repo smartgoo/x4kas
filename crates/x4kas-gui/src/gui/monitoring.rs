@@ -13,8 +13,8 @@ use super::widgets::{
 };
 use x4kas_core::app::{App, WatchPhase};
 use x4kas_core::controller::{CommandSender, UiCommand};
-use x4kas_core::format::{format_duration, format_kas};
-use x4kas_core::watch::{EventKind, WatchEntry};
+use x4kas_core::format::{format_duration, format_kas, shorten_middle};
+use x4kas_core::watch::{EventKind, WatchEntry, validate_address};
 
 const DAY_MS: u64 = 24 * 3_600_000;
 /// Watchlist | Activity, half and half.
@@ -22,12 +22,17 @@ const PANE_WEIGHTS: [f32; 2] = [1.0, 1.0];
 /// Narrowest a pane gets before the panes stack.
 const PANE_MIN: f32 = 480.0;
 
+/// How long a notice under the add field stays.
+const NOTICE_SECS: f64 = 4.0;
+
 /// The tab's own state: the add/search field.
 #[derive(Default)]
 pub struct MonitoringTab {
     input: String,
     /// The label matches popup is showing under the field.
     search_open: bool,
+    /// Feedback under the field (added, already watched, invalid) and when it was set.
+    notice: Option<(String, bool, f64)>,
 }
 
 impl MonitoringTab {
@@ -84,22 +89,55 @@ impl MonitoringTab {
             }
             submitted = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             let is_address = looks_like_address(&self.input);
+            let validity = is_address.then(|| validate_address(&self.input, &network));
+            let valid = matches!(validity, Some(Ok(())));
+            let watched = valid
+                && app
+                    .watch
+                    .list
+                    .entries
+                    .iter()
+                    .any(|e| e.address == self.input.trim() && e.network == network);
+            // Enter adds (as the hint under the table says), or shows an address that is
+            // already watched.
             if ui
-                .add_enabled(is_address, primary_button("Watch"))
-                .on_hover_text("Add to the watchlist")
+                .add_enabled(valid && !watched, primary_button("Watch"))
+                .on_hover_text("Add to the watchlist (Enter)")
+                .on_disabled_hover_text(match validity {
+                    Some(Err(ref why)) => why.as_str(),
+                    _ if watched => "Already on the watchlist",
+                    _ => "Paste a Kaspa address",
+                })
                 .clicked()
+                || (submitted && valid && !watched)
             {
-                self.add(app, cmd_tx, &network);
+                self.add(ui.ctx(), app, cmd_tx, &network);
             }
             if ui
-                .add_enabled(is_address, egui::Button::new("Info"))
+                .add_enabled(valid, egui::Button::new("Info"))
                 .on_hover_text("Show address info")
                 .clicked()
-                || (submitted && is_address)
+                || (submitted && watched)
             {
                 request_address(ui.ctx(), self.input.trim());
             }
+            if let Some(Err(why)) = validity
+                && submitted
+            {
+                self.notice = Some((why, true, ui.input(|i| i.time)));
+            }
         });
+        if let Some((text, is_error, since)) = self.notice.clone() {
+            let now = ui.input(|i| i.time);
+            if now - since > NOTICE_SECS {
+                self.notice = None;
+            } else {
+                let color = if is_error { theme::ERROR } else { theme::OK };
+                ui.label(RichText::new(text).color(color));
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_secs_f64(NOTICE_SECS));
+            }
+        }
         // Label matches, when the field isn't an address.
         if let Some(field) = field
             && !looks_like_address(&self.input)
@@ -162,6 +200,7 @@ impl MonitoringTab {
             rows,
             "No watched addresses yet. Paste one above and press Watch.",
             address,
+            Some(request_address),
             |_, _| {},
             height,
         );
@@ -173,19 +212,27 @@ impl MonitoringTab {
         );
     }
 
-    fn add(&mut self, app: &mut App, cmd_tx: &CommandSender, network: &str) {
+    fn add(&mut self, ctx: &egui::Context, app: &mut App, cmd_tx: &CommandSender, network: &str) {
         let addr = self.input.trim();
         if addr.is_empty() {
             return;
         }
+        let now = ctx.input(|i| i.time);
         let mut list = app.watch.list.clone();
-        if !list
+        if list
             .entries
             .iter()
             .any(|e| e.address == addr && e.network == network)
         {
+            self.notice = Some(("Already on the watchlist".to_string(), false, now));
+        } else {
             list.entries.push(WatchEntry::new(addr, network));
             let _ = cmd_tx.send(UiCommand::WatchSet(list));
+            self.notice = Some((
+                format!("Added {} to the watchlist", shorten_middle(addr, 20)),
+                false,
+                now,
+            ));
         }
         self.input.clear();
     }
@@ -200,6 +247,8 @@ pub fn network(app: &App) -> String {
         .unwrap_or_else(|| "mainnet".to_string())
 }
 
+/// Whether `s` is shaped like an address rather than a label search; whether it is one
+/// is `watch::validate_address`'s call.
 pub fn looks_like_address(s: &str) -> bool {
     let s = s.trim();
     s.contains(':') && s.len() > 40 && !s.contains(' ')
@@ -316,6 +365,7 @@ fn activity(ui: &mut Ui, app: &mut App, fill: bool) {
         rows,
         "No confirmed activity yet",
         address,
+        Some(request_address),
         |ui, index| {
             if alert_dot(ui, dots[index].as_ref()) {
                 toggled.push(index);

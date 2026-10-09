@@ -5,11 +5,13 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
 use kaspa_rpc_core::{RpcAddress, UtxosChangedNotification};
+use kaspa_wrpc_client::prelude::NetworkId;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{RwLock, mpsc};
 
@@ -448,9 +450,47 @@ async fn set_phase(app: &RwLock<App>, phase: WatchPhase) {
     }
 }
 
+/// Why `s` can't be watched (or labelled) on `network`, if it can't: it must parse
+/// as a Kaspa address, and its prefix must be the network's (`kaspa:` on mainnet,
+/// `kaspatest:` on a testnet).
+pub fn validate_address(s: &str, network: &str) -> Result<(), String> {
+    let s = s.trim();
+    let address = RpcAddress::try_from(s).map_err(|_| "Not a valid Kaspa address".to_string())?;
+    let expected = NetworkId::from_str(network)
+        .ok()
+        .map(kaspa_addresses::Prefix::from);
+    match expected {
+        Some(prefix) if prefix != address.prefix => Err(format!(
+            "A {} address, but the connection is {network}",
+            address.prefix
+        )),
+        _ => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn address_validation() {
+        let main = "kaspa:qpzpfwcsqsxhxwup26r55fd0ghqlhyugz8cp6y3wxuddc02vcxtjg75pspnwz";
+        assert!(validate_address(main, "mainnet").is_ok());
+        assert!(validate_address(&format!("  {main} "), "mainnet").is_ok());
+        assert!(
+            validate_address(main, "testnet-10")
+                .unwrap_err()
+                .contains("kaspa address")
+        );
+        assert!(
+            validate_address("kaspa:notanaddress", "mainnet")
+                .unwrap_err()
+                .contains("Not a valid")
+        );
+        assert!(validate_address("", "mainnet").is_err());
+        // An unknown network name only checks the address itself.
+        assert!(validate_address(main, "somenet").is_ok());
+    }
 
     fn event(kind: EventKind, amount: u64, after: Option<u64>) -> AddressEvent {
         AddressEvent {

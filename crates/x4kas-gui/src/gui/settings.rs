@@ -6,7 +6,7 @@
 use eframe::egui::{self, RichText, TextEdit, Ui};
 use egui_extras::{Column, TableBuilder};
 
-use super::monitoring::looks_like_address;
+use super::monitoring::network;
 use super::theme;
 use super::widgets::{
     CARD_GAP, address_bare, card, card_with_header, edit_label_cell, kv_grid, kv_with, label_cell,
@@ -16,6 +16,7 @@ use x4kas_core::app::App;
 use x4kas_core::controller::{CommandSender, UiCommand};
 use x4kas_core::format::{format_duration, format_number};
 use x4kas_core::labels::LabelSource;
+use x4kas_core::watch::validate_address;
 
 /// Width of the section navigation.
 const NAV_WIDTH: f32 = 170.0;
@@ -48,7 +49,13 @@ pub struct SettingsPage {
     new_name: String,
     /// Narrows the user's labels table.
     filter: String,
+    /// The address whose 🗑 was clicked once, and when: a second click within
+    /// `CONFIRM_SECS` deletes.
+    confirm_delete: Option<(String, f64)>,
 }
+
+/// How long a first click on 🗑 waits for the confirming second one.
+const CONFIRM_SECS: f64 = 3.0;
 
 impl SettingsPage {
     pub fn toggle(&mut self) {
@@ -170,10 +177,20 @@ impl SettingsPage {
                     .desired_width(200.0),
             );
             let submitted = name.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            let valid = looks_like_address(&self.new_address) && !self.new_name.trim().is_empty();
+            let problem = if self.new_address.trim().is_empty() {
+                Some("Paste an address".to_string())
+            } else {
+                match validate_address(&self.new_address, &network(app)) {
+                    Ok(()) if self.new_name.trim().is_empty() => Some("Enter a label".to_string()),
+                    Ok(()) => None,
+                    Err(why) => Some(why),
+                }
+            };
+            let valid = problem.is_none();
             if ui
                 .add_enabled(valid, primary_button("Add"))
                 .on_hover_text("Save this label; it shows over any public one")
+                .on_disabled_hover_text(problem.as_deref().unwrap_or_default())
                 .clicked()
                 || (submitted && valid)
             {
@@ -221,7 +238,7 @@ impl SettingsPage {
                 },
             );
         } else {
-            labels_table(ui, &rows);
+            labels_table(ui, &rows, &mut self.confirm_delete);
         }
     }
 }
@@ -249,7 +266,7 @@ fn source_name(source: LabelSource) -> &'static str {
 
 /// Every known label: the chip (click to edit), the address, the source, and edit and
 /// delete buttons.
-fn labels_table(ui: &mut Ui, rows: &[LabelRow]) {
+fn labels_table(ui: &mut Ui, rows: &[LabelRow], confirm_delete: &mut Option<(String, f64)>) {
     ui.push_id("known_labels", |ui| {
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
         // A solid scroll bar beside the rows: the default floating one lies over the
@@ -289,15 +306,39 @@ fn labels_table(ui: &mut Ui, rows: &[LabelRow]) {
                         {
                             edit_label_cell(ui.ctx(), &r.address);
                         }
+                        // Deleting takes two clicks: the first turns the button into
+                        // a red "Delete?" for a moment.
+                        let now = ui.input(|i| i.time);
+                        let armed = confirm_delete
+                            .as_ref()
+                            .is_some_and(|(a, at)| *a == r.address && now - at < CONFIRM_SECS);
+                        let button = if armed {
+                            egui::Button::new(RichText::new("Delete?").color(theme::ERROR)).small()
+                        } else {
+                            egui::Button::new("🗑").small()
+                        };
                         if ui
-                            .add_enabled(r.manual, egui::Button::new("🗑").small())
-                            .on_hover_text("Delete this label")
+                            .add_enabled(r.manual, button)
+                            .on_hover_text(if armed {
+                                "Click again to delete this label"
+                            } else {
+                                "Delete this label"
+                            })
                             .on_disabled_hover_text(
                                 "Public labels come from api.kaspa.org; edit one to override it",
                             )
                             .clicked()
                         {
-                            request_label(ui.ctx(), &r.address, None);
+                            if armed {
+                                request_label(ui.ctx(), &r.address, None);
+                                *confirm_delete = None;
+                            } else {
+                                *confirm_delete = Some((r.address.clone(), now));
+                                ui.ctx()
+                                    .request_repaint_after(std::time::Duration::from_secs_f64(
+                                        CONFIRM_SECS,
+                                    ));
+                            }
                         }
                     });
                 });

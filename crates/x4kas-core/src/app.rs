@@ -739,18 +739,34 @@ impl FlowState {
     }
 }
 
+/// Where an export was asked for, so its outcome shows there and nowhere else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExportOrigin {
+    /// The transactions table of this address's page.
+    Address(String),
+    /// The flow graph window.
+    Flows,
+}
+
 /// The last export (`UiCommand::Export`) from an address's page or the flow graph window.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ExportStatus {
     pub running: bool,
+    pub origin: Option<ExportOrigin>,
     /// The file written, or why not.
     pub last: Option<Result<PathBuf, String>>,
 }
 
 impl ExportStatus {
-    pub fn start(&mut self) {
+    pub fn start(&mut self, origin: ExportOrigin) {
         self.running = true;
+        self.origin = Some(origin);
         self.last = None;
+    }
+
+    /// This status, if it is `origin`'s.
+    pub fn of(&self, origin: &ExportOrigin) -> Option<&Self> {
+        (self.origin.as_ref() == Some(origin)).then_some(self)
     }
 
     pub fn finish(&mut self, result: Result<PathBuf, String>) {

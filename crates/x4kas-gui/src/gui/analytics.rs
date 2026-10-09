@@ -7,7 +7,7 @@ use egui_extras::{Column, TableBuilder};
 use super::theme;
 use super::widgets::{
     address, card_with_header, direct_node_placeholder, fit_label, kv, kv_columns, kv_grid,
-    kv_with, or_dash, placeholder, section_title, subheader,
+    kv_with, or_dash, placeholder, request_address, section_title, subheader,
 };
 use x4kas_core::analytics::{AggregatedView, InspectionCounts, ScriptClassCounts};
 use x4kas_core::app::{AnalyticsPanel, App, ChainPhase, TimeWindow};
@@ -355,6 +355,7 @@ pub(super) fn node_versions(ui: &mut Ui, app: &App, view: Option<&AggregatedView
         |ui, v| {
             fit_label(ui, v);
         },
+        None,
     );
     ui.add_space(2.0);
     let footnote = match view {
@@ -387,6 +388,7 @@ pub(super) fn addresses(ui: &mut Ui, app: &App, entries: Option<&[(String, u64)]
         rows,
         &empty,
         address,
+        Some(request_address),
     );
 }
 
@@ -402,6 +404,7 @@ pub fn wide_table<const N: usize>(
     rows: Vec<[String; N]>,
     empty: &str,
     first_cell: fn(&mut Ui, &str),
+    row_click: Option<fn(&egui::Context, &str)>,
 ) {
     wide_table_with_lead(
         ui,
@@ -410,6 +413,7 @@ pub fn wide_table<const N: usize>(
         rows,
         empty,
         first_cell,
+        row_click,
         |_, _| {},
         TABLE_HEIGHT,
     );
@@ -427,6 +431,9 @@ pub fn wide_table_with_lead<const N: usize>(
     rows: Vec<[String; N]>,
     empty: &str,
     first_cell: fn(&mut Ui, &str),
+    // A click anywhere else on a row (the rows highlight as one) acts on its first
+    // cell's value, e.g. opens the address's info pane.
+    row_click: Option<fn(&egui::Context, &str)>,
     mut lead: impl FnMut(&mut Ui, usize),
     height: f32,
 ) {
@@ -506,6 +513,11 @@ pub fn wide_table_with_lead<const N: usize>(
                             });
                         }
                     });
+                }
+                if let Some(on_click) = row_click
+                    && row.response().clicked()
+                {
+                    on_click(&ctx, &rows[index][0]);
                 }
             });
         });
@@ -697,5 +709,6 @@ pub(super) fn top_miners(ui: &mut Ui, app: &App, view: Option<&AggregatedView>) 
             waiting_text(app)
         },
         address,
+        Some(request_address),
     );
 }

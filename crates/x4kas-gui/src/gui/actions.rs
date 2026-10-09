@@ -2,7 +2,7 @@
 //! like an application's menu bar, at the top of the Explorer's page and of the info
 //! pane. An Open menu (the web explorers, an address's flow graph) first, then what
 //! an address can be given (its label and watchlist settings: dialogs, see
-//! `gui/dialogs.rs`) and its export. It needs only the page (not its data), so it is
+//! `gui/dialogs.rs`) and its export, or a block's export. It needs only the page (not its data), so it is
 //! there while the page loads or when it wasn't found.
 
 use eframe::egui::containers::menu::MenuButton;
@@ -67,12 +67,19 @@ pub fn bar(ui: &mut Ui, app: &mut App, page: &ExplorerPage, cmd_tx: &CommandSend
                 }
             }
         });
-        if let ExplorerPage::Address(addr) = page {
-            if flows {
-                open_flow_graph(app, addr, cmd_tx);
+        match page {
+            ExplorerPage::Address(addr) => {
+                if flows {
+                    open_flow_graph(app, addr, cmd_tx);
+                }
+                ui.separator();
+                address_actions(ui, app, addr, cmd_tx);
             }
-            ui.separator();
-            address_actions(ui, app, addr, cmd_tx);
+            ExplorerPage::Block(_) => {
+                ui.separator();
+                block_export(ui, app, page, cmd_tx);
+            }
+            _ => {}
         }
     });
     let rule_y = ui.cursor().top() + 2.0;
@@ -153,6 +160,39 @@ fn address_actions(ui: &mut Ui, app: &mut App, addr: &str, cmd_tx: &CommandSende
         response
             .on_hover_text("The indexed transactions, to ~/.x4kas/exports")
             .on_disabled_hover_text("Nothing to export until the page shows transactions");
+    });
+}
+
+/// A block's Export menu: the block as the page shows it, as JSON, once it is loaded.
+fn block_export(ui: &mut Ui, app: &App, page: &ExplorerPage, cmd_tx: &CommandSender) {
+    let view = match app.explorer.load(page) {
+        Some(PageLoad::Ready(data)) => match &**data {
+            PageData::Block(view) => Some(view),
+            _ => None,
+        },
+        _ => None,
+    };
+    ui.add_enabled_ui(view.is_some(), |ui| {
+        let (response, _) = MenuButton::from_button(action_button("Export ▾")).ui(ui, |ui| {
+            if ui
+                .button("Block as JSON")
+                .on_hover_text(
+                    "The block as this page shows it (header, DAG standing, miner, \
+                     transactions with acceptance and fees), to ~/.x4kas/exports",
+                )
+                .clicked()
+            {
+                if let Some(view) = view {
+                    let _ = cmd_tx.send(UiCommand::Export(ExportRequest::Block(Box::new(
+                        view.clone(),
+                    ))));
+                }
+                ui.close();
+            }
+        });
+        response
+            .on_hover_text("The block as JSON, to ~/.x4kas/exports")
+            .on_disabled_hover_text("Nothing to export until the block is loaded");
     });
 }
 

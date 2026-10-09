@@ -1,3 +1,5 @@
+use serde::Serialize;
+
 use kaspa_rpc_core::{
     GetBlockDagInfoResponse, GetBlockRewardInfoResponse, GetCoinSupplyResponse,
     GetServerInfoResponse, RpcBlockColor, RpcFeeEstimate, RpcMempoolEntry,
@@ -134,7 +136,7 @@ impl From<RpcFeeEstimate> for FeeEstimateInfo {
 
 /// A block's standing in the DAG, from `get_block_reward_info`: whether it was merged
 /// blue or red, how deep it is, and what it earned.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct BlockRewardInfo {
     pub color: BlockColor,
     /// Chain blocks on top of the one that merged it.
@@ -145,7 +147,7 @@ pub struct BlockRewardInfo {
     pub reward: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum BlockColor {
     /// Not merged by the selected chain yet.
     Unknown,

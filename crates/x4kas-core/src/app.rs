@@ -746,9 +746,12 @@ pub enum ExportOrigin {
     Address(String),
     /// The flow graph window.
     Flows,
+    /// This block's page.
+    Block(String),
 }
 
-/// The last export (`UiCommand::Export`) from an address's page or the flow graph window.
+/// The last export (`UiCommand::Export`) from an address's or a block's page or the flow
+/// graph window.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ExportStatus {
     pub running: bool,

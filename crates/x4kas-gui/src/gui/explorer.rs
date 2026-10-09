@@ -29,7 +29,7 @@ use super::widgets::{
     page_table, placeholder, primary_button, set_in_explorer, subheader, table_header,
     table_row_height, transaction_id, transaction_id_in_block, weighted_columns, yes_no,
 };
-use x4kas_core::app::{App, ConnectionStatus};
+use x4kas_core::app::{App, ConnectionStatus, ExportOrigin};
 use x4kas_core::controller::{CommandSender, UiCommand};
 use x4kas_core::explorer::{
     AddressPageData, BlockView, ExplorerPage, PageData, PageLoad, TxStatus, TxView, parse_query,
@@ -846,6 +846,15 @@ pub(super) fn block_overview(ui: &mut Ui, app: &App, view: &BlockView) {
                 copy_value(ui, &view.utxo_commitment, "Copy");
             });
         });
+    }
+    // The export asked for from the action bar, where the block is.
+    if let Some(status) = app
+        .address
+        .export
+        .of(&ExportOrigin::Block(view.hash.clone()))
+    {
+        ui.add_space(4.0);
+        address::export_status(ui, status);
     }
 }
 

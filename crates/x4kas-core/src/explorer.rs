@@ -12,6 +12,7 @@ use std::collections::{HashMap, VecDeque};
 use anyhow::Result;
 use kaspa_addresses::Address;
 use kaspa_rpc_core::{RpcBlock, RpcMempoolEntry, RpcTransaction};
+use serde::Serialize;
 
 use crate::app::AddressView;
 use crate::format::shorten_middle;
@@ -496,7 +497,7 @@ impl ExplorerState {
 
 /// What a block page shows, from `get_block` (and `get_block_reward_info`), with the
 /// index's acceptance data folded in by [`enrich_block`].
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct BlockView {
     pub hash: String,
     pub version: u16,
@@ -528,7 +529,7 @@ pub struct BlockView {
 }
 
 /// The miner, from the coinbase: its payout address and what its payload says.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MinerInfo {
     pub address: Option<String>,
     pub node_version: Option<String>,
@@ -536,7 +537,7 @@ pub struct MinerInfo {
 }
 
 /// One transaction of a block, as its list shows it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BlockTx {
     pub txid: String,
     pub is_coinbase: bool,
@@ -552,7 +553,7 @@ pub struct BlockTx {
     pub accepted: Option<Accepted>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Accepted {
     pub block: String,
     pub fee: Option<u64>,

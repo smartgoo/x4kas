@@ -90,6 +90,8 @@ pub enum ExportRequest {
         roots: Vec<String>,
         format: ExportFormat,
     },
+    /// A block as the Explorer shows it, as JSON.
+    Block(Box<BlockView>),
 }
 
 /// A node reached over the network: a wRPC URL or the public resolver.
@@ -525,6 +527,7 @@ impl Controller {
         let origin = match &request {
             ExportRequest::Transactions { address, .. } => ExportOrigin::Address(address.clone()),
             ExportRequest::Flows { .. } => ExportOrigin::Flows,
+            ExportRequest::Block(view) => ExportOrigin::Block(view.hash.clone()),
         };
         let labels = {
             let mut app = self.app.write().await;
@@ -562,6 +565,10 @@ impl Controller {
                         };
                         (export::export_path(&stem, format), contents)
                     }
+                    ExportRequest::Block(view) => (
+                        export::export_path(&export::block_stem(&view.hash), ExportFormat::Json),
+                        export::block_json(&view)?,
+                    ),
                 };
                 export::write(&path, &contents)?;
                 Ok(path)

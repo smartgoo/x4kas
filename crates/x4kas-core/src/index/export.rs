@@ -1,5 +1,5 @@
 //! CSV and JSON exports of what the index knows: an address's transactions and a flow
-//! graph. Files go under `~/.x4kas/exports/` (`export_path`); the CLI prints the same
+//! graph; and of a block as the Explorer shows it (JSON). Files go under `~/.x4kas/exports/` (`export_path`); the CLI prints the same
 //! text to stdout. CSV is plain RFC 4180 (quoted only where needed), one row per
 //! transaction or per flow edge, with amounts both in sompi and in KAS.
 
@@ -14,6 +14,7 @@ use super::IndexStore;
 use super::query::{self, FlowGraph, TxRow};
 use super::records::AddrId;
 use crate::config;
+use crate::explorer::BlockView;
 use crate::format::{format_utc, now_ms};
 use crate::labels::LabelBook;
 
@@ -116,6 +117,18 @@ pub fn transactions_csv(address: &str, rows: &[TxRow]) -> String {
 /// A flow graph as JSON (`FlowGraph`: nodes and edges, `via` on collapsed edges).
 pub fn flows_json(graph: &FlowGraph) -> Result<String> {
     Ok(serde_json::to_string_pretty(graph)?)
+}
+
+/// A block as the Explorer shows it (`BlockView`: header, DAG standing, miner, its
+/// transactions with the index's acceptance and fees) as JSON.
+pub fn block_json(view: &BlockView) -> Result<String> {
+    Ok(serde_json::to_string_pretty(view)?)
+}
+
+/// A short file stem for a block: `block_<first 12 hex digits>`.
+pub fn block_stem(hash: &str) -> String {
+    let head: String = hash.chars().take(12).collect();
+    format!("block_{head}")
 }
 
 pub const FLOWS_CSV_HEADER: &str =
@@ -247,6 +260,41 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["address"], "kaspa:qq1");
         assert_eq!(v["transactions"][0]["delta"], 5);
+    }
+
+    #[test]
+    fn block_json_names_the_file_after_the_hash() {
+        assert_eq!(block_stem(&"ab".repeat(32)), "block_abababababab");
+        let view = BlockView {
+            hash: "ab".repeat(32),
+            version: 1,
+            timestamp_ms: 1_759_926_896_123,
+            bits: 0,
+            nonce: 7,
+            daa_score: 42,
+            blue_score: 41,
+            blue_work: "ff".into(),
+            difficulty: None,
+            parents: vec!["cd".repeat(32)],
+            parent_levels: 1,
+            hash_merkle_root: String::new(),
+            accepted_id_merkle_root: String::new(),
+            utxo_commitment: String::new(),
+            pruning_point: String::new(),
+            selected_parent: None,
+            children: Vec::new(),
+            merge_set_blues: Vec::new(),
+            merge_set_reds: Vec::new(),
+            is_chain_block: Some(true),
+            is_header_only: false,
+            miner: None,
+            transactions: Vec::new(),
+            reward: None,
+        };
+        let v: serde_json::Value = serde_json::from_str(&block_json(&view).unwrap()).unwrap();
+        assert_eq!(v["hash"], "ab".repeat(32));
+        assert_eq!(v["daa_score"], 42);
+        assert_eq!(v["parents"][0], "cd".repeat(32));
     }
 
     #[test]

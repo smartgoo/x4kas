@@ -1,9 +1,12 @@
 //! The flow graph window: money followed hop by hop from an address (data in
 //! `App.address.flows`, from `UiCommand::AddressFlows`). Nodes are addresses sized by
-//! the volume over their edges, laid out by a small force simulation; a click on a node
-//! expands it by one hop, a right-click shows its info pane.
+//! the volume over their edges, laid out by a small force simulation in graph space
+//! (positions relative to the graph's center, so the window can be resized freely);
+//! the view pans by dragging the background and zooms with the wheel or a pinch around
+//! the pointer. A click on a node expands it by one hop (once; expanded nodes wear a
+//! ring), a right-click shows its info pane, a drag moves it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use eframe::egui::{self, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2, pos2, vec2};
 
@@ -18,14 +21,63 @@ use x4kas_core::index::query::FlowGraph;
 use x4kas_core::index::records::AddrId;
 
 /// Layout state between frames.
-#[derive(Default)]
 pub struct FlowWindowUi {
+    /// Node positions in graph space: relative to the graph's center, unzoomed.
     positions: HashMap<AddrId, Pos2>,
     /// The graph these positions belong to (node count and roots), to reseed on change.
     laid_out_for: (usize, Vec<String>),
     /// Simulation steps left; the layout settles and then stops repainting.
     steps_left: u32,
-    dragging: Option<AddrId>,
+    dragging: Option<Drag>,
+    /// The view: where the graph's origin sits relative to the canvas center (in graph
+    /// units) and the zoom factor.
+    pan: Vec2,
+    zoom: f32,
+    /// Nodes whose counterparties were asked for (roots count), so a click doesn't ask
+    /// again and the ring says so.
+    expanded: HashSet<AddrId>,
+}
+
+impl Default for FlowWindowUi {
+    fn default() -> Self {
+        Self {
+            positions: HashMap::new(),
+            laid_out_for: (0, Vec::new()),
+            steps_left: 0,
+            dragging: None,
+            pan: Vec2::ZERO,
+            zoom: 1.0,
+            expanded: HashSet::new(),
+        }
+    }
+}
+
+/// What a drag on the canvas moves.
+#[derive(Clone, Copy, PartialEq)]
+enum Drag {
+    Node(AddrId),
+    View,
+}
+
+/// The view's zoom range.
+const ZOOM_RANGE: std::ops::RangeInclusive<f32> = 0.25..=4.0;
+
+/// Graph space ↔ canvas, for one frame's canvas `rect`.
+#[derive(Clone, Copy)]
+struct View {
+    center: Pos2,
+    pan: Vec2,
+    zoom: f32,
+}
+
+impl View {
+    fn to_screen(self, p: Pos2) -> Pos2 {
+        self.center + (p.to_vec2() + self.pan) * self.zoom
+    }
+
+    fn to_graph(self, p: Pos2) -> Pos2 {
+        ((p - self.center) / self.zoom - self.pan).to_pos2()
+    }
 }
 
 const NODE_MIN_RADIUS: f32 = 6.0;
@@ -67,11 +119,15 @@ impl FlowWindowUi {
             } else {
                 ui.label(
                     RichText::new(format!(
-                        "{} addresses, {} flows. Click a node to expand it, right-click for its info, drag to arrange.",
+                        "{} addresses, {} flows",
                         flows.shown().nodes.len(),
                         flows.shown().edges.len()
                     ))
                     .weak(),
+                )
+                .on_hover_text(
+                    "Click a node to expand it by one hop, right-click for its info, drag \
+                     it to arrange. Drag the background to pan, scroll or pinch to zoom.",
                 );
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -96,11 +152,21 @@ impl FlowWindowUi {
                 }
                 ui.label(RichText::new("Export").weak().small());
                 ui.separator();
-                ui.checkbox(&mut collapse, "Collapse chains")
-                    .on_hover_text(
-                        "Fold addresses that only pass money on (one flow in, one out), such \
+                ui.checkbox(&mut collapse, "Collapse chains").on_hover_text(
+                    "Fold addresses that only pass money on (one flow in, one out), such \
                          as peel chains, into a single dashed arrow with a hop count",
-                    );
+                );
+                ui.separator();
+                let fitted = self.zoom == 1.0 && self.pan == Vec2::ZERO;
+                if ui
+                    .add_enabled(!fitted, egui::Button::new("Reset view").small())
+                    .on_hover_text(
+                        "Back to the whole graph, centered (also double-click the background)",
+                    )
+                    .clicked()
+                {
+                    self.reset_view();
+                }
             });
         });
         if let Some(ref err) = flows.error {
@@ -122,8 +188,31 @@ impl FlowWindowUi {
         let roots = flows.roots.clone();
         let labels = app.labels.clone();
         let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
-        self.reseed_if_needed(&graph, &roots, rect);
-        self.step(&graph, rect);
+        self.reseed_if_needed(&graph, &roots);
+        self.step(&graph);
+
+        // Zoom around the pointer (wheel or pinch), so what is under it stays put.
+        if response.hovered() {
+            let (wheel, pinch) = ui.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));
+            let factor = pinch * (wheel * 0.0025).exp();
+            if factor != 1.0
+                && let Some(p) = response.hover_pos()
+            {
+                let before = self.view(rect);
+                let under = before.to_graph(p);
+                self.zoom = (self.zoom * factor).clamp(*ZOOM_RANGE.start(), *ZOOM_RANGE.end());
+                let after = View {
+                    zoom: self.zoom,
+                    ..before
+                };
+                // pan' such that `under` maps back onto `p`.
+                self.pan = (p - after.center) / after.zoom - under.to_vec2();
+            }
+        }
+        if response.double_clicked() && !self.node_at(&graph, rect, response.hover_pos()) {
+            self.reset_view();
+        }
+        let view = self.view(rect);
 
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 3.0, theme::BG_DEEP);
@@ -146,15 +235,20 @@ impl FlowWindowUi {
         let pointer = response.hover_pos();
 
         // Edges with arrowheads, amounts on hover.
+        let radius_on_screen = |id: &AddrId| node_radius[id] * self.zoom.clamp(0.5, 2.0);
         for edge in &graph.edges {
             let (Some(&from), Some(&to)) =
                 (self.positions.get(&edge.from), self.positions.get(&edge.to))
             else {
                 continue;
             };
+            let (from, to) = (view.to_screen(from), view.to_screen(to));
+            if from == to {
+                continue;
+            }
             let dir = (to - from).normalized();
-            let start = from + dir * node_radius[&edge.from];
-            let end = to - dir * node_radius[&edge.to];
+            let start = from + dir * radius_on_screen(&edge.from);
+            let end = to - dir * radius_on_screen(&edge.to);
             let hovered = pointer.is_some_and(|p| distance_to_segment(p, start, end) < 5.0);
             let color = if hovered {
                 theme::ACCENT_BRIGHT
@@ -217,12 +311,15 @@ impl FlowWindowUi {
 
         // Nodes.
         let mut clicked: Option<(AddrId, String, bool)> = None;
+        let mut hovered_node = None;
         for node in &graph.nodes {
             let Some(&pos) = self.positions.get(&node.id) else {
                 continue;
             };
-            let r = node_radius[&node.id];
+            let pos = view.to_screen(pos);
+            let r = radius_on_screen(&node.id);
             let is_root = node.hop == 0;
+            let expanded = is_root || self.expanded.contains(&node.id);
             let hovered = pointer.is_some_and(|p| p.distance(pos) <= r + 2.0);
             let fill = if is_root {
                 theme::ACCENT_DIM
@@ -239,6 +336,10 @@ impl FlowWindowUi {
                 theme::BORDER_HI
             };
             painter.circle(pos, r, fill, Stroke::new(1.5_f32, stroke_color));
+            if expanded && !is_root {
+                // A ring: this node's counterparties are all on the graph.
+                painter.circle_stroke(pos, r + 3.0, Stroke::new(1.0_f32, theme::ACCENT_DIM));
+            }
             let name = labels
                 .name(&node.address)
                 .map(str::to_string)
@@ -255,6 +356,7 @@ impl FlowWindowUi {
                 },
             );
             if hovered {
+                hovered_node = Some(node.id);
                 response.clone().on_hover_ui_at_pointer(|ui| {
                     ui.label(&node.address);
                     ui.label(
@@ -270,10 +372,15 @@ impl FlowWindowUi {
                         ))
                         .weak(),
                     );
+                    ui.label(
+                        RichText::new(if expanded {
+                            "Expanded · right-click for info · drag to move"
+                        } else {
+                            "Click to expand · right-click for info · drag to move"
+                        })
+                        .weak(),
+                    );
                 });
-                if response.drag_started() {
-                    self.dragging = Some(node.id);
-                }
                 if response.clicked() {
                     clicked = Some((node.id, node.address.clone(), false));
                 }
@@ -283,41 +390,94 @@ impl FlowWindowUi {
             }
         }
 
-        if let Some(id) = self.dragging {
-            if response.dragged() {
+        // A drag moves the node under the pointer, else the view.
+        if response.drag_started() {
+            self.dragging = Some(hovered_node.map_or(Drag::View, Drag::Node));
+        }
+        match self.dragging {
+            Some(Drag::Node(id)) if response.dragged() => {
                 if let (Some(p), Some(pos)) = (pointer, self.positions.get_mut(&id)) {
-                    *pos = p;
+                    *pos = view.to_graph(p);
                 }
                 self.steps_left = self.steps_left.max(30);
-            } else {
-                self.dragging = None;
             }
+            Some(Drag::View) if response.dragged() => {
+                self.pan += response.drag_delta() / self.zoom;
+            }
+            Some(_) => self.dragging = None,
+            None => {}
+        }
+        if response.dragged() {
+            ui.ctx().set_cursor_icon(match self.dragging {
+                Some(Drag::View) => egui::CursorIcon::Grabbing,
+                _ => egui::CursorIcon::Move,
+            });
+        } else if hovered_node.is_some() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
 
-        if let Some((_, address, info)) = clicked {
+        if let Some((id, address, info)) = clicked {
             if info {
                 request_address(ui.ctx(), &address);
-            } else {
+            } else if self.expanded.insert(id)
+                && !graph.nodes.iter().any(|n| n.id == id && n.hop == 0)
+            {
                 app.address.flows.loading = true;
                 let _ = cmd_tx.send(UiCommand::AddressFlows { address, hops: 1 });
             }
         }
+        painter.text(
+            rect.left_bottom() + vec2(8.0, -6.0),
+            egui::Align2::LEFT_BOTTOM,
+            format!("{:.0}%", self.zoom * 100.0),
+            egui::FontId::monospace(theme::SMALL_FONT_SIZE),
+            theme::TEXT_DIM,
+        );
         if self.steps_left > 0 {
             ui.ctx().request_repaint();
         }
     }
 
+    fn view(&self, rect: Rect) -> View {
+        View {
+            center: rect.center(),
+            pan: self.pan,
+            zoom: self.zoom,
+        }
+    }
+
+    fn reset_view(&mut self) {
+        self.pan = Vec2::ZERO;
+        self.zoom = 1.0;
+    }
+
+    /// Whether a node is under `pointer`.
+    fn node_at(&self, graph: &FlowGraph, rect: Rect, pointer: Option<Pos2>) -> bool {
+        let Some(p) = pointer else {
+            return false;
+        };
+        let view = self.view(rect);
+        graph.nodes.iter().any(|n| {
+            self.positions
+                .get(&n.id)
+                .is_some_and(|pos| view.to_screen(*pos).distance(p) <= NODE_MAX_RADIUS + 2.0)
+        })
+    }
+
     /// Place new nodes near their first neighbour (or the center) and restart settling
     /// when the graph changed.
-    fn reseed_if_needed(&mut self, graph: &FlowGraph, roots: &[String], rect: Rect) {
+    fn reseed_if_needed(&mut self, graph: &FlowGraph, roots: &[String]) {
         let key = (graph.nodes.len(), roots.to_vec());
         if self.laid_out_for == key && !self.positions.is_empty() {
             return;
         }
         if self.laid_out_for.1 != key.1 {
+            // A new graph: start over, view included.
             self.positions.clear();
+            self.expanded.clear();
+            self.reset_view();
         }
-        let center = rect.center();
+        let center = Pos2::ZERO;
         let mut seed = 0.618_f32;
         for node in &graph.nodes {
             if self.positions.contains_key(&node.id) {
@@ -349,14 +509,14 @@ impl FlowWindowUi {
     }
 
     /// One frame of a spring/repulsion layout; roots are pulled to the center.
-    fn step(&mut self, graph: &FlowGraph, rect: Rect) {
+    fn step(&mut self, graph: &FlowGraph) {
         if self.steps_left == 0 {
             return;
         }
         self.steps_left -= 1;
         let ids: Vec<AddrId> = graph.nodes.iter().map(|n| n.id).collect();
         let mut forces: HashMap<AddrId, Vec2> = ids.iter().map(|id| (*id, Vec2::ZERO)).collect();
-        let center = rect.center();
+        let center = Pos2::ZERO;
         for (i, &a) in ids.iter().enumerate() {
             for &b in &ids[i + 1..] {
                 let (pa, pb) = (self.positions[&a], self.positions[&b]);
@@ -389,7 +549,7 @@ impl FlowWindowUi {
             let Some(pos) = self.positions.get_mut(&node.id) else {
                 continue;
             };
-            if Some(node.id) == self.dragging {
+            if Some(Drag::Node(node.id)) == self.dragging {
                 continue;
             }
             let mut f = forces[&node.id];
@@ -400,8 +560,6 @@ impl FlowWindowUi {
             }
             let damping = 0.08 + 0.3 * (self.steps_left as f32 / SETTLE_STEPS as f32);
             *pos += f * damping;
-            pos.x = pos.x.clamp(rect.left() + 12.0, rect.right() - 12.0);
-            pos.y = pos.y.clamp(rect.top() + 12.0, rect.bottom() - 18.0);
         }
     }
 }

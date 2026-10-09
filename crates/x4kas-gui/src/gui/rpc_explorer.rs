@@ -92,9 +92,13 @@ pub fn show(ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
                 }
             }
             None if app.rpc_explorer.is_loading => placeholder(ui, "Loading…"),
-            None if method.params.is_empty() => {
-                placeholder(ui, "Select a method on the left to run it.")
-            }
+            None if method.params.is_empty() => placeholder(
+                ui,
+                &format!(
+                    "Press Run to call {} (or pick another method).",
+                    method.name
+                ),
+            ),
             None => placeholder(ui, "Fill in the arguments and press Run."),
         }
     });

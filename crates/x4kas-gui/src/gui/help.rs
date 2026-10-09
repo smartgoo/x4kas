@@ -21,6 +21,11 @@ fn shortcuts(ctx: &egui::Context) -> Vec<(String, &'static str)> {
         ),
         (format!("{cmd}+L"), "Explorer: focus the search field"),
         (
+            format!("{cmd}+[ / {cmd}+]"),
+            "Back / forward (the info pane when open, else the Explorer tab; mouse back/forward buttons too)",
+        ),
+        ("Middle-click".to_string(), "Explorer: close a sub tab"),
+        (
             format!("{cmd}+click"),
             "Open an address, block or transaction link in a new Explorer tab",
         ),

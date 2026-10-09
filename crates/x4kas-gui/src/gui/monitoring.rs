@@ -138,13 +138,20 @@ impl MonitoringTab {
                     .request_repaint_after(std::time::Duration::from_secs_f64(NOTICE_SECS));
             }
         }
-        // Label matches, when the field isn't an address.
+        // Label matches, when the field isn't an address; Enter takes the first.
         if let Some(field) = field
             && !looks_like_address(&self.input)
-            && let Some(addr) =
-                label_search_popup(ui, &field, &mut self.search_open, &self.input, &app.labels)
         {
-            request_address(ui.ctx(), &addr);
+            let picked =
+                label_search_popup(ui, &field, &mut self.search_open, &self.input, &app.labels);
+            let first = (submitted && !self.input.trim().is_empty())
+                .then(|| app.labels.search(&self.input).into_iter().next())
+                .flatten()
+                .map(|(addr, _)| addr.to_string());
+            if let Some(addr) = picked.or(first) {
+                request_address(ui.ctx(), &addr);
+                self.search_open = false;
+            }
         }
         ui.add_space(4.0);
 

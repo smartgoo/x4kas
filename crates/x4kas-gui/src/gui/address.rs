@@ -10,9 +10,9 @@ use egui_extras::Column;
 use super::monitoring::network;
 use super::theme;
 use super::widgets::{
-    CARD_GAP, address, block_hash, card, card_with_header, copy_value, kv, kv_columns, kv_grid,
-    kv_with, link_table, or_dash, page_table, placeholder, primary_button, subheader, table_header,
-    table_row_height, transaction_id, weighted_columns,
+    CARD_GAP, address, block_hash, card, card_with_header, copy_value, is_testnet, kv, kv_columns,
+    kv_grid, kv_with, link_table, or_dash, page_table, placeholder, primary_button, subheader,
+    table_header, table_row_height, transaction_id, weighted_columns,
 };
 use x4kas_core::app::{AddressView, App, ExportOrigin, ExportStatus};
 use x4kas_core::controller::{CommandSender, ExportRequest, UiCommand};
@@ -99,8 +99,11 @@ impl AddressForms {
         kv_grid(ui, "address_header", |ui| {
             kv_with(ui, "Address", |ui| copy_value(ui, addr, "Copy address"));
             kv_with(ui, "View on", |ui| {
-                ui.hyperlink_to("Kaspa Stream", kaspa_stream_address_url(addr));
-                ui.label(RichText::new("·").weak());
+                // Kaspa Stream only covers mainnet.
+                if !is_testnet(ui.ctx()) {
+                    ui.hyperlink_to("Kaspa Stream", kaspa_stream_address_url(addr));
+                    ui.label(RichText::new("·").weak());
+                }
                 ui.hyperlink_to("Kaspa Explorer", explorer_address_url(addr));
             });
             kv_with(ui, "Online", |ui| {

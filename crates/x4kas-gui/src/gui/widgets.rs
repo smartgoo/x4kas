@@ -703,10 +703,12 @@ fn linked_value(ui: &mut Ui, value: &str, kind: LinkKind<'_>, selected: bool, ch
                         }
                     }
                     ui.separator();
-                    for (name, url) in [
-                        ("Open in Kaspa Explorer", explorer_address_url(value)),
-                        ("Open in Kaspa Stream", kaspa_stream_address_url(value)),
-                    ] {
+                    let mut sites = vec![("Open in Kaspa Explorer", explorer_address_url(value))];
+                    // Kaspa Stream only covers mainnet.
+                    if !is_testnet(ui.ctx()) {
+                        sites.push(("Open in Kaspa Stream", kaspa_stream_address_url(value)));
+                    }
+                    for (name, url) in sites {
                         if ui.button(name).clicked() {
                             ui.ctx().open_url(egui::OpenUrl::new_tab(url));
                         }
@@ -1085,6 +1087,19 @@ fn in_explorer(ctx: &egui::Context) -> bool {
 /// page, not in the flow, so what is below doesn't move while typing. Stays while the
 /// field has focus or the pointer is on it; Esc or a pick closes it. Returns the
 /// address picked.
+/// Why a search found nothing: a near miss (an id a few characters short, something
+/// that starts like an address) says so rather than "no label matches".
+fn no_match_text(query: &str) -> &'static str {
+    let q = query.trim();
+    if q.len() >= 32 && q.chars().all(|c| c.is_ascii_hexdigit()) {
+        "Not a 64-character hex id (a block hash or transaction id)"
+    } else if q.starts_with("kaspa") && q.len() > 20 {
+        "Not a valid Kaspa address"
+    } else {
+        "No label matches"
+    }
+}
+
 pub fn label_search_popup(
     ui: &mut Ui,
     field: &egui::Response,
@@ -1109,7 +1124,7 @@ pub fn label_search_popup(
             egui::Frame::popup(ui.style()).show(ui, |ui| {
                 ui.set_width(field.rect.width());
                 if hits.is_empty() {
-                    placeholder(ui, "No label matches");
+                    placeholder(ui, no_match_text(query));
                 }
                 for (addr, name) in &hits {
                     ui.horizontal(|ui| {

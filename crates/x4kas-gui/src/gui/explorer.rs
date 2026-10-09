@@ -14,17 +14,19 @@
 use std::collections::HashMap;
 
 use eframe::egui::{
-    self, Align2, Button, CornerRadius, RichText, Sense, Stroke, StrokeKind, TextEdit, Ui, vec2,
+    self, Align2, Button, CornerRadius, RichText, Sense, Stroke, StrokeKind, TextEdit, Ui,
+    text::{CCursor, CCursorRange},
+    vec2,
 };
 use egui_extras::Column;
 
 use super::address::{self, AddressForms};
 use super::theme;
 use super::widgets::{
-    CARD_GAP, address as address_widget, block_hash, card, command_key, copy_value, is_testnet, kv,
-    kv_columns, kv_grid, kv_with, label_search_popup, link_table, or_dash, page_table, placeholder,
-    primary_button, set_in_explorer, subheader, table_header, table_row_height, transaction_id,
-    transaction_id_in_block, weighted_columns, yes_no,
+    CARD_GAP, address as address_widget, block_hash, card, card_with_header, command_key,
+    copy_value, is_testnet, kv, kv_columns, kv_grid, kv_with, label_search_popup, link_table,
+    or_dash, page_table, placeholder, primary_button, set_in_explorer, subheader, table_header,
+    table_row_height, transaction_id, transaction_id_in_block, weighted_columns, yes_no,
 };
 use x4kas_core::app::{App, ConnectionStatus};
 use x4kas_core::controller::{CommandSender, UiCommand};
@@ -68,6 +70,10 @@ pub struct ExplorerUi {
     recents_open: bool,
     /// The active sub tab last frame, to scroll a newly active one into view.
     shown_tab: Option<u64>,
+    /// A page's Retry was clicked (the pages draw with `&App`; `show` reloads it).
+    reload: Option<ExplorerPage>,
+    /// "Clear" on a Recently viewed card was clicked.
+    clear_recent: bool,
     forms: AddressForms,
 }
 
@@ -99,18 +105,29 @@ impl ExplorerUi {
                     egui::ScrollArea::vertical()
                         .auto_shrink(false)
                         .show(ui, |ui| {
-                            card(ui, "Recently viewed", |ui| recent(ui, app));
+                            recent_card(ui, app, &mut self.clear_recent);
                         });
                 });
         }
         let mut open_flows = false;
+        // One scroll position per page of each sub tab, so a page opens at its top and
+        // comes back (through the history) where it was.
+        let tab_id = app.explorer.active_tab().id;
         egui::ScrollArea::vertical()
+            .id_salt(("explorer_page", tab_id, &page))
             .auto_shrink(false)
             .show(ui, |ui| {
                 self.page(ui, app, &page, connected, cmd_tx, &mut open_flows);
             });
         if open_flows && let ExplorerPage::Address(addr) = &page {
             address::open_flow_graph(app, addr, cmd_tx);
+        }
+        if let Some(page) = self.reload.take() {
+            app.explorer.start_loading(page.clone());
+            let _ = cmd_tx.send(UiCommand::ExplorerLoad(page));
+        }
+        if std::mem::take(&mut self.clear_recent) {
+            app.explorer.clear_recent();
         }
         set_in_explorer(ui.ctx(), false);
     }
@@ -125,6 +142,7 @@ impl ExplorerUi {
         }
         if ctx.input_mut(|i| i.consume_key(m, egui::Key::W)) {
             let active = app.explorer.active;
+            self.drafts.remove(&app.explorer.tabs[active].id);
             app.explorer.close_tab(active);
         }
         if ctx.input_mut(|i| i.consume_key(m, egui::Key::L)) {
@@ -244,6 +262,7 @@ impl ExplorerUi {
         let mut forward = false;
         let mut reload = false;
         let mut submitted = false;
+        let mut escaped = false;
         let mut field = None;
         ui.horizontal(|ui| {
             ui.toggle_value(&mut self.recents_open, "🕓")
@@ -269,13 +288,22 @@ impl ExplorerUi {
                     .desired_width(ui.available_width() - go_width),
             );
             if self.focus_search {
+                // Focus with everything selected, like a URL bar: typing replaces the
+                // page's id instead of appending to it.
                 response.request_focus();
+                let mut state = TextEdit::load_state(ui.ctx(), response.id).unwrap_or_default();
+                state.cursor.set_char_range(Some(CCursorRange::two(
+                    CCursor::new(0),
+                    CCursor::new(draft.chars().count()),
+                )));
+                TextEdit::store_state(ui.ctx(), response.id, state);
                 self.focus_search = false;
             }
             if response.changed() {
                 self.search_open = true;
             }
             submitted = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            escaped = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape));
             field = Some(response);
             if ui.add(primary_button("Go")).clicked() {
                 submitted = true;
@@ -284,7 +312,11 @@ impl ExplorerUi {
         if submitted {
             match parse_query(draft) {
                 Some(target) => go = Some(target),
-                None => self.search_open = true,
+                // Enter on a label search takes its first match.
+                None => match app.labels.search(draft).into_iter().next() {
+                    Some((addr, _)) => go = Some(ExplorerPage::Address(addr.to_string())),
+                    None => self.search_open = true,
+                },
             }
         }
         // Label matches, when the field isn't an address or an id.
@@ -294,6 +326,11 @@ impl ExplorerUi {
                 label_search_popup(ui, &field, &mut self.search_open, draft, &app.labels)
         {
             go = Some(ExplorerPage::Address(addr));
+        }
+        // Esc puts the page's id back, like a URL bar.
+        if escaped {
+            self.drafts.remove(&id);
+            self.search_open = false;
         }
 
         if back {
@@ -334,7 +371,7 @@ impl ExplorerUi {
             load = app.explorer.load(target);
         }
         match (page, load) {
-            (ExplorerPage::Home, _) => home(ui, app, self.recents_open),
+            (ExplorerPage::Home, _) => home(ui, app, self.recents_open, &mut self.clear_recent),
             (_, None) if !connected => card(ui, "Explorer", |ui| {
                 placeholder(ui, "Connect to a node to load this page.");
             }),
@@ -348,12 +385,19 @@ impl ExplorerUi {
                 copy_value(ui, page.query(), "Copy");
                 ui.add_space(4.0);
                 ui.label(RichText::new(error).color(theme::ERROR));
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new("Reload with ⟳ once the node or the index has it.")
-                        .weak()
-                        .small(),
-                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(connected, Button::new("Retry"))
+                        .on_hover_text("Ask the node and the index again")
+                        .clicked()
+                    {
+                        self.reload = Some(page.clone());
+                    }
+                    ui.label(
+                        RichText::new("once the node or the index has it (also ⟳ above)").weak(),
+                    );
+                });
             }),
             (_, Some(PageLoad::Ready(data))) => match &**data {
                 PageData::Block(view) => block_page(ui, app, view),
@@ -397,13 +441,19 @@ impl ExplorerUi {
 
 /// A sub tab's title: a labelled address shows its label.
 fn tab_title(app: &App, page: &ExplorerPage) -> String {
-    match page {
+    let title = match page {
         ExplorerPage::Address(addr) => app
             .labels
             .name(addr)
             .map(str::to_string)
             .unwrap_or_else(|| page.title()),
         _ => page.title(),
+    };
+    // The tab says when its page is still loading or didn't load.
+    match app.explorer.load(page) {
+        Some(PageLoad::Loading) => format!("⟳ {title}"),
+        Some(PageLoad::Failed(_)) => format!("⚠ {title}"),
+        _ => title,
     }
 }
 
@@ -550,7 +600,7 @@ fn kas(sompi: u64) -> String {
 
 /// Search hints, the newest blocks from the node and the pages viewed recently (unless
 /// the recents pane already shows them beside the page).
-fn home(ui: &mut Ui, app: &App, recents_open: bool) {
+fn home(ui: &mut Ui, app: &App, recents_open: bool, clear_recent: &mut bool) {
     card(ui, "Explorer", |ui| {
         ui.label(
             "Search for a Kaspa address, a block hash or a transaction id above; it opens in a new tab.",
@@ -563,8 +613,29 @@ fn home(ui: &mut Ui, app: &App, recents_open: bool) {
     }
     weighted_columns(ui, [1.0, 1.0], 360.0, |[left, right]| {
         card(left, "Latest blocks", |ui| latest_blocks(ui, app));
-        card(right, "Recently viewed", |ui| recent(ui, app));
+        recent_card(right, app, clear_recent);
     });
+}
+
+/// The "Recently viewed" card with its Clear button (on Home and in the recents pane).
+fn recent_card(ui: &mut Ui, app: &App, clear: &mut bool) {
+    let any = app.explorer.recent().next().is_some();
+    card_with_header(
+        ui,
+        "Recently viewed",
+        clear,
+        |ui, clear| {
+            if any
+                && ui
+                    .small_button("Clear")
+                    .on_hover_text("Forget the recently viewed pages")
+                    .clicked()
+            {
+                *clear = true;
+            }
+        },
+        |ui, _| recent(ui, app),
+    );
 }
 
 /// The newest blocks the DAG visualizer has seen, newest DAA score first.
@@ -633,7 +704,7 @@ fn recent(ui: &mut Ui, app: &App) {
 // --- Block ---
 
 fn block_page(ui: &mut Ui, app: &App, view: &BlockView) {
-    card(ui, "Block", |ui| block_overview(ui, view));
+    card(ui, "Block", |ui| block_overview(ui, app, view));
     ui.add_space(CARD_GAP);
 
     weighted_columns(ui, [1.0, 1.0], 360.0, |[left, right]| {
@@ -676,14 +747,17 @@ fn block_page(ui: &mut Ui, app: &App, view: &BlockView) {
 /// The block's core: hash and explorer links, header fields, DAG standing (chain
 /// block, color, confirmations, reward, merging block, selected parent), miner and
 /// merkle roots. The page's first card; the info pane shows it too.
-pub(super) fn block_overview(ui: &mut Ui, view: &BlockView) {
+pub(super) fn block_overview(ui: &mut Ui, app: &App, view: &BlockView) {
     let testnet = is_testnet(ui.ctx());
     {
         kv_grid(ui, "block_ids", |ui| {
             kv_with(ui, "Hash", |ui| copy_value(ui, &view.hash, "Copy hash"));
             kv_with(ui, "View on", |ui| {
-                ui.hyperlink_to("Kaspa Stream", kaspa_stream_block_url(&view.hash));
-                ui.label(RichText::new("·").weak());
+                // Kaspa Stream only covers mainnet.
+                if !testnet {
+                    ui.hyperlink_to("Kaspa Stream", kaspa_stream_block_url(&view.hash));
+                    ui.label(RichText::new("·").weak());
+                }
                 ui.hyperlink_to("Kaspa Explorer", explorer_block_url(&view.hash, testnet));
             });
         });
@@ -727,11 +801,13 @@ pub(super) fn block_overview(ui: &mut Ui, view: &BlockView) {
                         ui.label("—");
                     }
                 });
-                kv(
-                    ui,
-                    "Confirmations",
-                    or_dash(reward.and_then(|r| r.confirmations), format_number),
-                );
+                // Live from the sink's blue score (the node's figure is from load time).
+                let confirmations = reward.and_then(|r| r.confirmations).map(|at_load| {
+                    app.node
+                        .sink_blue_score
+                        .map_or(at_load, |sink| sink.saturating_sub(view.blue_score))
+                });
+                kv(ui, "Confirmations", or_dash(confirmations, format_number));
                 kv(ui, "Reward", or_dash(reward.and_then(|r| r.reward), kas));
                 hash_row(
                     ui,
@@ -927,8 +1003,10 @@ pub(super) fn tx_overview(ui: &mut Ui, app: &App, view: &TxView) {
                 copy_value(ui, &view.txid, "Copy transaction id");
             });
             kv_with(ui, "View on", |ui| {
-                ui.hyperlink_to("Kaspa Stream", kaspa_stream_tx_url(&view.txid));
-                ui.label(RichText::new("·").weak());
+                if !testnet {
+                    ui.hyperlink_to("Kaspa Stream", kaspa_stream_tx_url(&view.txid));
+                    ui.label(RichText::new("·").weak());
+                }
                 ui.hyperlink_to("Kaspa Explorer", explorer_tx_url(&view.txid, testnet));
             });
         });

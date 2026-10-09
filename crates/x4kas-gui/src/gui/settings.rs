@@ -203,11 +203,21 @@ impl SettingsPage {
             }
         });
         ui.add_space(4.0);
-        ui.add(
-            TextEdit::singleline(&mut self.filter)
-                .hint_text("filter by label, address or source")
-                .desired_width(260.0),
-        );
+        ui.horizontal(|ui| {
+            ui.add(
+                TextEdit::singleline(&mut self.filter)
+                    .hint_text("filter by label, address or source")
+                    .desired_width(260.0),
+            );
+            if !self.filter.is_empty()
+                && ui
+                    .small_button("×")
+                    .on_hover_text("Clear the filter")
+                    .clicked()
+            {
+                self.filter.clear();
+            }
+        });
         ui.add_space(4.0);
 
         let filter = self.filter.trim().to_lowercase();

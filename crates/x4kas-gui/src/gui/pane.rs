@@ -193,7 +193,9 @@ impl InfoPane {
 
         let mut open_flows = false;
         let mut retry = false;
+        // One scroll position per page, so a newly shown page starts at its top.
         egui::ScrollArea::vertical()
+            .id_salt(("pane_page", &page))
             .auto_shrink(false)
             .show(ui, |ui| {
                 self.page(
@@ -251,7 +253,7 @@ impl InfoPane {
             }),
             Some(PageLoad::Ready(data)) => match &**data {
                 PageData::Block(view) => {
-                    card(ui, "Block", |ui| explorer::block_overview(ui, view));
+                    card(ui, "Block", |ui| explorer::block_overview(ui, app, view));
                     ui.add_space(CARD_GAP);
                     card(
                         ui,

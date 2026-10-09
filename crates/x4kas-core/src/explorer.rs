@@ -24,7 +24,10 @@ use crate::tx_inspect::{
 };
 
 /// Pages a sub tab can show.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// A transaction's block hint is load metadata, not identity: the same transaction
+/// opened from a block page and from elsewhere is one page (one tab, one cache entry,
+/// one recents row), so `PartialEq` and `Hash` leave the hint out.
+#[derive(Debug, Clone, Eq)]
 pub enum ExplorerPage {
     /// Search, the latest blocks and recently viewed pages.
     Home,
@@ -41,7 +44,35 @@ pub enum ExplorerPage {
     Lookup(String),
 }
 
+impl PartialEq for ExplorerPage {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Home, Self::Home) => true,
+            (Self::Block(a), Self::Block(b))
+            | (Self::Address(a), Self::Address(b))
+            | (Self::Lookup(a), Self::Lookup(b)) => a == b,
+            (Self::Transaction { txid: a, .. }, Self::Transaction { txid: b, .. }) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl std::hash::Hash for ExplorerPage {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        self.query().hash(state);
+    }
+}
+
 impl ExplorerPage {
+    /// The block hint of a transaction page, if it has one.
+    fn block_hint(&self) -> Option<&str> {
+        match self {
+            Self::Transaction { block, .. } => block.as_deref(),
+            _ => None,
+        }
+    }
+
     pub fn transaction(txid: &str) -> Self {
         Self::Transaction {
             txid: txid.to_string(),
@@ -370,7 +401,23 @@ impl ExplorerState {
     /// Whether the controller should be asked for `page`: it is loadable and nothing is
     /// cached for it (a failed load stays until a reload is asked for).
     pub fn needs_load(&self, page: &ExplorerPage) -> bool {
-        page.is_loadable() && !self.cache.contains_key(page)
+        if !page.is_loadable() {
+            return false;
+        }
+        match self.cache.get_key_value(page) {
+            None => true,
+            // A transaction that failed without a block hint gets another go with one:
+            // the hint is where to find it when neither the index nor the mempool has it.
+            Some((cached, PageLoad::Failed(_))) => {
+                page.block_hint().is_some() && cached.block_hint().is_none()
+            }
+            Some(_) => false,
+        }
+    }
+
+    /// Forget the recently viewed pages.
+    pub fn clear_recent(&mut self) {
+        self.recent.clear();
     }
 
     /// Mark `page` as loading (the frontend then sends `UiCommand::ExplorerLoad`).
@@ -378,6 +425,8 @@ impl ExplorerState {
         if !self.order.contains(&page) {
             self.order.push_back(page.clone());
         }
+        // The key carries the block hint the load will use (see `needs_load`).
+        self.cache.remove(&page);
         self.cache.insert(page, PageLoad::Loading);
         self.evict();
     }
@@ -941,6 +990,30 @@ mod tests {
         state.go_home();
         assert_eq!(state.active, 0);
         assert!(state.active_tab().is_home());
+    }
+
+    #[test]
+    fn a_transaction_is_one_page_whatever_its_block_hint() {
+        let plain = ExplorerPage::transaction(&h('t'));
+        let hinted = ExplorerPage::Transaction {
+            txid: h('t'),
+            block: Some(h('b')),
+        };
+        assert_eq!(plain, hinted);
+        let mut state = ExplorerState::default();
+        let a = state.show_in_tab(plain.clone());
+        assert_eq!(state.show_in_tab(hinted.clone()), a);
+        assert_eq!(state.tabs.len(), 2);
+        assert_eq!(state.recent().count(), 1);
+        // A failure without the hint is retried with one, and only then.
+        state.start_loading(plain.clone());
+        state.set_loaded(plain.clone(), Err("not found".into()));
+        assert!(!state.needs_load(&plain));
+        assert!(state.needs_load(&hinted));
+        state.start_loading(hinted.clone());
+        state.set_loaded(hinted.clone(), Err("still not".into()));
+        assert!(!state.needs_load(&hinted));
+        assert!(!state.needs_load(&plain));
     }
 
     #[test]

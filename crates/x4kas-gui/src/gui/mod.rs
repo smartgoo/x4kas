@@ -459,6 +459,7 @@ fn handle_shortcuts(
     if modal_open {
         return;
     }
+    history_navigation(ctx, app);
     // Modifier combinations type nothing, so they work from the search field too.
     if app.active_tab == Tab::Explorer && !*settings_open {
         explorer.handle_shortcuts(ctx, app);
@@ -486,6 +487,37 @@ fn handle_shortcuts(
             app.paused = !app.paused;
         }
     });
+}
+
+/// Back and forward through the history, like a browser: Cmd+[ / Cmd+] (Alt+Left /
+/// Alt+Right too) and the mouse's back and forward buttons. The info pane's history
+/// when it is open, else the Explorer tab's.
+fn history_navigation(ctx: &egui::Context, app: &mut App) {
+    let (back, forward) = ctx.input_mut(|i| {
+        let back = i.consume_key(Modifiers::COMMAND, Key::OpenBracket)
+            || i.consume_key(Modifiers::ALT, Key::ArrowLeft)
+            || i.pointer.button_pressed(egui::PointerButton::Extra1);
+        let forward = i.consume_key(Modifiers::COMMAND, Key::CloseBracket)
+            || i.consume_key(Modifiers::ALT, Key::ArrowRight)
+            || i.pointer.button_pressed(egui::PointerButton::Extra2);
+        (back, forward)
+    });
+    if !back && !forward {
+        return;
+    }
+    if app.explorer.pane.is_some() {
+        if back {
+            app.explorer.pane_back();
+        } else {
+            app.explorer.pane_forward();
+        }
+    } else if app.active_tab == Tab::Explorer {
+        if back {
+            app.explorer.go_back();
+        } else {
+            app.explorer.go_forward();
+        }
+    }
 }
 
 fn take_text_event(input: &mut egui::InputState, text: &str) -> bool {

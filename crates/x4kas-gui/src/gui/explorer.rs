@@ -32,8 +32,8 @@ use x4kas_core::explorer::{
     AddressPageData, BlockView, ExplorerPage, PageData, PageLoad, TxStatus, TxView, parse_query,
 };
 use x4kas_core::format::{
-    explorer_block_url, explorer_tx_url, format_duration, format_kas, format_number, format_utc,
-    kaspa_stream_block_url, kaspa_stream_tx_url, now_ms, shorten_middle,
+    explorer_block_url, explorer_tx_url, format_kas, format_number, format_when,
+    kaspa_stream_block_url, kaspa_stream_tx_url, shorten_middle,
 };
 use x4kas_core::index::cluster::CHANGE_THRESHOLD;
 
@@ -537,18 +537,9 @@ fn sub_tab(
     }
 }
 
-fn ago(ms: u64) -> String {
-    format!(
-        "{} ago",
-        format_duration(std::time::Duration::from_millis(
-            now_ms().saturating_sub(ms)
-        ))
-    )
-}
-
 /// A timestamp as UTC and how long ago.
 fn when(ms: u64) -> String {
-    format!("{} ({})", format_utc(ms), ago(ms))
+    format_when(ms)
 }
 
 fn kas(sompi: u64) -> String {
@@ -709,7 +700,7 @@ pub(super) fn block_overview(ui: &mut Ui, view: &BlockView) {
                 kv(
                     ui,
                     "Difficulty",
-                    or_dash(view.difficulty, |d| format!("{d:.0}")),
+                    or_dash(view.difficulty, |d| format_number(d as u64)),
                 );
                 kv(ui, "Bits", format!("{:#010x}", view.bits));
                 kv(ui, "Nonce", format!("{:#018x}", view.nonce));
@@ -1057,7 +1048,7 @@ pub(super) fn tx_inputs(ui: &mut Ui, view: &TxView) {
                 let i = row.index();
                 let input = &view.inputs[i];
                 row.col(|ui| {
-                    ui.label(RichText::new(i.to_string()).weak());
+                    ui.label(RichText::new((i + 1).to_string()).weak());
                 });
                 row.col(|ui| {
                     ui.spacing_mut().item_spacing.x = 2.0;
@@ -1097,7 +1088,7 @@ pub(super) fn tx_outputs(ui: &mut Ui, view: &TxView) {
                 let i = row.index();
                 let output = &view.outputs[i];
                 row.col(|ui| {
-                    ui.label(RichText::new(i.to_string()).weak());
+                    ui.label(RichText::new((i + 1).to_string()).weak());
                 });
                 row.col(|ui| match &output.address {
                     Some(addr) => address_widget(ui, addr),

@@ -8,8 +8,8 @@ use eframe::egui::{
 
 use super::theme;
 use super::widgets::{block_hash, kv, kv_columns, kv_grid, kv_with, or_dash, request_block};
-use x4kas_core::app::{App, DAG_MAX_DAA_SCORES, DagBlock, DagVisualizer};
-use x4kas_core::format::{format_number, shorten_middle};
+use x4kas_core::app::{App, ConnectionStatus, DAG_MAX_DAA_SCORES, DagBlock, DagVisualizer};
+use x4kas_core::format::{format_number, format_when, shorten_middle};
 
 // The visualizer mirrors the one on the Kaspalytics home page: a band of the newest DAA
 // scores, one column each, blocks spread evenly down their column and joined to their
@@ -32,14 +32,22 @@ const FADE_SECS: f64 = 0.125;
 const EXIT_X: f32 = -BLOCK_SIZE - 100.0;
 /// Pointer distance at which a block counts as hovered (blocks are tiny).
 const HIT_RADIUS: f32 = 6.0;
+/// How long the pointer rests on the band before it pauses, so passing over it (or
+/// scrolling past) doesn't freeze it.
+const HOVER_PAUSE_SECS: f64 = 0.4;
 
 /// The live DAG visualizer band across the top of the Dashboard. A click on a block shows
 /// its info pane.
 pub(super) fn band(ui: &mut Ui, app: &App) {
-    let waiting = if app.node.server_info.as_ref().is_some_and(|s| s.is_synced) {
-        "Waiting for blocks…"
-    } else {
-        "Waiting for the node to sync…"
+    let waiting = match app.node.connection_status {
+        ConnectionStatus::Connected
+            if app.node.server_info.as_ref().is_some_and(|s| s.is_synced) =>
+        {
+            "Waiting for blocks…"
+        }
+        ConnectionStatus::Connected => "Waiting for the node to sync…",
+        ConnectionStatus::Connecting => "Connecting…",
+        ConnectionStatus::Disconnected | ConnectionStatus::Error(_) => "Not connected",
     };
     if let Some(hash) = visualizer(ui, &app.node.dag_visualizer, waiting) {
         request_block(ui.ctx(), &hash);
@@ -53,6 +61,8 @@ struct DagView {
     nodes: HashMap<String, Node>,
     /// The blocks as they were when the hover pause began.
     frozen: Option<DagVisualizer>,
+    /// When the pointer came to rest on the band (`None` while it isn't there).
+    hover_since: Option<f64>,
 }
 
 #[derive(Clone)]
@@ -70,8 +80,24 @@ fn visualizer(ui: &mut Ui, live: &DagVisualizer, waiting: &str) -> Option<String
         ui.allocate_painter(vec2(ui.available_width(), CANVAS_HEIGHT), Sense::click());
     let rect = response.rect;
 
-    // Hovering anywhere on the canvas freezes it, so a block can be picked out.
-    let paused = ui.rect_contains_pointer(rect) && !live.is_empty();
+    // Resting the pointer on the canvas freezes it, so a block can be picked out; a
+    // pointer just passing (or scrolling) over it doesn't.
+    let now = ui.input(|i| i.time);
+    let hovering = ui.rect_contains_pointer(rect) && !live.is_empty();
+    let scrolling = ui.input(|i| i.smooth_scroll_delta != Vec2::ZERO);
+    view.hover_since = match view.hover_since {
+        _ if !hovering || scrolling => None,
+        None => Some(now),
+        since => since,
+    };
+    let paused = view
+        .hover_since
+        .is_some_and(|since| now - since >= HOVER_PAUSE_SECS);
+    if hovering && !paused {
+        // Wake up to start the pause even if nothing else repaints.
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_secs_f64(HOVER_PAUSE_SECS));
+    }
     // Taken out while drawing so `view` stays free to animate; put back before storing.
     let frozen = match view.frozen.take() {
         Some(f) if paused => Some(f),
@@ -144,7 +170,7 @@ fn draw_blocks(
             painter,
             rect.center_top() + vec2(0.0, 10.0),
             Align2::CENTER_TOP,
-            "Updates paused during hover",
+            "Paused: point at a block, click for its details",
         );
     }
     if let Some(block) = hovered_block {
@@ -358,7 +384,7 @@ pub(super) fn stats(ui: &mut Ui, app: &App) {
             kv(
                 ui,
                 "Past Median Time",
-                or_dash(dag, |d| d.past_median_time.to_string()),
+                or_dash(dag, |d| format_when(d.past_median_time)),
             );
         });
 

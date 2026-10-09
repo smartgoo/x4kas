@@ -83,6 +83,12 @@ pub fn format_duration(d: std::time::Duration) -> String {
     }
 }
 
+/// A unix-millisecond timestamp as UTC and how long ago, `2026-10-08T12:34:56Z (5m ago)`.
+pub fn format_when(ms: u64) -> String {
+    let ago = std::time::Duration::from_millis(now_ms().saturating_sub(ms));
+    format!("{} ({} ago)", format_utc(ms), format_duration(ago))
+}
+
 /// A unix-millisecond timestamp as UTC, `2026-10-08T12:34:56Z`.
 pub fn format_utc(ms: u64) -> String {
     let secs = ms / 1000;

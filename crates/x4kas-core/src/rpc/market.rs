@@ -36,10 +36,18 @@ pub fn start_market_polling(app_state: Arc<RwLock<App>>, interval: Duration) {
             if app_state.read().await.paused {
                 continue;
             }
-            if let Ok(data) = fetch_market_data(&client).await {
-                let mut app = app_state.write().await;
-                app.market_data = Some(data);
-                app.mark_dirty();
+            match fetch_market_data(&client).await {
+                Ok(data) => {
+                    let mut app = app_state.write().await;
+                    app.market_data = Some(data);
+                    app.market_error = None;
+                    app.mark_dirty();
+                }
+                Err(e) => {
+                    let mut app = app_state.write().await;
+                    app.market_error = Some(e.to_string());
+                    app.mark_dirty();
+                }
             }
         }
     });
@@ -54,6 +62,7 @@ async fn fetch_market_data(client: &reqwest::Client) -> Result<MarketData, reqwe
         market_cap: kaspa.usd_market_cap.unwrap_or(0.0),
         volume_24h: kaspa.usd_24h_vol.unwrap_or(0.0),
         price_change_24h_pct: kaspa.usd_24h_change,
+        fetched_at: Some(std::time::Instant::now()),
     })
 }
 

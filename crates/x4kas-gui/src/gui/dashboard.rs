@@ -8,8 +8,8 @@ use super::analytics::{self, panel_card};
 use super::blockdag;
 use super::theme;
 use super::widgets::{
-    CARD_GAP, card, card_with_header, kv, kv_columns, kv_grid, kv_with, or_dash, subheader,
-    weighted_columns, yes_no,
+    CARD_GAP, card, card_with_header, copy_value, kv, kv_columns, kv_grid, kv_with, or_dash,
+    subheader, weighted_columns, yes_no,
 };
 use x4kas_core::app::{AnalyticsPanel, App};
 use x4kas_core::format::{format_duration, format_hashrate, format_kas, format_number, format_usd};
@@ -104,8 +104,8 @@ pub fn show(ui: &mut Ui, app: &mut App) {
                 app,
                 "Top Senders",
                 AnalyticsPanel::TopSenders,
-                |ui, view| {
-                    analytics::addresses(ui, view.map(|v| v.top_senders.as_slice()), "sender")
+                |ui, app, view| {
+                    analytics::addresses(ui, app, view.map(|v| v.top_senders.as_slice()), "sender")
                 },
             );
             panel_card(
@@ -113,8 +113,13 @@ pub fn show(ui: &mut Ui, app: &mut App) {
                 app,
                 "Top Receivers",
                 AnalyticsPanel::TopReceivers,
-                |ui, view| {
-                    analytics::addresses(ui, view.map(|v| v.top_receivers.as_slice()), "receiver")
+                |ui, app, view| {
+                    analytics::addresses(
+                        ui,
+                        app,
+                        view.map(|v| v.top_receivers.as_slice()),
+                        "receiver",
+                    )
                 },
             );
         });
@@ -124,8 +129,12 @@ pub fn show(ui: &mut Ui, app: &mut App) {
 // Node-backed cards always draw every row, with dashes until the data arrives, so the
 // layout doesn't jump as it fills in.
 
+/// Market data older than this (the API failing since) is marked stale.
+const MARKET_STALE: std::time::Duration = std::time::Duration::from_secs(180);
+
 fn markets(ui: &mut Ui, app: &App) {
     let market = app.market_data.as_ref();
+    let age = market.and_then(|m| m.fetched_at).map(|at| at.elapsed());
     kv_grid(ui, "markets", |ui| {
         kv_with(ui, "Price (USD)", |ui| {
             // Right to left: the change first, so it ends up after the price.
@@ -158,6 +167,25 @@ fn markets(ui: &mut Ui, app: &App) {
             or_dash(market, |m| format_usd(m.volume_24h)),
         );
     });
+    // Say so when the numbers stopped updating, or never arrived.
+    match (age, &app.market_error) {
+        (Some(age), _) if age > MARKET_STALE => {
+            ui.label(
+                RichText::new(format!("Last updated {} ago", format_duration(age)))
+                    .color(theme::WARN),
+            )
+            .on_hover_text(
+                app.market_error
+                    .as_deref()
+                    .unwrap_or("The market data source hasn't answered since"),
+            );
+        }
+        (None, Some(error)) => {
+            ui.label(RichText::new("Market data unavailable").weak())
+                .on_hover_text(error);
+        }
+        _ => {}
+    }
 }
 
 /// Coin supply and the block reward schedule.
@@ -237,11 +265,18 @@ fn node_info(ui: &mut Ui, app: &App) {
             None => RichText::new("—"),
         };
         kv(ui, "Synced", synced);
-        kv(
-            ui,
-            "UTXO Index",
-            or_dash(info, |i| yes_no(i.has_utxo_index).into()),
-        );
+        kv_with(ui, "UTXO Index", |ui| match info {
+            Some(i) if i.has_utxo_index => {
+                ui.label(yes_no(true));
+            }
+            Some(_) => {
+                ui.label(RichText::new(yes_no(false)).color(theme::WARN))
+                    .on_hover_text("The watchlist needs the node's UTXO index (--utxoindex)");
+            }
+            None => {
+                ui.label("—");
+            }
+        });
         let dag = app.node.dag_info.as_ref();
         kv(
             ui,
@@ -253,8 +288,18 @@ fn node_info(ui: &mut Ui, app: &App) {
             "Header Count",
             or_dash(dag, |d| format_number(d.header_count)),
         );
-        kv(ui, "URL", or_dash(app.node.node_url.clone(), |u| u));
-        kv(ui, "Node ID", or_dash(app.node.node_uid.clone(), |u| u));
+        kv_with(ui, "URL", |ui| match app.node.node_url.as_deref() {
+            Some(url) => copy_value(ui, url, "Copy URL"),
+            None => {
+                ui.label("—");
+            }
+        });
+        kv_with(ui, "Node ID", |ui| match app.node.node_uid.as_deref() {
+            Some(id) => copy_value(ui, id, "Copy node id"),
+            None => {
+                ui.label("—");
+            }
+        });
     });
 }
 

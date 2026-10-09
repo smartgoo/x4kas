@@ -786,6 +786,8 @@ pub struct App {
     /// The public list fetch (on launch and periodically, `labels::start_label_refresh`).
     pub label_refresh: LabelRefresh,
     pub market_data: Option<MarketData>,
+    /// Why the last market fetch failed; cleared by the next success.
+    pub market_error: Option<String>,
 
     pub rpc_explorer: RpcExplorerState,
 

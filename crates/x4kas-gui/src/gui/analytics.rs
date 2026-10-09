@@ -7,7 +7,7 @@ use egui_extras::{Column, TableBuilder};
 use super::theme;
 use super::widgets::{
     address, card_with_header, direct_node_placeholder, fit_label, kv, kv_columns, kv_grid,
-    or_dash, placeholder, section_title, subheader,
+    kv_with, or_dash, placeholder, section_title, subheader,
 };
 use x4kas_core::analytics::{AggregatedView, InspectionCounts, ScriptClassCounts};
 use x4kas_core::app::{AnalyticsPanel, App, ChainPhase, TimeWindow};
@@ -20,6 +20,18 @@ pub const TABLE_HEIGHT: f32 = 200.0;
 
 /// Shown instead of an empty list while analytics catches up, when its counts are partial.
 const SYNCING: &str = "Analyzing DAG…";
+
+/// What to show instead of an empty list while there is no view: why there is none,
+/// from the chain pipeline's phase (an error is not "analyzing").
+fn waiting_text(app: &App) -> &'static str {
+    match app.chain.phase {
+        ChainPhase::Error(_) => "Analyzer error (see the status bar)",
+        ChainPhase::WaitingForNode => "Waiting for the node to sync…",
+        ChainPhase::Idle | ChainPhase::Opening => "Starting the analyzer…",
+        _ if app.chain.write_error.is_some() => "Analyzer error (see the status bar)",
+        _ => SYNCING,
+    }
+}
 
 /// A count from `view`, or a dash without one (while syncing), never a partial `0`.
 fn count(view: Option<&AggregatedView>, f: impl FnOnce(&AggregatedView) -> u64) -> String {
@@ -52,7 +64,7 @@ pub(super) fn sync_dot(ui: &mut Ui, app: &App) {
         size * 0.25,
         theme::WARN.gamma_multiply(0.3 + 0.7 * pulse),
     );
-    response.on_hover_text(format!("Analyzing DAG ({:.1}%)", fraction * 100.0));
+    response.on_hover_text(format!("Analyzing DAG ({:.0}%)", fraction * 100.0));
     // Animate only while syncing; the frame loop otherwise repaints once a second.
     ui.ctx()
         .request_repaint_after(std::time::Duration::from_millis(50));
@@ -68,7 +80,7 @@ pub(super) fn panel_card(
     app: &mut App,
     title: &str,
     panel: AnalyticsPanel,
-    add_contents: impl FnOnce(&mut Ui, Option<&AggregatedView>),
+    add_contents: impl FnOnce(&mut Ui, &App, Option<&AggregatedView>),
 ) {
     card_with_header(
         ui,
@@ -86,7 +98,9 @@ pub(super) fn panel_card(
                     for w in TimeWindow::ALL {
                         ui.selectable_value(window, w, w.label());
                     }
-                });
+                })
+                .response
+                .on_hover_text("Time window of this card");
             sync_dot(ui, app);
         },
         |ui, app| {
@@ -95,7 +109,7 @@ pub(super) fn panel_card(
                 return;
             }
             let view = app.analytics.view(app.analytics.window(panel));
-            add_contents(ui, view.filter(|_| sync_fraction(app).is_none()));
+            add_contents(ui, app, view.filter(|_| sync_fraction(app).is_none()));
         },
     );
 }
@@ -150,7 +164,7 @@ pub(super) fn tx_chart(ui: &mut Ui, app: &App) {
         painter.text(
             rect.center(),
             egui::Align2::CENTER_CENTER,
-            SYNCING,
+            waiting_text(app),
             egui::TextStyle::Body.resolve(ui.style()),
             theme::TEXT_DIM,
         );
@@ -224,7 +238,7 @@ fn utc_time(ms: u64) -> String {
 
 // ── Transaction Summary ──
 
-pub(super) fn tx_summary(ui: &mut Ui, view: Option<&AggregatedView>) {
+pub(super) fn tx_summary(ui: &mut Ui, _app: &App, view: Option<&AggregatedView>) {
     kv_columns(ui, 220.0, |[txs, classes]| {
         subheader(txs, "Unique Transactions");
         kv_grid(txs, "tx_summary", |ui| {
@@ -276,14 +290,14 @@ pub(super) fn fee_windows(avg: &mut Ui, total: &mut Ui, app: &App) {
             let fees = view
                 .map(|v| &v.totals)
                 .and_then(|t| (t.fee_tx_count > 0).then_some(t.total_fees));
-            kv(ui, &label, or_dash(fees, |f| format_kas(f as f64, 3)));
+            kv(ui, &label, or_dash(fees, |f| format_kas(f as f64, 8)));
         }
     });
 }
 
 // ── Transaction Inspection ──
 
-pub(super) fn inspection(ui: &mut Ui, view: Option<&AggregatedView>) {
+pub(super) fn inspection(ui: &mut Ui, _app: &App, view: Option<&AggregatedView>) {
     let i = |f: fn(&InspectionCounts) -> u64| count(view, |v| f(&v.totals.inspection));
     kv_columns(ui, 270.0, |cols: &mut [Ui; 3]| {
         subheader(&mut cols[0], "Opcodes");
@@ -317,7 +331,7 @@ pub(super) fn inspection(ui: &mut Ui, view: Option<&AggregatedView>) {
 
 // ── Mining Share by Node Version ──
 
-pub(super) fn node_versions(ui: &mut Ui, view: Option<&AggregatedView>) {
+pub(super) fn node_versions(ui: &mut Ui, app: &App, view: Option<&AggregatedView>) {
     let total = view.map_or(0, AggregatedView::node_version_total);
     let share = |n: u64| n as f64 / total as f64 * 100.0;
     let name = |v: &str| if v.is_empty() { "Unknown" } else { v }.to_string();
@@ -336,30 +350,30 @@ pub(super) fn node_versions(ui: &mut Ui, view: Option<&AggregatedView>) {
         if view.is_some() {
             "No coinbase data yet"
         } else {
-            SYNCING
+            waiting_text(app)
         },
         |ui, v| {
             fit_label(ui, v);
         },
     );
     ui.add_space(2.0);
-    ui.label(
-        RichText::new(format!(
+    let footnote = match view {
+        Some(view) => format!(
             "From {} accepted coinbase transactions.",
-            count(view, AggregatedView::node_version_total)
-        ))
-        .weak()
-        .small(),
-    );
+            format_number(view.node_version_total())
+        ),
+        None => "Counting coinbase transactions…".to_string(),
+    };
+    ui.label(RichText::new(footnote).weak());
 }
 
 // ── Top Senders / Receivers ──
 
 /// `entries` is `None` while syncing.
-pub(super) fn addresses(ui: &mut Ui, entries: Option<&[(String, u64)]>, kind: &str) {
+pub(super) fn addresses(ui: &mut Ui, app: &App, entries: Option<&[(String, u64)]>, kind: &str) {
     let empty = match entries {
         Some(_) => format!("No {kind} data yet"),
-        None => SYNCING.to_string(),
+        None => waiting_text(app).to_string(),
     };
     let rows = entries
         .unwrap_or_default()
@@ -646,19 +660,18 @@ pub(super) fn miner_counts(ui: &mut Ui, app: &App) {
         .view(window)
         .filter(|_| app.connection.is_direct() && sync_fraction(app).is_none());
     let w = window.label();
-    kv(
-        ui,
-        &format!("Unique Miners ({w})"),
-        count(view, |v| v.unique_miners as u64),
-    );
-    kv(
-        ui,
-        &format!("Blocks Mined ({w})"),
-        count(view, |v| v.totals.mined_blocks),
-    );
+    const FOLLOWS: &str = "Over the Top Miners card's time window";
+    kv_with(ui, &format!("Unique Miners ({w})"), |ui| {
+        ui.label(count(view, |v| v.unique_miners as u64))
+            .on_hover_text(FOLLOWS);
+    });
+    kv_with(ui, &format!("Blocks Mined ({w})"), |ui| {
+        ui.label(count(view, |v| v.totals.mined_blocks))
+            .on_hover_text(FOLLOWS);
+    });
 }
 
-pub(super) fn top_miners(ui: &mut Ui, view: Option<&AggregatedView>) {
+pub(super) fn top_miners(ui: &mut Ui, app: &App, view: Option<&AggregatedView>) {
     let blocks = view.map_or(0, |v| v.totals.mined_blocks);
     let share = |n: u64| n as f64 / blocks.max(1) as f64 * 100.0;
     let rows = view
@@ -681,7 +694,7 @@ pub(super) fn top_miners(ui: &mut Ui, view: Option<&AggregatedView>) {
         if view.is_some() {
             "No miner data yet"
         } else {
-            SYNCING
+            waiting_text(app)
         },
         address,
     );

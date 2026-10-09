@@ -185,6 +185,8 @@ pub struct MarketData {
     pub market_cap: f64,
     pub volume_24h: f64,
     pub price_change_24h_pct: Option<f64>,
+    /// When this was fetched, so a stale price (the API failing since) can be shown as such.
+    pub fetched_at: Option<std::time::Instant>,
 }
 
 #[cfg(test)]

@@ -410,9 +410,23 @@ pub fn field_label(ui: &mut Ui, label: &str) -> egui::Response {
 }
 
 /// One row of a [`kv_grid`]: the label on the left, the value against the right edge.
+/// A value too wide for the row is truncated (with the whole of it on hover) rather
+/// than running over the label or the column beside it.
 pub fn kv(ui: &mut Ui, label: &str, value: impl Into<WidgetText>) {
+    let value: WidgetText = value.into();
     kv_with(ui, label, |ui| {
-        ui.label(value);
+        let full = value.text().to_string();
+        let galley = value.into_galley(
+            ui,
+            Some(egui::TextWrapMode::Truncate),
+            ui.available_width(),
+            egui::TextStyle::Body,
+        );
+        let elided = galley.elided;
+        let response = ui.add(egui::Label::new(galley));
+        if elided {
+            response.on_hover_text(full);
+        }
     });
 }
 
@@ -1252,7 +1266,7 @@ pub fn link_table(
             body.rows(row_height, rows.len(), |mut row| {
                 let i = row.index();
                 row.col(|ui| {
-                    ui.label(RichText::new(i.to_string()).weak());
+                    ui.label(RichText::new((i + 1).to_string()).weak());
                 });
                 row.col(|ui| cell(ui, &rows[i]));
             });

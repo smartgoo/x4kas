@@ -3,25 +3,40 @@
 use eframe::egui::{self, RichText};
 
 use super::theme;
-use super::widgets::{modal_window, section_title};
+use super::widgets::{command_key, modal_window, section_title};
 
-const SHORTCUTS: &[(&str, &str)] = &[
-    ("1 – 5", "Switch tab"),
-    ("Ctrl+Tab / Ctrl+Shift+Tab", "Next / previous tab"),
-    ("Ctrl+T / Ctrl+W", "Explorer: new / close sub tab"),
-    ("Ctrl+L", "Explorer: focus the search field"),
-    ("P", "Pause / resume polling"),
-    ("Ctrl+`", "Show / hide the terminal"),
-    ("? / F1", "Toggle this help"),
-    ("Esc", "Close the info pane, a popup or help"),
-];
+/// The shortcuts, with the command modifier named for the platform (`Cmd` on macOS,
+/// `Ctrl` elsewhere) where the app checks `Modifiers::COMMAND`.
+fn shortcuts(ctx: &egui::Context) -> Vec<(String, &'static str)> {
+    let cmd = command_key(ctx);
+    vec![
+        ("1 – 5".to_string(), "Switch tab"),
+        (
+            "Ctrl+Tab / Ctrl+Shift+Tab".to_string(),
+            "Next / previous tab",
+        ),
+        (
+            format!("{cmd}+T / {cmd}+W"),
+            "Explorer: Home to open a new sub tab / close the sub tab",
+        ),
+        (format!("{cmd}+L"), "Explorer: focus the search field"),
+        (
+            format!("{cmd}+click"),
+            "Open an address, block or transaction link in a new Explorer tab",
+        ),
+        ("P".to_string(), "Pause / resume polling"),
+        ("Ctrl+`".to_string(), "Show / hide the terminal"),
+        ("? / F1".to_string(), "Toggle this help"),
+        ("Esc".to_string(), "Close the info pane, a popup or help"),
+    ]
+}
 
 pub fn show(ctx: &egui::Context, open: &mut bool) {
     if !*open {
         return;
     }
     *open = modal_window(ctx, egui::Window::new("Help").resizable(false), |ui| {
-        section(ui, "Shortcuts", SHORTCUTS);
+        section(ui, "Shortcuts", &shortcuts(ctx));
         ui.add_space(8.0);
         ui.label(
             RichText::new(
@@ -40,7 +55,7 @@ pub fn show(ctx: &egui::Context, open: &mut bool) {
     });
 }
 
-fn section(ui: &mut egui::Ui, title: &str, rows: &[(&str, &str)]) {
+fn section(ui: &mut egui::Ui, title: &str, rows: &[(String, &str)]) {
     section_title(ui, title);
     egui::Grid::new(title)
         .num_columns(2)
@@ -48,7 +63,7 @@ fn section(ui: &mut egui::Ui, title: &str, rows: &[(&str, &str)]) {
         .min_row_height(theme::ROW_HEIGHT)
         .show(ui, |ui| {
             for (keys, action) in rows {
-                ui.label(RichText::new(*keys).color(theme::ACCENT_BRIGHT));
+                ui.label(RichText::new(keys).color(theme::ACCENT_BRIGHT));
                 ui.label(*action);
                 ui.end_row();
             }

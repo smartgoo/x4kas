@@ -641,28 +641,20 @@ fn linked_value(ui: &mut Ui, value: &str, kind: LinkKind<'_>, selected: bool, ch
         ui.selectable_label(selected || menu_open, shown.as_str())
     })
     .on_hover_cursor(egui::CursorIcon::PointingHand);
-    let hint = match (kind, in_explorer) {
-        (LinkKind::Address, false) => Some("Click for address info, right-click for more"),
-        (LinkKind::Address, true) => Some("Click to open, right-click for more"),
-        (LinkKind::Block, false) => Some("Click for block info"),
-        (LinkKind::Block, true) => Some("Click to open"),
-        (LinkKind::Transaction { .. }, false) => {
-            Some("Click for transaction info, right-click for more")
-        }
-        (LinkKind::Transaction { .. }, true) => Some("Click to open, right-click for more"),
-    };
-    let response = match (shown != value, hint) {
-        (true, Some(hint)) => response.on_hover_text(format!("{value}\n{hint}")),
-        (true, None) => response.on_hover_text(value),
-        (false, Some(hint)) => response.on_hover_text(hint),
-        (false, None) => response,
+    let hint = link_hint(ui.ctx(), kind, in_explorer);
+    let response = if shown != value {
+        response.on_hover_text(format!("{value}\n{hint}"))
+    } else {
+        response.on_hover_text(hint)
     };
 
-    // A click: the info pane, or inside the Explorer the page.
+    // A click: the info pane, or inside the Explorer the page; with Cmd held, a new
+    // Explorer tab from anywhere.
     let mut get_block = false;
     if response.clicked() {
-        if in_explorer {
-            request_explorer(ui.ctx(), kind.page(value), false);
+        let command = ui.input(|i| i.modifiers.command);
+        if in_explorer || command {
+            request_explorer(ui.ctx(), kind.page(value), command);
         } else {
             request_pane(ui.ctx(), kind.page(value));
         }
@@ -720,14 +712,43 @@ fn linked_value(ui: &mut Ui, value: &str, kind: LinkKind<'_>, selected: bool, ch
     get_block
 }
 
-/// Context menu entries that open `value` elsewhere: in the Explorer tab's current
-/// sub tab (when not already there) or a new one, and inside the Explorer (where a
-/// click navigates) in the info pane.
+/// The hover hint of a link: what a click, a Cmd+click and (for addresses and
+/// transactions, which have menus) a right-click do.
+fn link_hint(ctx: &egui::Context, kind: LinkKind<'_>, in_explorer: bool) -> String {
+    let (click, tab) = if in_explorer {
+        ("Click to open".to_string(), "a new tab")
+    } else {
+        let what = match kind {
+            LinkKind::Address => "address",
+            LinkKind::Block => "block",
+            LinkKind::Transaction { .. } => "transaction",
+        };
+        (format!("Click for {what} info"), "a new Explorer tab")
+    };
+    let more = match kind {
+        LinkKind::Address | LinkKind::Transaction { .. } => ", right-click for more",
+        LinkKind::Block => "",
+    };
+    format!("{click}, {}+click for {tab}{more}", command_key(ctx))
+}
+
+/// The platform's name of the command modifier ("Cmd" on macOS, "Ctrl" elsewhere),
+/// for hints that mention a shortcut.
+pub fn command_key(ctx: &egui::Context) -> String {
+    ctx.format_modifiers(egui::Modifiers::COMMAND)
+}
+
+/// Context menu entries that open `value` elsewhere: in the Explorer, in its own sub
+/// tab (from outside the Explorer, "Open in Explorer"; inside it, where a click
+/// navigates the active one, "Open in new tab"), and inside the Explorer also in the
+/// info pane.
 fn explorer_menu_items(ui: &mut Ui, kind: LinkKind<'_>, value: &str, in_explorer: bool) {
-    if !in_explorer && ui.button("Open in Explorer").clicked() {
-        request_explorer(ui.ctx(), kind.page(value), false);
-    }
-    if ui.button("Open in new Explorer tab").clicked() {
+    let label = if in_explorer {
+        "Open in new tab"
+    } else {
+        "Open in Explorer"
+    };
+    if ui.button(label).clicked() {
         request_explorer(ui.ctx(), kind.page(value), true);
     }
     if in_explorer && ui.button("Show in info pane").clicked() {
@@ -1011,7 +1032,9 @@ fn explorer_request_id() -> egui::Id {
 
 /// Ask the Explorer tab to show `page`, in the active sub tab or a new one, from
 /// anywhere. The GUI frame loop picks it up with [`take_explorer_requests`], switches to
-/// the tab and loads the page.
+/// the tab and loads the page: in a new sub tab when `new_tab` (every request from
+/// outside the Explorer), else in the active one (a click inside the Explorer; from the
+/// pinned Home tab that opens a new tab too).
 pub fn request_explorer(ctx: &egui::Context, page: ExplorerPage, new_tab: bool) {
     ctx.data_mut(|d| {
         d.get_temp_mut_or_default::<Vec<(ExplorerPage, bool)>>(explorer_request_id())

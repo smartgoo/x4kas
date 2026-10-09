@@ -1,23 +1,28 @@
 //! Explorer tab: browser-like sub tabs over block, address and transaction pages
 //! (`x4kas_core::explorer`), each with a search field and back/forward history. The
-//! pages are modeled on the classic Kaspa explorers, with the index's extras (acceptance,
-//! fees, resolved inputs, clusters) folded in. While the tab draws, a click on any
-//! address, block hash or transaction id navigates the active sub tab
-//! (`widgets::set_in_explorer`); the right-click menu opens it in a new one or in the
-//! info pane (`gui/pane.rs`, which shares the pages' core pieces: `block_overview`,
-//! `block_transactions`, `tx_overview`, `tx_inputs`, `tx_outputs`).
+//! first tab is the pinned Home (search hints, latest blocks, recently viewed): it is
+//! always there, and a search or a click from it opens a new tab. The pages are modeled
+//! on the classic Kaspa explorers, with the index's extras (acceptance, fees, resolved
+//! inputs, clusters) folded in. While the tab draws, a click on any address, block hash
+//! or transaction id navigates the active sub tab (`widgets::set_in_explorer`); the
+//! right-click menu opens it in a new one or in the info pane (`gui/pane.rs`, which
+//! shares the pages' core pieces: `block_overview`, `block_transactions`,
+//! `tx_overview`, `tx_inputs`, `tx_outputs`). Links from anywhere else in the app
+//! always open a new tab (or switch to the one already on the page). The 🕓 button in
+//! the nav bar opens a thin pane on the left with the recently viewed pages.
 
 use std::collections::HashMap;
 
-use eframe::egui::{self, Button, RichText, TextEdit, Ui};
+use eframe::egui::{
+    self, Align2, Button, CornerRadius, RichText, Sense, Stroke, StrokeKind, TextEdit, Ui, vec2,
+};
 use egui_extras::Column;
 
 use super::address::{self, AddressForms};
-use super::tab_button;
 use super::theme;
 use super::widgets::{
-    CARD_GAP, address as address_widget, block_hash, card, copy_value, is_testnet, kv, kv_columns,
-    kv_grid, kv_with, label_search_popup, link_table, or_dash, page_table, placeholder,
+    CARD_GAP, address as address_widget, block_hash, card, command_key, copy_value, is_testnet, kv,
+    kv_columns, kv_grid, kv_with, label_search_popup, link_table, or_dash, page_table, placeholder,
     primary_button, set_in_explorer, subheader, table_header, table_row_height, transaction_id,
     transaction_id_in_block, weighted_columns, yes_no,
 };
@@ -28,7 +33,7 @@ use x4kas_core::explorer::{
 };
 use x4kas_core::format::{
     explorer_block_url, explorer_tx_url, format_duration, format_kas, format_number, format_utc,
-    kaspa_stream_block_url, kaspa_stream_tx_url, now_ms,
+    kaspa_stream_block_url, kaspa_stream_tx_url, now_ms, shorten_middle,
 };
 use x4kas_core::index::cluster::CHANGE_THRESHOLD;
 
@@ -38,6 +43,17 @@ const LATEST_BLOCKS: usize = 25;
 const TABLE_MAX_HEIGHT: f32 = 420.0;
 /// The height of a block's parents, children and merge set lists before scrolling.
 const HASH_LIST_HEIGHT: f32 = 160.0;
+/// The recents pane's default width and the range it resizes within.
+const RECENTS_WIDTH: f32 = 300.0;
+const RECENTS_WIDTH_RANGE: std::ops::RangeInclusive<f32> = 220.0..=480.0;
+/// A sub tab's inner padding.
+const TAB_PADDING: egui::Vec2 = vec2(10.0, 6.0);
+/// Characters of a sub tab's title before it is shortened in the middle.
+const TAB_TITLE_MAX: usize = 30;
+/// The side of a sub tab's close button.
+const TAB_CLOSE_SIZE: f32 = 15.0;
+/// The corner radius of a sub tab's top.
+const TAB_RADIUS: u8 = 5;
 
 /// The tab's own state: the search drafts and the address page's forms.
 #[derive(Default)]
@@ -48,6 +64,10 @@ pub struct ExplorerUi {
     search_open: bool,
     /// Focus the search field on the next frame (Ctrl+L).
     pub focus_search: bool,
+    /// The recently viewed pane on the left is open.
+    recents_open: bool,
+    /// The active sub tab last frame, to scroll a newly active one into view.
+    shown_tab: Option<u64>,
     forms: AddressForms,
 }
 
@@ -66,6 +86,23 @@ impl ExplorerUi {
             let _ = cmd_tx.send(UiCommand::ExplorerLoad(page.clone()));
         }
 
+        if self.recents_open {
+            egui::SidePanel::left("explorer_recents")
+                .resizable(true)
+                .default_width(RECENTS_WIDTH)
+                .width_range(RECENTS_WIDTH_RANGE)
+                .frame(egui::Frame::NONE.inner_margin(egui::Margin {
+                    right: CARD_GAP as i8,
+                    ..Default::default()
+                }))
+                .show_inside(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink(false)
+                        .show(ui, |ui| {
+                            card(ui, "Recently viewed", |ui| recent(ui, app));
+                        });
+                });
+        }
         let mut open_flows = false;
         egui::ScrollArea::vertical()
             .auto_shrink(false)
@@ -78,11 +115,12 @@ impl ExplorerUi {
         set_in_explorer(ui.ctx(), false);
     }
 
-    /// New tab (Ctrl+T), close tab (Ctrl+W) and focus the search field (Ctrl+L).
+    /// New tab (Ctrl+T: Home with the search focused, where a search opens a tab),
+    /// close tab (Ctrl+W) and focus the search field (Ctrl+L).
     pub fn handle_shortcuts(&mut self, ctx: &egui::Context, app: &mut App) {
         let m = egui::Modifiers::COMMAND;
         if ctx.input_mut(|i| i.consume_key(m, egui::Key::T)) {
-            app.explorer.open_tab(ExplorerPage::Home);
+            app.explorer.go_home();
             self.focus_search = true;
         }
         if ctx.input_mut(|i| i.consume_key(m, egui::Key::W)) {
@@ -94,39 +132,77 @@ impl ExplorerUi {
         }
     }
 
-    /// The sub tabs, like a browser's: a click activates, × or a middle click closes,
-    /// + opens a new Home tab.
+    /// The sub tabs, like a browser's, in one row over a rule: a click activates, the ×
+    /// in the tab or a middle click closes (not Home, which is pinned), + goes Home to
+    /// search for a page to open in a new tab. The tabs scroll sideways once they
+    /// overflow (a newly active tab is scrolled into view); + stays put after them.
     fn tab_strip(&mut self, ui: &mut Ui, app: &mut App) {
         let mut activate = None;
         let mut close = None;
         let mut open = false;
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing.x = 2.0;
-            for (i, tab) in app.explorer.tabs.iter().enumerate() {
-                let title = tab_title(app, &tab.page);
-                let selected = i == app.explorer.active;
-                let response = tab_button(ui, &title, selected).on_hover_text(match &tab.page {
-                    ExplorerPage::Home => "Home".to_string(),
-                    page => page.query().to_string(),
+        let font = tab_font(ui);
+        let tab_height = ui.fonts_mut(|f| f.row_height(&font)) + 2.0 * TAB_PADDING.y;
+        let cmd = command_key(ui.ctx());
+        // The rule the tabs sit on; the active tab's fill covers its share of it.
+        let strip = ui.available_rect_before_wrap();
+        let baseline = strip.top() + tab_height - 0.5;
+        ui.painter().hline(
+            strip.x_range(),
+            baseline,
+            Stroke::new(1.0_f32, theme::BORDER),
+        );
+        let active_id = app.explorer.active_tab().id;
+        let reveal = self.shown_tab != Some(active_id);
+        self.shown_tab = Some(active_id);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 3.0;
+            let plus = RichText::new("+")
+                .color(theme::ACCENT)
+                .size(font.size + 2.0);
+            let plus_width = ui
+                .painter()
+                .layout_no_wrap(plus.text().to_string(), font.clone(), theme::ACCENT)
+                .size()
+                .x
+                + 2.0 * ui.spacing().button_padding.x
+                + 2.0 * ui.spacing().item_spacing.x;
+            egui::ScrollArea::horizontal()
+                .id_salt("explorer_tabs")
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                .auto_shrink([true, true])
+                .max_width(ui.available_width() - plus_width)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 3.0;
+                        for (i, tab) in app.explorer.tabs.iter().enumerate() {
+                            let title = tab_title(app, &tab.page);
+                            let selected = i == app.explorer.active;
+                            let response =
+                                sub_tab(ui, tab.id, &title, selected, !tab.is_home(), tab_height);
+                            if selected && reveal {
+                                response.tab.scroll_to_me(None);
+                            }
+                            match &tab.page {
+                                ExplorerPage::Home => response
+                                    .tab
+                                    .on_hover_text("Home: search, latest blocks, recently viewed"),
+                                page => response.tab.on_hover_text(page.query()),
+                            };
+                            if let Some(close_response) = response.close {
+                                close_response.on_hover_text(format!("Close tab ({cmd}+W)"));
+                            }
+                            if response.clicked {
+                                activate = Some(i);
+                            }
+                            if response.closed {
+                                close = Some(i);
+                            }
+                        }
+                    });
                 });
-                if response.clicked() {
-                    activate = Some(i);
-                }
-                if response.middle_clicked() {
-                    close = Some(i);
-                }
-                if ui
-                    .add(Button::new(RichText::new("×").color(theme::TEXT_DIM)).frame(false))
-                    .on_hover_text("Close tab (Ctrl+W)")
-                    .clicked()
-                {
-                    close = Some(i);
-                }
-                ui.add_space(6.0);
-            }
             if ui
-                .add(Button::new(RichText::new("+").color(theme::ACCENT)).frame(false))
-                .on_hover_text("New tab (Ctrl+T)")
+                .add(Button::new(plus).frame(false))
+                .on_hover_text(format!("New tab: search from Home ({cmd}+T)"))
                 .clicked()
             {
                 open = true;
@@ -140,7 +216,7 @@ impl ExplorerUi {
             app.explorer.close_tab(i);
         }
         if open {
-            app.explorer.open_tab(ExplorerPage::Home);
+            app.explorer.go_home();
             self.focus_search = true;
         }
     }
@@ -170,6 +246,8 @@ impl ExplorerUi {
         let mut submitted = false;
         let mut field = None;
         ui.horizontal(|ui| {
+            ui.toggle_value(&mut self.recents_open, "🕓")
+                .on_hover_text("Recently viewed pages");
             back = ui
                 .add_enabled(can_back, Button::new("◀"))
                 .on_hover_text("Back")
@@ -231,6 +309,10 @@ impl ExplorerUi {
         if let Some(target) = go {
             app.explorer.navigate(target);
             self.search_open = false;
+            // A search from Home opened a tab: Home's own field starts over.
+            if app.explorer.active_tab().id != id {
+                self.drafts.remove(&id);
+            }
         }
     }
 
@@ -252,7 +334,7 @@ impl ExplorerUi {
             load = app.explorer.load(target);
         }
         match (page, load) {
-            (ExplorerPage::Home, _) => home(ui, app),
+            (ExplorerPage::Home, _) => home(ui, app, self.recents_open),
             (_, None) if !connected => card(ui, "Explorer", |ui| {
                 placeholder(ui, "Connect to a node to load this page.");
             }),
@@ -325,6 +407,136 @@ fn tab_title(app: &App, page: &ExplorerPage) -> String {
     }
 }
 
+/// The sub tabs' font: a size over the body's.
+fn tab_font(ui: &Ui) -> egui::FontId {
+    let mut font = egui::TextStyle::Button.resolve(ui.style());
+    font.size += 1.0;
+    font
+}
+
+/// A drawn [`sub_tab`]: its responses (for hover texts and scrolling) and what a
+/// click did.
+struct SubTabResponse {
+    tab: egui::Response,
+    /// The close button's response, when the tab is closable.
+    close: Option<egui::Response>,
+    /// The tab was clicked to activate it.
+    clicked: bool,
+    /// The tab was closed (its × or a middle click).
+    closed: bool,
+}
+
+/// One sub tab: a raised, top-rounded block on the strip's rule, the active one on the
+/// lighter surface with an accent line along its top, and (when `closable`) a close
+/// button grouped into its right end, visible while the tab is active or hovered. A
+/// middle click closes too.
+fn sub_tab(
+    ui: &mut Ui,
+    id: u64,
+    title: &str,
+    selected: bool,
+    closable: bool,
+    height: f32,
+) -> SubTabResponse {
+    let font = tab_font(ui);
+    let title = shorten_middle(title, TAB_TITLE_MAX);
+    let text = ui
+        .painter()
+        .layout_no_wrap(title, font.clone(), theme::TEXT);
+    let close_room = if closable {
+        TAB_PADDING.x * 0.6 + TAB_CLOSE_SIZE
+    } else {
+        0.0
+    };
+    let width = text.size().x + 2.0 * TAB_PADDING.x + close_room;
+    let (rect, response) = ui.allocate_exact_size(vec2(width, height), Sense::click());
+    let widget_id = ui.id().with(("explorer_tab", id));
+    // The close button sits on top of the tab: registered after it, so it gets the click.
+    let close_rect = egui::Rect::from_center_size(
+        egui::pos2(
+            rect.right() - TAB_PADDING.x * 0.7 - TAB_CLOSE_SIZE / 2.0,
+            rect.center().y,
+        ),
+        egui::Vec2::splat(TAB_CLOSE_SIZE),
+    );
+    let close = closable.then(|| ui.interact(close_rect, widget_id.with("close"), Sense::click()));
+    let close_hovered = close.as_ref().is_some_and(|r| r.hovered());
+    let hovered = response.hovered() || close_hovered;
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::SelectableLabel,
+            ui.is_enabled(),
+            selected,
+            text.text(),
+        )
+    });
+
+    if ui.is_rect_visible(rect) {
+        let (fill, stroke, color) = if selected {
+            (theme::SURFACE_HI, theme::BORDER_HI, theme::TEXT_BRIGHT)
+        } else if hovered {
+            (theme::SURFACE, theme::BORDER_HI, theme::TEXT)
+        } else {
+            (theme::SURFACE, theme::BORDER, theme::TEXT_DIM)
+        };
+        let corners = CornerRadius {
+            nw: TAB_RADIUS,
+            ne: TAB_RADIUS,
+            sw: 0,
+            se: 0,
+        };
+        let painter = ui.painter();
+        // The active tab reaches over the rule so it joins the page below.
+        let body = if selected {
+            rect.with_max_y(rect.bottom() + 1.0)
+        } else {
+            rect
+        };
+        painter.rect_filled(body, corners, fill);
+        // Sides and the rounded top only: the outline is drawn on a taller rect whose
+        // bottom edge is clipped away, since the rule under the strip (or, for the
+        // active tab, the page) is the bottom.
+        painter.with_clip_rect(body).rect_stroke(
+            body.with_max_y(body.bottom() + 2.0 * f32::from(TAB_RADIUS)),
+            corners,
+            Stroke::new(1.0_f32, stroke),
+            StrokeKind::Inside,
+        );
+        if selected {
+            painter.line_segment(
+                [
+                    egui::pos2(rect.left() + 4.0, rect.top() + 1.5),
+                    egui::pos2(rect.right() - 4.0, rect.top() + 1.5),
+                ],
+                Stroke::new(2.0_f32, theme::ACCENT),
+            );
+        }
+        let text_pos = egui::pos2(
+            rect.left() + TAB_PADDING.x,
+            rect.center().y - text.size().y / 2.0,
+        );
+        painter.galley_with_override_text_color(text_pos, text, color);
+        if closable && (selected || hovered) {
+            let color = if close_hovered {
+                painter.rect_filled(close_rect, 3.0, theme::BORDER_HI);
+                theme::TEXT_BRIGHT
+            } else {
+                theme::TEXT_DIM
+            };
+            painter.text(close_rect.center(), Align2::CENTER_CENTER, "×", font, color);
+        }
+    }
+    let close_clicked = close.as_ref().is_some_and(|r| r.clicked());
+    let closed = close_clicked || (closable && response.middle_clicked());
+    let clicked = response.clicked() && !close_clicked;
+    SubTabResponse {
+        tab: response.on_hover_cursor(egui::CursorIcon::PointingHand),
+        close,
+        clicked,
+        closed,
+    }
+}
+
 fn ago(ms: u64) -> String {
     format!(
         "{} ago",
@@ -345,12 +557,19 @@ fn kas(sompi: u64) -> String {
 
 // --- Home ---
 
-/// Search hints, the newest blocks from the node and the pages viewed recently.
-fn home(ui: &mut Ui, app: &App) {
+/// Search hints, the newest blocks from the node and the pages viewed recently (unless
+/// the recents pane already shows them beside the page).
+fn home(ui: &mut Ui, app: &App, recents_open: bool) {
     card(ui, "Explorer", |ui| {
-        ui.label("Search for a Kaspa address, a block hash or a transaction id above.");
+        ui.label(
+            "Search for a Kaspa address, a block hash or a transaction id above; it opens in a new tab.",
+        );
     });
     ui.add_space(CARD_GAP);
+    if recents_open {
+        card(ui, "Latest blocks", |ui| latest_blocks(ui, app));
+        return;
+    }
     weighted_columns(ui, [1.0, 1.0], 360.0, |[left, right]| {
         card(left, "Latest blocks", |ui| latest_blocks(ui, app));
         card(right, "Recently viewed", |ui| recent(ui, app));
@@ -395,6 +614,7 @@ fn latest_blocks(ui: &mut Ui, app: &App) {
     });
 }
 
+/// The recently viewed pages, newest first (the Home card and the recents pane).
 fn recent(ui: &mut Ui, app: &App) {
     let mut any = false;
     kv_grid(ui, "recent_pages", |ui| {

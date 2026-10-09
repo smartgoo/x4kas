@@ -258,8 +258,10 @@ impl eframe::App for GuiApp {
             let _ = self.cmd_tx.send(UiCommand::SetLabel { address, name });
         }
 
-        // "Open in Explorer" from anywhere (a right-click menu, the info pane): switch
-        // to the tab, close the pane, and show the page.
+        // "Open in Explorer" from anywhere (a right-click menu, the info pane, a
+        // Cmd+click): switch to the tab, close the pane, and show the page: from outside
+        // the Explorer in its own sub tab (a new one, or the one already on that page);
+        // a click inside it navigates the active one.
         let requests = widgets::take_explorer_requests(ctx);
         if !requests.is_empty() {
             app.active_tab = Tab::Explorer;
@@ -268,7 +270,7 @@ impl eframe::App for GuiApp {
         }
         for (page, new_tab) in requests {
             if new_tab {
-                app.explorer.open_tab(page);
+                app.explorer.show_in_tab(page);
             } else {
                 app.explorer.navigate(page);
             }

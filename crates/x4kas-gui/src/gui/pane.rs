@@ -182,10 +182,10 @@ impl InfoPane {
                 }
                 if ui
                     .button("Open in Explorer")
-                    .on_hover_text("Show this as a page in the Explorer tab")
+                    .on_hover_text("Show this as a page in a new Explorer tab")
                     .clicked()
                 {
-                    request_explorer(ui.ctx(), page.clone(), false);
+                    request_explorer(ui.ctx(), page.clone(), true);
                 }
             });
         });

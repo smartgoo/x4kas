@@ -96,6 +96,8 @@ pub fn parse_query(input: &str) -> Option<ExplorerPage> {
 const HISTORY_MAX: usize = 50;
 /// The info pane's tab id (it isn't in `ExplorerState::tabs`, so no sub tab has it).
 const PANE_TAB_ID: u64 = u64::MAX;
+/// The Home tab's id: the first tab, always there, never closed or navigated away.
+pub const HOME_TAB_ID: u64 = 0;
 
 /// One browser-like sub tab: its page and history.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,6 +118,11 @@ impl ExplorerTab {
             back: Vec::new(),
             forward: Vec::new(),
         }
+    }
+
+    /// Whether this is the pinned Home tab.
+    pub fn is_home(&self) -> bool {
+        self.id == HOME_TAB_ID
     }
 
     /// Go to `page`, pushing the current one onto the back history.
@@ -192,6 +199,8 @@ pub const RECENT_MAX: usize = 12;
 /// The Explorer tab: its sub tabs and the pages loaded for them.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExplorerState {
+    /// The first one is the pinned Home tab ([`HOME_TAB_ID`]): it stays Home, can't be
+    /// closed, and a navigation from it opens a new tab instead.
     pub tabs: Vec<ExplorerTab>,
     /// Index into `tabs`.
     pub active: usize,
@@ -211,7 +220,7 @@ pub struct ExplorerState {
 impl Default for ExplorerState {
     fn default() -> Self {
         Self {
-            tabs: vec![ExplorerTab::new(0, ExplorerPage::Home)],
+            tabs: vec![ExplorerTab::new(HOME_TAB_ID, ExplorerPage::Home)],
             active: 0,
             next_id: 1,
             pane: None,
@@ -243,13 +252,21 @@ impl ExplorerState {
         id
     }
 
-    /// Close the tab at `index`. The last tab isn't closed but reset to Home.
-    pub fn close_tab(&mut self, index: usize) {
-        if index >= self.tabs.len() {
-            return;
+    /// Show `page` in its own tab: switch to the tab already on it, else open a new one
+    /// ([`open_tab`](Self::open_tab)). Requests from outside the Explorer use this, so
+    /// asking for the same page twice doesn't fill the strip with copies. Returns the
+    /// tab's id.
+    pub fn show_in_tab(&mut self, page: ExplorerPage) -> u64 {
+        if let Some(i) = self.tabs.iter().position(|tab| tab.page == page) {
+            self.active = i;
+            return self.tabs[i].id;
         }
-        if self.tabs.len() == 1 {
-            self.tabs[0] = ExplorerTab::new(self.tabs[0].id, ExplorerPage::Home);
+        self.open_tab(page)
+    }
+
+    /// Close the tab at `index`; the Home tab stays.
+    pub fn close_tab(&mut self, index: usize) {
+        if index >= self.tabs.len() || self.tabs[index].is_home() {
             return;
         }
         self.tabs.remove(index);
@@ -258,8 +275,20 @@ impl ExplorerState {
         }
     }
 
-    /// Navigate the active tab to `page`.
+    /// Switch to the Home tab.
+    pub fn go_home(&mut self) {
+        if let Some(i) = self.tabs.iter().position(ExplorerTab::is_home) {
+            self.active = i;
+        }
+    }
+
+    /// Navigate the active tab to `page`; from the Home tab, which stays Home, open
+    /// `page` in a new tab instead.
     pub fn navigate(&mut self, page: ExplorerPage) {
+        if self.active_tab().is_home() {
+            self.open_tab(page);
+            return;
+        }
         self.active_tab_mut().navigate(page.clone());
         self.visited(page);
     }
@@ -868,17 +897,22 @@ mod tests {
     fn tabs_open_after_the_active_one_and_close_sensibly() {
         let mut state = ExplorerState::default();
         assert_eq!(state.tabs.len(), 1);
+        assert!(state.active_tab().is_home());
         let a = state.open_tab(ExplorerPage::Block(h('a')));
         let b = state.open_tab(ExplorerPage::Block(h('b')));
         assert_ne!(a, b);
         state.active = 1;
         let c = state.open_tab(ExplorerPage::Block(h('c')));
         let ids: Vec<u64> = state.tabs.iter().map(|t| t.id).collect();
-        assert_eq!(ids, vec![0, a, c, b]);
+        assert_eq!(ids, vec![HOME_TAB_ID, a, c, b]);
         assert_eq!(state.active, 2);
 
-        // Closing a tab before the active one keeps the same tab active.
+        // The Home tab can't be closed.
         state.close_tab(0);
+        assert_eq!(state.tabs.len(), 4);
+        assert_eq!(state.active, 2);
+        // Closing a tab before the active one keeps the same tab active.
+        state.close_tab(1);
         assert_eq!(state.active, 1);
         assert_eq!(state.active_tab().id, c);
         // Closing the last tab in the row moves to the one before it.
@@ -886,12 +920,45 @@ mod tests {
         state.close_tab(2);
         assert_eq!(state.active, 1);
         state.close_tab(1);
-        state.close_tab(0);
-        // The last tab is reset rather than removed.
         assert_eq!(state.tabs.len(), 1);
-        assert_eq!(state.active_tab().page, ExplorerPage::Home);
+        assert!(state.active_tab().is_home());
         state.close_tab(7); // out of range: ignored
         assert_eq!(state.tabs.len(), 1);
+    }
+
+    #[test]
+    fn home_tab_stays_home_and_navigates_into_a_new_tab() {
+        let mut state = ExplorerState::default();
+        state.navigate(ExplorerPage::Block(h('a')));
+        assert_eq!(state.tabs.len(), 2);
+        assert_eq!(state.active, 1);
+        assert_eq!(state.tabs[0].page, ExplorerPage::Home);
+        assert_eq!(state.active_tab().page, ExplorerPage::Block(h('a')));
+        // The new tab navigates in place.
+        state.navigate(ExplorerPage::Block(h('b')));
+        assert_eq!(state.tabs.len(), 2);
+        assert_eq!(state.active_tab().back, vec![ExplorerPage::Block(h('a'))]);
+        state.go_home();
+        assert_eq!(state.active, 0);
+        assert!(state.active_tab().is_home());
+    }
+
+    #[test]
+    fn show_in_tab_reuses_the_tab_on_the_page() {
+        let mut state = ExplorerState::default();
+        let a = state.show_in_tab(ExplorerPage::Block(h('a')));
+        let b = state.show_in_tab(ExplorerPage::Block(h('b')));
+        assert_eq!(state.tabs.len(), 3);
+        assert_eq!(state.active_tab().id, b);
+        // The same page again switches back instead of opening a copy.
+        assert_eq!(state.show_in_tab(ExplorerPage::Block(h('a'))), a);
+        assert_eq!(state.tabs.len(), 3);
+        assert_eq!(state.active, 1);
+        // Home itself is never asked for; a tab that moved on no longer matches.
+        state.navigate(ExplorerPage::Block(h('c')));
+        let again = state.show_in_tab(ExplorerPage::Block(h('a')));
+        assert_ne!(again, a);
+        assert_eq!(state.tabs.len(), 4);
     }
 
     #[test]

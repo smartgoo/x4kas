@@ -5,7 +5,7 @@
 //! the page (not its data), so it is there while the page loads or when it wasn't found.
 
 use eframe::egui::containers::menu::MenuButton;
-use eframe::egui::{self, Button, OpenUrl, Response, Ui};
+use eframe::egui::{self, Button, OpenUrl, Ui};
 
 use super::address::open_flow_graph;
 use super::dialogs;
@@ -62,19 +62,20 @@ pub fn bar(ui: &mut Ui, app: &mut App, page: &ExplorerPage, cmd_tx: &CommandSend
     ui.add_space(CARD_GAP);
 }
 
-/// The address's own actions: label, watchlist and flow graph. Their wording follows
-/// the address's state (a label to add or edit, a watchlist to join or settings to
-/// change).
+/// The address's own actions: the Add/Edit menu (label, watchlist), flow graph and
+/// export. Their wording follows the address's state (a label to add or edit, a
+/// watchlist to join or settings to change).
 fn address_actions(ui: &mut Ui, app: &mut App, addr: &str, cmd_tx: &CommandSender) {
+    // One menu for what the address can be given: a label and a watchlist entry. Its
+    // items say add or edit by what it has; the button says "Add…" until it has both.
     let labelled = app.labels.user_labels().contains_key(addr);
-    let label = if labelled { "Edit label" } else { "Add label" };
-    if button(ui, label)
-        .on_hover_text("Your own name for this address, shown wherever it appears")
-        .clicked()
-    {
-        dialogs::request_label(ui.ctx(), addr);
-    }
     let watched = app.watch.entry(addr).is_some();
+    let menu = if labelled && watched {
+        "Edit ▾"
+    } else {
+        "Add ▾"
+    };
+    let label = if labelled { "Edit label" } else { "Add label" };
     let watch = if watched {
         "Watch settings"
     } else {
@@ -85,9 +86,21 @@ fn address_actions(ui: &mut Ui, app: &mut App, addr: &str, cmd_tx: &CommandSende
     } else {
         "Follow its balance and get alerts on activity"
     };
-    if button(ui, watch).on_hover_text(watch_hint).clicked() {
-        dialogs::request_watch(ui.ctx(), addr);
-    }
+    let (response, _) = MenuButton::from_button(action_button(menu)).ui(ui, |ui| {
+        if ui
+            .button(label)
+            .on_hover_text("Your own name for this address, shown wherever it appears")
+            .clicked()
+        {
+            dialogs::request_label(ui.ctx(), addr);
+            ui.close();
+        }
+        if ui.button(watch).on_hover_text(watch_hint).clicked() {
+            dialogs::request_watch(ui.ctx(), addr);
+            ui.close();
+        }
+    });
+    response.on_hover_text("A label of your own, or a place on the watchlist");
     // The flow graph reads the index, which only a direct node fills.
     let direct = app.connection.is_direct();
     if ui
@@ -142,8 +155,4 @@ fn menu_link(ui: &mut Ui, text: &str, url: &str) {
 /// A menu-like button: flat until hovered.
 fn action_button(text: &str) -> Button<'static> {
     Button::new(text).frame_when_inactive(false)
-}
-
-fn button(ui: &mut Ui, text: &str) -> Response {
-    ui.add(action_button(text))
 }

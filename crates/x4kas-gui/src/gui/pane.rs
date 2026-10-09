@@ -189,7 +189,7 @@ impl InfoPane {
             });
         });
         ui.add_space(4.0);
-        actions::bar(ui, app, page, cmd_tx, true);
+        actions::bar(ui, app, page, cmd_tx);
 
         let mut retry = false;
         // One scroll position per page, so a newly shown page starts at its top.

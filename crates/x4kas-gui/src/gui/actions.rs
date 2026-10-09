@@ -1,6 +1,6 @@
 //! The action bar over an address, block or transaction page: a row of flat buttons,
 //! like an application's menu bar, at the top of the Explorer's page and of the info
-//! pane. The web explorers first, then what can be done with an address: its label and
+//! pane. The web explorers (one menu) first, then what can be done with an address: its label and
 //! watchlist settings (dialogs, see `gui/dialogs.rs`) and its flow graph. It needs only
 //! the page (not its data), so it is there while the page loads or when it wasn't found.
 
@@ -21,9 +21,8 @@ use x4kas_core::format::{
 use x4kas_core::index::export::ExportFormat;
 
 /// Draw the bar for `page`, if it is a page with actions (an address, a block or a
-/// transaction), with a rule under it and the gap to the first card. `compact` (the
-/// info pane) folds the web explorers into one "Open Explorer ▾" menu.
-pub fn bar(ui: &mut Ui, app: &mut App, page: &ExplorerPage, cmd_tx: &CommandSender, compact: bool) {
+/// transaction), with a rule under it and the gap to the first card.
+pub fn bar(ui: &mut Ui, app: &mut App, page: &ExplorerPage, cmd_tx: &CommandSender) {
     let testnet = is_testnet(ui.ctx());
     // Kaspa Stream only covers mainnet.
     let (explorer, stream) = match page {
@@ -43,19 +42,12 @@ pub fn bar(ui: &mut Ui, app: &mut App, page: &ExplorerPage, cmd_tx: &CommandSend
     };
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 2.0;
-        if compact {
-            MenuButton::from_button(action_button("Open Explorer ▾")).ui(ui, |ui| {
-                menu_link(ui, "Kaspa Explorer ↗", &explorer);
-                if let Some(stream) = &stream {
-                    menu_link(ui, "Kaspa Stream ↗", stream);
-                }
-            });
-        } else {
-            link(ui, "Kaspa Explorer ↗", &explorer);
+        MenuButton::from_button(action_button("Open Explorer ▾")).ui(ui, |ui| {
+            menu_link(ui, "Kaspa Explorer ↗", &explorer);
             if let Some(stream) = &stream {
-                link(ui, "Kaspa Stream ↗", stream);
+                menu_link(ui, "Kaspa Stream ↗", stream);
             }
-        }
+        });
         if let ExplorerPage::Address(addr) = page {
             ui.separator();
             address_actions(ui, app, addr, cmd_tx);
@@ -139,14 +131,7 @@ fn address_actions(ui: &mut Ui, app: &mut App, addr: &str, cmd_tx: &CommandSende
     });
 }
 
-/// A web link as an action: opens in the browser, the URL on hover.
-fn link(ui: &mut Ui, text: &str, url: &str) {
-    if button(ui, text).on_hover_text(url).clicked() {
-        ui.ctx().open_url(OpenUrl::new_tab(url));
-    }
-}
-
-/// [`link`] as a menu item.
+/// A web link as a menu item: opens in the browser, the URL on hover.
 fn menu_link(ui: &mut Ui, text: &str, url: &str) {
     if ui.button(text).on_hover_text(url).clicked() {
         ui.ctx().open_url(OpenUrl::new_tab(url));

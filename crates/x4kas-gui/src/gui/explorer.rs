@@ -1,9 +1,11 @@
 //! Explorer tab: browser-like sub tabs over block, address and transaction pages
 //! (`x4kas_core::explorer`), each with a search field and back/forward history. The
-//! first tab is the pinned Home (search hints, latest blocks, recently viewed): it is
+//! first tab is the pinned Home (search hints, latest blocks, recently viewed, the top
+//! sending and receiving addresses and the protocols by transaction count): it is
 //! always there, and a search or a click from it opens a new tab. The pages are modeled
 //! on the classic Kaspa explorers, with the index's extras (acceptance, fees, resolved
-//! inputs, clusters) folded in. While the tab draws, a click on any address, block hash
+//! inputs, clusters) folded in, plus a page per protocol listing its indexed
+//! transactions. While the tab draws, a click on any address, block hash
 //! or transaction id navigates the active sub tab (`widgets::set_in_explorer`); the
 //! right-click menu opens it in a new one or in the info pane (`gui/pane.rs`, which
 //! shares the pages' core pieces: `block_overview`, `block_transactions`,
@@ -22,20 +24,25 @@ use egui_extras::Column;
 
 use super::actions;
 use super::address;
+use super::analytics::{self, panel_card};
 use super::theme;
 use super::widgets::{
     CARD_GAP, address as address_widget, block_hash, card, card_with_header, command_key,
-    copy_value, kv, kv_columns, kv_grid, kv_with, label_search_popup, link_table, or_dash,
-    page_table, placeholder, primary_button, set_in_explorer, subheader, table_header,
+    copy_value, kv, kv_columns, kv_grid, kv_with, label_search_popup, link_table, open_page,
+    or_dash, page_table, placeholder, primary_button, set_in_explorer, subheader, table_header,
     table_row_height, transaction_id, transaction_id_in_block, weighted_columns, yes_no,
 };
-use x4kas_core::app::{App, ConnectionStatus, ExportOrigin};
+use x4kas_core::app::{AnalyticsPanel, App, ConnectionStatus, ExportOrigin};
 use x4kas_core::controller::{CommandSender, UiCommand};
 use x4kas_core::explorer::{
-    AddressPageData, BlockView, ExplorerPage, PageData, PageLoad, TxStatus, TxView, parse_query,
+    AddressPageData, BlockView, ExplorerPage, PageData, PageLoad, ProtocolPageData, TxStatus,
+    TxView, parse_query,
 };
-use x4kas_core::format::{format_kas, format_number, format_when, shorten_middle};
+use x4kas_core::format::{
+    format_duration, format_kas, format_number, format_when, now_ms, shorten_middle,
+};
 use x4kas_core::index::cluster::CHANGE_THRESHOLD;
+use x4kas_core::tx_inspect::TransactionProtocol;
 
 /// Blocks listed on the Home page.
 const LATEST_BLOCKS: usize = 25;
@@ -46,6 +53,8 @@ const HASH_LIST_HEIGHT: f32 = 160.0;
 /// The recents pane's default width and the range it resizes within.
 const RECENTS_WIDTH: f32 = 300.0;
 const RECENTS_WIDTH_RANGE: std::ops::RangeInclusive<f32> = 220.0..=480.0;
+/// Below this width Home's Top Senders, Top Receivers and Protocols cards wrap.
+const HOME_ANALYTICS_CARD: f32 = 360.0;
 /// A sub tab's inner padding.
 const TAB_PADDING: egui::Vec2 = vec2(10.0, 6.0);
 /// Characters of a sub tab's title before it is shortened in the middle.
@@ -364,7 +373,7 @@ impl ExplorerUi {
     fn page(
         &mut self,
         ui: &mut Ui,
-        app: &App,
+        app: &mut App,
         page: &ExplorerPage,
         connected: bool,
         cmd_tx: &CommandSender,
@@ -410,6 +419,7 @@ impl ExplorerUi {
                 PageData::Block(view) => block_page(ui, app, view),
                 PageData::Address(data) => address_page(ui, app, page.query(), data, cmd_tx),
                 PageData::Transaction(view) => tx_page(ui, app, view),
+                PageData::Protocol(data) => protocol_page(ui, data, cmd_tx),
                 PageData::Redirect(_) => placeholder(ui, "Resolving…"),
             },
         }
@@ -596,8 +606,10 @@ fn kas(sompi: u64) -> String {
 // --- Home ---
 
 /// Search hints, the newest blocks from the node and the pages viewed recently (unless
-/// the recents pane already shows them beside the page).
-fn home(ui: &mut Ui, app: &App, recents_open: bool, clear_recent: &mut bool) {
+/// the recents pane already shows them beside the page), then the addresses sending
+/// and receiving the most transactions and the protocols by transaction count (the
+/// analytics cards, with their time windows).
+fn home(ui: &mut Ui, app: &mut App, recents_open: bool, clear_recent: &mut bool) {
     card(ui, "Explorer", |ui| {
         ui.label(
             "Search for a Kaspa address, a block hash or a transaction id above; it opens in a new tab.",
@@ -606,12 +618,50 @@ fn home(ui: &mut Ui, app: &App, recents_open: bool, clear_recent: &mut bool) {
     ui.add_space(CARD_GAP);
     if recents_open {
         card(ui, "Latest blocks", |ui| latest_blocks(ui, app));
-        return;
+    } else {
+        weighted_columns(ui, [1.0, 1.0], 360.0, |[left, right]| {
+            card(left, "Latest blocks", |ui| latest_blocks(ui, app));
+            recent_card(right, app, clear_recent);
+        });
     }
-    weighted_columns(ui, [1.0, 1.0], 360.0, |[left, right]| {
-        card(left, "Latest blocks", |ui| latest_blocks(ui, app));
-        recent_card(right, app, clear_recent);
-    });
+    ui.add_space(CARD_GAP);
+    weighted_columns(
+        ui,
+        [1.0, 1.0, 0.8],
+        HOME_ANALYTICS_CARD,
+        |[senders, receivers, protocols]| {
+            panel_card(
+                senders,
+                app,
+                "Top Senders",
+                AnalyticsPanel::TopSenders,
+                |ui, app, view| {
+                    analytics::addresses(ui, app, view.map(|v| v.top_senders.as_slice()), "sender")
+                },
+            );
+            panel_card(
+                receivers,
+                app,
+                "Top Receivers",
+                AnalyticsPanel::TopReceivers,
+                |ui, app, view| {
+                    analytics::addresses(
+                        ui,
+                        app,
+                        view.map(|v| v.top_receivers.as_slice()),
+                        "receiver",
+                    )
+                },
+            );
+            panel_card(
+                protocols,
+                app,
+                "Protocols",
+                AnalyticsPanel::Protocols,
+                analytics::protocols,
+            );
+        },
+    );
 }
 
 /// The "Recently viewed" card with its Clear button (on Home and in the recents pane).
@@ -689,12 +739,120 @@ fn recent(ui: &mut Ui, app: &App) {
                 ExplorerPage::Transaction { txid, block } => kv_with(ui, "Transaction", |ui| {
                     transaction_id_in_block(ui, txid, block.as_deref());
                 }),
+                ExplorerPage::Protocol(protocol) => kv_with(ui, "Protocol", |ui| {
+                    protocol_link(ui, *protocol);
+                }),
                 ExplorerPage::Home | ExplorerPage::Lookup(_) => {}
             }
         }
     });
     if !any {
         placeholder(ui, "Pages you open show up here.");
+    }
+}
+
+/// A protocol's name as a link to its transactions page.
+fn protocol_link(ui: &mut Ui, protocol: TransactionProtocol) {
+    if ui
+        .link(protocol.label())
+        .on_hover_text("Its transactions")
+        .clicked()
+    {
+        open_page(ui.ctx(), ExplorerPage::Protocol(protocol));
+    }
+}
+
+// --- Protocol ---
+
+/// A protocol's page: its indexed transactions, newest first, more on request.
+fn protocol_page(ui: &mut Ui, data: &ProtocolPageData, cmd_tx: &CommandSender) {
+    card(
+        ui,
+        &format!("{} transactions", data.protocol.label()),
+        |ui| protocol_transactions(ui, data, cmd_tx),
+    );
+}
+
+/// The table of a protocol page (also the info pane's): the transactions loaded so far
+/// and a "Load older" button while the index has more.
+pub(super) fn protocol_transactions(ui: &mut Ui, data: &ProtocolPageData, cmd_tx: &CommandSender) {
+    let rows = &data.page.items;
+    if rows.is_empty() {
+        placeholder(
+            ui,
+            &format!(
+                "No {} transactions in the indexed window",
+                data.protocol.label()
+            ),
+        );
+    } else {
+        ui.push_id("protocol_txs", |ui| {
+            let row_height = table_row_height(ui);
+            let table = page_table(ui, TABLE_MAX_HEIGHT)
+                .column(Column::remainder().at_least(140.0))
+                .column(Column::auto().at_least(80.0))
+                .column(Column::auto().at_least(60.0))
+                .column(Column::auto().at_least(120.0))
+                .column(Column::auto().at_least(80.0))
+                .column(Column::remainder().at_least(140.0));
+            table_header(
+                table,
+                &[
+                    "Transaction",
+                    "When",
+                    "In → Out",
+                    "Amount (KAS)",
+                    "Fee (KAS)",
+                    "To",
+                ],
+            )
+            .body(|body| {
+                body.rows(row_height, rows.len(), |mut row| {
+                    let tx = &rows[row.index()];
+                    row.col(|ui| {
+                        transaction_id(ui, &tx.txid);
+                    });
+                    row.col(|ui| {
+                        ui.label(
+                            format_duration(std::time::Duration::from_millis(
+                                now_ms().saturating_sub(tx.time_ms),
+                            )) + " ago",
+                        )
+                        .on_hover_text(when(tx.time_ms));
+                    });
+                    row.col(|ui| {
+                        ui.label(format!("{} → {}", tx.input_count, tx.output_count));
+                    });
+                    row.col(|ui| {
+                        ui.label(format_kas(tx.output_total as f64, 8));
+                    });
+                    row.col(|ui| {
+                        ui.label(or_dash(tx.fee, |f| format_kas(f as f64, 8)));
+                    });
+                    row.col(|ui| match &tx.recipient {
+                        Some(addr) => address_widget(ui, addr),
+                        None => {
+                            ui.label("—");
+                        }
+                    });
+                });
+            });
+        });
+    }
+    if let Some(error) = &data.error {
+        ui.label(RichText::new(error).color(theme::ERROR));
+    }
+    if let Some(next) = data.page.next {
+        ui.horizontal(|ui| {
+            if data.loading_more {
+                ui.spinner();
+            } else if ui.button("Load older").clicked() {
+                let _ = cmd_tx.send(UiCommand::ProtocolPage {
+                    protocol: data.protocol,
+                    before: next,
+                });
+            }
+        });
     }
 }
 
@@ -1077,13 +1235,26 @@ pub(super) fn tx_overview(ui: &mut Ui, app: &App, view: &TxView) {
                     Some(payload) if payload.is_empty() => {
                         ui.label("empty");
                     }
-                    Some(payload) => match view.payload_text() {
-                        Some(text) => copy_value(ui, &text, "Copy payload"),
-                        None => {
-                            let hex: String = payload.iter().map(|b| format!("{b:02x}")).collect();
-                            copy_value(ui, &hex, "Copy payload (hex)");
+                    Some(payload) => {
+                        match view.payload_text() {
+                            Some(text) => copy_value(ui, &text, "Copy payload"),
+                            None => {
+                                let hex: String =
+                                    payload.iter().map(|b| format!("{b:02x}")).collect();
+                                copy_value(ui, &hex, "Copy payload (hex)");
+                            }
                         }
-                    },
+                        if let Some(len) = view.payload_len {
+                            ui.label(
+                                RichText::new(format!(
+                                    "(first {} of {} bytes)",
+                                    payload.len(),
+                                    format_number(len as u64)
+                                ))
+                                .weak(),
+                            );
+                        }
+                    }
                     None => {
                         ui.label(RichText::new("— (not kept by the index)").weak());
                     }

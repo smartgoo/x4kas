@@ -37,6 +37,7 @@ struct Status {
     path: String,
     format: u32,
     txs_indexed: u64,
+    blocks_indexed: u64,
     addresses: u32,
     slabs: usize,
     /// `(from_ms, to_ms)`
@@ -63,12 +64,13 @@ pub async fn run(url: Option<&str>, network: &str, cmd: IndexCommand) -> Result<
 }
 
 fn status(network: &str) -> Result<()> {
-    let store = IndexStore::open(network)?;
+    let store = IndexStore::open_existing(network)?;
     let manifest = store.manifest()?;
     let status = Status {
         path: index::index_dir(network).display().to_string(),
         format: index::FORMAT_VERSION,
         txs_indexed: manifest.txs_indexed,
+        blocks_indexed: manifest.blocks_indexed,
         addresses: manifest.next_addr_id,
         slabs: store.slabs().len(),
         coverage: store.coverage(),
@@ -79,21 +81,29 @@ fn status(network: &str) -> Result<()> {
     Ok(())
 }
 
-async fn run_indexer(
+/// The headless chain pipeline: the index writer fed by the chain stream, with node
+/// polling (the sync state and pruning point, as in the GUI).
+pub(crate) struct Pipeline {
+    pub app: Arc<RwLock<App>>,
+    pub handles: PollingHandles,
+    pub rpc: Arc<x4kas_core::rpc::client::RpcManager>,
+    pub store: Arc<IndexStore>,
+}
+
+/// Open the index and start the pipeline from `url`.
+pub(crate) fn start_pipeline(
     url: &str,
     network: &str,
     backfill: Option<Duration>,
-    progress_secs: u64,
-) -> Result<()> {
+) -> Result<Pipeline> {
     let app = Arc::new(RwLock::new(App::default()));
     let mut handles = PollingHandles::default();
 
     let store = Arc::new(IndexStore::open(network)?);
     let labels = Arc::new(x4kas_core::labels::LabelBook::load());
-    let sink = index::task::start_writer(store, labels, app.clone(), &mut handles)?;
+    let sink = index::task::start_writer(store.clone(), labels, app.clone(), &mut handles)?;
     let position = sink.stream_position();
 
-    // Polling keeps the node's sync state and pruning point in the app, as in the GUI.
     let rpc = create_and_start_rpc(Some(url), network, &app, 1000, &mut handles)?;
     chain_stream::start_chain_stream(
         &rpc,
@@ -106,7 +116,29 @@ async fn run_indexer(
         "indexing {network} from {url} into {}",
         index::index_dir(network).display()
     );
+    Ok(Pipeline {
+        app,
+        handles,
+        rpc,
+        store,
+    })
+}
 
+/// Stop the pipeline: the stream, then the writer (which closes the store), then the node.
+pub(crate) async fn stop_pipeline(mut pipeline: Pipeline) {
+    eprintln!("stopping…");
+    pipeline.handles.abort_all();
+    pipeline.handles.stop_index().await;
+    let _ = pipeline.rpc.disconnect().await;
+}
+
+async fn run_indexer(
+    url: &str,
+    network: &str,
+    backfill: Option<Duration>,
+    progress_secs: u64,
+) -> Result<()> {
+    let pipeline = start_pipeline(url, network, backfill)?;
     let mut ticker = tokio::time::interval(Duration::from_secs(progress_secs.max(1)));
     ticker.tick().await;
     loop {
@@ -114,21 +146,17 @@ async fn run_indexer(
             _ = tokio::signal::ctrl_c() => break,
             _ = ticker.tick() => {
                 if progress_secs > 0 {
-                    eprintln!("{}", progress_line(&*app.read().await));
+                    eprintln!("{}", progress_line(&*pipeline.app.read().await));
                 }
             }
         }
     }
-
-    eprintln!("stopping…");
-    handles.abort_all();
-    handles.stop_index().await;
-    let _ = rpc.disconnect().await;
+    stop_pipeline(pipeline).await;
     Ok(())
 }
 
 /// One line of progress: the stream's phase and the writer's counters.
-fn progress_line(app: &App) -> String {
+pub(crate) fn progress_line(app: &App) -> String {
     let index = &app.chain;
     let phase = match (&index.phase, &index.write_error) {
         (_, Some(e)) => format!("write error: {e}"),

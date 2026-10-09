@@ -1,13 +1,18 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::analytics::{AggregatedView, TxHistogram};
 use crate::emission::{BlockReward, Emission};
-use crate::explorer::ExplorerState;
+use crate::explorer::{ExplorerState, TxView};
 use crate::index::query::{AddressProfile, ClusterInfo, FlowGraph, Page, Peer, TxRow};
 use crate::labels::LabelBook;
+use crate::query::Query;
+use crate::query::exec::{Progress, ResultSet};
+use crate::query::saved::SavedQueries;
+use crate::query::watch::QueryEvent;
 use crate::rpc::hash_links::{HashLink, block_hash_links};
 use crate::rpc::methods::{RPC_METHODS, RpcMethod};
 use crate::rpc::types::*;
@@ -156,6 +161,8 @@ pub enum Tab {
     #[default]
     Dashboard,
     Explorer,
+    /// Build, run and save queries over the index.
+    Query,
     Monitoring,
     Mempool,
     RpcExplorer,
@@ -166,6 +173,7 @@ impl Tab {
         &[
             Tab::Dashboard,
             Tab::Explorer,
+            Tab::Query,
             Tab::Monitoring,
             Tab::Mempool,
             Tab::RpcExplorer,
@@ -177,6 +185,7 @@ impl Tab {
         match self {
             Tab::Dashboard => "Dashboard",
             Tab::Explorer => "Explorer",
+            Tab::Query => "Query",
             Tab::Monitoring => "Monitoring",
             Tab::Mempool => "Mempool",
             Tab::RpcExplorer => "RPC Cmds",
@@ -391,6 +400,8 @@ pub enum AnalyticsPanel {
     Miners,
     TopSenders,
     TopReceivers,
+    /// The Explorer Home's protocols card.
+    Protocols,
 }
 
 /// DAA score growth per second: 10 blocks per second since Crescendo, on mainnet and
@@ -449,7 +460,12 @@ pub struct ChainStatus {
 
     // --- The writer ---
     pub txs_indexed: u64,
+    /// Block records held: chain blocks, and the merged blocks their transactions name.
+    pub blocks_indexed: u64,
     pub addresses: u64,
+    /// The index on disk had an older format and was discarded: the window is being
+    /// rebuilt from the node.
+    pub rebuilt_from: Option<u32>,
     /// The last indexed chain block.
     pub position: Option<crate::index::Position>,
     pub disk_bytes: u64,
@@ -533,7 +549,7 @@ impl ChainStatus {
 /// it keeps (`analytics::AnalyticsEngine`), and the windows the panels show.
 pub struct AnalyticsState {
     /// Each panel's time window, indexed by [`AnalyticsPanel`].
-    pub windows: [TimeWindow; 6],
+    pub windows: [TimeWindow; 7],
     pub reorg_notification: Option<String>,
     /// One view per window, indexed by [`TimeWindow::index`].
     pub cached_views: Option<[AggregatedView; 3]>,
@@ -553,6 +569,7 @@ impl Default for AnalyticsState {
                 OneHour,
                 OneHour,
                 OneHour,
+                TwentyFourHour,
             ],
             reorg_notification: None,
             cached_views: None,
@@ -748,6 +765,8 @@ pub enum ExportOrigin {
     Flows,
     /// This block's page.
     Block(String),
+    /// The Query tab's results, of the query named so (its text when unsaved).
+    Query(String),
 }
 
 /// The last export (`UiCommand::Export`) from an address's or a block's page or the flow
@@ -784,6 +803,315 @@ pub struct AddressState {
     pub export: ExportStatus,
 }
 
+/// The transaction flow window: one transaction's inputs and outputs as a Sankey
+/// diagram, with the transaction each output was spent by (from the index), so the
+/// user can walk from a transaction to the ones that fed it and the ones it fed. Its
+/// own back/forward history, like a browser's.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SankeyState {
+    pub open: bool,
+    /// The transaction on show (being loaded, or loaded into `view`).
+    pub txid: Option<String>,
+    /// The block the transaction is known to be in, to find it when neither the index
+    /// nor the mempool has it.
+    pub block_hint: Option<String>,
+    pub view: Option<TxView>,
+    /// For each output of `view`, the id of the indexed transaction that spent it.
+    pub spenders: Vec<Option<String>>,
+    pub loading: bool,
+    pub error: Option<String>,
+    pub back: Vec<String>,
+    pub forward: Vec<String>,
+}
+
+impl SankeyState {
+    /// Open the window on `txid`, starting a fresh history.
+    pub fn start(&mut self, txid: String, block_hint: Option<String>) {
+        self.open = true;
+        self.back.clear();
+        self.forward.clear();
+        self.load(txid, block_hint);
+    }
+
+    /// Follow an input or output to `txid`: the current transaction goes into the
+    /// history.
+    pub fn navigate(&mut self, txid: String) {
+        if self.txid.as_deref() == Some(txid.as_str()) {
+            return;
+        }
+        if let Some(current) = self.txid.take() {
+            self.back.push(current);
+        }
+        self.forward.clear();
+        self.load(txid, None);
+    }
+
+    pub fn go_back(&mut self) -> bool {
+        let Some(previous) = self.back.pop() else {
+            return false;
+        };
+        if let Some(current) = self.txid.take() {
+            self.forward.push(current);
+        }
+        self.load(previous, None);
+        true
+    }
+
+    pub fn go_forward(&mut self) -> bool {
+        let Some(next) = self.forward.pop() else {
+            return false;
+        };
+        if let Some(current) = self.txid.take() {
+            self.back.push(current);
+        }
+        self.load(next, None);
+        true
+    }
+
+    fn load(&mut self, txid: String, block_hint: Option<String>) {
+        self.txid = Some(txid);
+        self.block_hint = block_hint;
+        self.view = None;
+        self.spenders.clear();
+        self.loading = true;
+        self.error = None;
+    }
+
+    /// The controller's answer for `txid`; one for a transaction no longer on show
+    /// (the user moved on) is dropped.
+    pub fn set_result(
+        &mut self,
+        txid: &str,
+        result: Result<(TxView, Vec<Option<String>>), String>,
+    ) {
+        if self.txid.as_deref() != Some(txid) {
+            return;
+        }
+        self.loading = false;
+        match result {
+            Ok((view, spenders)) => {
+                self.view = Some(view);
+                self.spenders = spenders;
+            }
+            Err(e) => self.error = Some(e),
+        }
+    }
+
+    pub fn close(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// A query being answered (`UiCommand::QueryRun`): the executor reports its progress
+/// here and the frontend can cancel it.
+#[derive(Debug, Clone)]
+pub struct RunStatus {
+    pub generation: u64,
+    pub query: Query,
+    /// The saved query it was run as, if any.
+    pub name: Option<String>,
+    pub started: Instant,
+    pub scanned: u64,
+    pub matched: u64,
+    /// The rows are in and their balances are being fetched from the node.
+    pub fetching_balances: bool,
+    pub cancel: Arc<AtomicBool>,
+}
+
+/// A run the user stopped: what it had done when told to, until its rows arrive.
+#[derive(Debug, Clone)]
+pub struct CancelledRun {
+    pub generation: u64,
+    pub query: Query,
+    pub name: Option<String>,
+    pub scanned: u64,
+    pub matched: u64,
+    pub elapsed: Duration,
+}
+
+/// What a watched saved query last did (`query::watch`), by its id.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct QueryWatchStatus {
+    pub last_run_ms: Option<u64>,
+    /// Why the last run failed, or `None` when it went through.
+    pub last_error: Option<String>,
+    /// Rows the last run found (new or not).
+    pub last_rows: usize,
+}
+
+/// The Query tab's shared state: the run in progress, the last result, the saved
+/// queries, and a query handed in from elsewhere. The builder's draft lives in the
+/// frontend.
+#[derive(Default)]
+pub struct QueryState {
+    /// A query another page asked the tab to show (an address's "Query transactions").
+    pub preload: Option<Query>,
+    /// The saved query `preload` is (a toast's or an alert's query), if any.
+    pub preload_id: Option<String>,
+    /// Bumped by every start and cancel, so a late answer for an older run is dropped.
+    pub generation: u64,
+    pub run: Option<RunStatus>,
+    /// The last run was cancelled: shown until its partial answer arrives (which
+    /// replaces `result`) or another run starts.
+    pub cancelled: Option<CancelledRun>,
+    pub result: Option<ResultSet>,
+    /// The query `result` answers.
+    pub result_query: Option<Query>,
+    /// The saved query `result` was run as, if any.
+    pub result_name: Option<String>,
+    /// Bumped whenever `result` is replaced, so a frontend can tell a new result from
+    /// the one it had sorted.
+    pub result_seq: u64,
+    /// Why the last run failed.
+    pub error: Option<String>,
+    pub saved: SavedQueries,
+    /// Why the saved queries couldn't be written.
+    pub save_error: Option<String>,
+    /// Rows the watched queries found, newest first (`query::watch`).
+    pub events: VecDeque<QueryEvent>,
+    /// Events pushed in total, so a frontend can tell which of `events` are new to it.
+    pub events_raised: u64,
+    /// What each watched query last did, by saved query id.
+    pub watch_status: HashMap<String, QueryWatchStatus>,
+}
+
+impl QueryState {
+    /// Start answering `query` (as the saved query `name`, if any): the previous run,
+    /// if any, is cancelled. Returns the run's generation and its cancel flag.
+    pub fn start(&mut self, query: Query, name: Option<String>) -> (u64, Arc<AtomicBool>) {
+        self.cancel();
+        self.cancelled = None;
+        self.generation += 1;
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.run = Some(RunStatus {
+            generation: self.generation,
+            query,
+            name,
+            started: Instant::now(),
+            scanned: 0,
+            matched: 0,
+            fetching_balances: false,
+            cancel: cancel.clone(),
+        });
+        self.error = None;
+        (self.generation, cancel)
+    }
+
+    /// The executor's progress for run `generation` (ignored once superseded).
+    pub fn progress(&mut self, generation: u64, progress: &Progress) {
+        if let Some(run) = &mut self.run
+            && run.generation == generation
+        {
+            run.scanned = progress.scanned;
+            run.matched = progress.matched;
+        }
+    }
+
+    /// Run `generation` has its rows and is fetching their balances from the node.
+    pub fn fetching_balances(&mut self, generation: u64) {
+        if let Some(run) = &mut self.run
+            && run.generation == generation
+        {
+            run.fetching_balances = true;
+        }
+    }
+
+    /// The answer for run `generation`; one for a superseded run is dropped, except
+    /// the rows a cancelled run had found, which replace the result.
+    pub fn finish(&mut self, generation: u64, result: Result<ResultSet, String>) {
+        if let Some(cancelled) = self.cancelled.take_if(|c| c.generation == generation) {
+            if let Ok(result) = result {
+                self.set_result(result, cancelled.query, cancelled.name);
+            }
+            return;
+        }
+        let Some(run) = self.run.take_if(|r| r.generation == generation) else {
+            return;
+        };
+        match result {
+            Ok(result) => self.set_result(result, run.query, run.name),
+            Err(e) => self.error = Some(e),
+        }
+    }
+
+    fn set_result(&mut self, result: ResultSet, query: Query, name: Option<String>) {
+        self.result = Some(result);
+        self.result_query = Some(query);
+        self.result_name = name;
+        self.result_seq += 1;
+        self.error = None;
+    }
+
+    /// Stop the run in progress. Its answer, the rows found so far, is still shown
+    /// when it comes; until then `cancelled` says what it had done.
+    pub fn cancel(&mut self) {
+        if let Some(run) = self.run.take() {
+            run.cancel.store(true, Ordering::Relaxed);
+            self.cancelled = Some(CancelledRun {
+                generation: run.generation,
+                query: run.query,
+                name: run.name,
+                scanned: run.scanned,
+                matched: run.matched,
+                elapsed: run.started.elapsed(),
+            });
+            self.generation += 1;
+        }
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.run.is_some()
+    }
+
+    /// Forget the result and the run (a connection switch).
+    pub fn clear(&mut self) {
+        self.cancel();
+        self.cancelled = None;
+        self.result = None;
+        self.result_query = None;
+        self.result_name = None;
+        self.error = None;
+        self.watch_status.clear();
+    }
+
+    /// Forget the watched queries' events.
+    pub fn clear_events(&mut self) {
+        self.events.clear();
+    }
+
+    pub fn push_event(&mut self, event: QueryEvent) {
+        self.events.push_front(event);
+        self.events.truncate(crate::query::watch::MAX_EVENTS);
+        self.events_raised += 1;
+    }
+
+    /// Events not marked read.
+    pub fn unread(&self) -> usize {
+        self.events.iter().filter(|e| !e.read).count()
+    }
+
+    /// Unread events of the saved query `id`.
+    pub fn unread_of(&self, id: &str) -> usize {
+        self.events
+            .iter()
+            .filter(|e| !e.read && e.query_id == id)
+            .count()
+    }
+
+    /// Mark the event at `index` (newest first) read or unread.
+    pub fn set_read(&mut self, index: usize, read: bool) {
+        if let Some(event) = self.events.get_mut(index) {
+            event.read = read;
+        }
+    }
+
+    pub fn mark_all_read(&mut self) {
+        for event in &mut self.events {
+            event.read = true;
+        }
+    }
+}
+
 pub type RepaintFn = Arc<dyn Fn() + Send + Sync>;
 
 #[derive(Default)]
@@ -796,6 +1124,9 @@ pub struct App {
     pub chain: ChainStatus,
     pub watch: WatchState,
     pub address: AddressState,
+    pub sankey: SankeyState,
+    /// The Query tab: the run in progress, the last result, the saved queries.
+    pub query: QueryState,
     /// The Explorer tab: sub tabs and their loaded pages.
     pub explorer: ExplorerState,
     /// Known address labels; replaced as a whole when a source changes.
@@ -845,6 +1176,7 @@ impl App {
         self.watch.clear_node_data();
         self.address.flows.close();
         self.address.export = ExportStatus::default();
+        self.query.clear();
         self.explorer.clear_cache();
         self.rpc_explorer.set_response(None);
         self.rpc_explorer.is_loading = false;
@@ -885,6 +1217,146 @@ impl App {
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn query_state_drops_stale_results_and_cancels() {
+        use crate::query::{Entity, Query};
+        let mut q = QueryState::default();
+        assert!(!q.is_running());
+        let (g1, cancel1) = q.start(Query::default_for(Entity::Transactions), None);
+        assert!(q.is_running());
+        let (g2, _cancel2) = q.start(Query::default_for(Entity::Blocks), Some("b".into()));
+        assert!(
+            cancel1.load(Ordering::Relaxed),
+            "the first run was cancelled"
+        );
+        assert!(g2 > g1);
+        q.progress(
+            g1,
+            &Progress {
+                scanned: 5,
+                matched: 1,
+                elapsed: Duration::ZERO,
+            },
+        );
+        q.progress(
+            g2,
+            &Progress {
+                scanned: 7,
+                matched: 2,
+                elapsed: Duration::ZERO,
+            },
+        );
+        assert_eq!(q.run.as_ref().map(|r| r.scanned), Some(7));
+        q.finish(g1, Err("late".into()));
+        assert!(q.is_running() && q.error.is_none());
+        q.finish(g2, Err("failed".into()));
+        assert!(!q.is_running());
+        assert_eq!(q.error.as_deref(), Some("failed"));
+        let (g3, cancel3) = q.start(Query::default_for(Entity::Payouts), None);
+        q.progress(
+            g3,
+            &Progress {
+                scanned: 9,
+                matched: 3,
+                elapsed: Duration::ZERO,
+            },
+        );
+        q.cancel();
+        assert!(cancel3.load(Ordering::Relaxed));
+        assert!(!q.is_running());
+        assert_eq!(
+            q.cancelled.as_ref().map(|c| (c.scanned, c.matched)),
+            Some((9, 3)),
+            "a cancelled run says what it had done"
+        );
+        q.finish(g3, Err("cancelled late".into()));
+        assert!(q.error.is_none(), "a cancelled run's failure is dropped");
+        assert!(q.cancelled.is_none());
+        // The rows a cancelled run had found replace the result when they arrive.
+        let (g4, _) = q.start(Query::default_for(Entity::Blocks), Some("blocks".into()));
+        q.cancel();
+        let mut partial = ResultSet::empty(Entity::Blocks);
+        partial.partial = Some(crate::query::exec::Partial::Cancelled);
+        q.finish(g4, Ok(partial));
+        assert_eq!(q.result_seq, 1);
+        assert_eq!(q.result_name.as_deref(), Some("blocks"));
+        assert_eq!(
+            q.result.as_ref().and_then(|r| r.partial),
+            Some(crate::query::exec::Partial::Cancelled)
+        );
+        // A newer run forgets the cancelled one.
+        let (g5, _) = q.start(Query::default_for(Entity::Blocks), None);
+        q.cancel();
+        let (_g6, _) = q.start(Query::default_for(Entity::Blocks), None);
+        q.finish(g5, Ok(ResultSet::empty(Entity::Blocks)));
+        assert_eq!(
+            q.result_seq, 1,
+            "the superseded cancelled answer is dropped"
+        );
+    }
+
+    #[test]
+    fn query_events_unread_counts() {
+        let mut q = QueryState::default();
+        let event = |id: &str| QueryEvent {
+            time_ms: 1,
+            query_id: id.to_string(),
+            query_name: id.to_string(),
+            columns: Vec::new(),
+            row: Vec::new(),
+            primary: "x".to_string(),
+            read: false,
+        };
+        q.push_event(event("a"));
+        q.push_event(event("b"));
+        q.push_event(event("a"));
+        assert_eq!((q.events_raised, q.unread(), q.unread_of("a")), (3, 3, 2));
+        q.set_read(0, true);
+        assert_eq!(q.unread_of("a"), 1);
+        q.mark_all_read();
+        assert_eq!(q.unread(), 0);
+        for _ in 0..crate::query::watch::MAX_EVENTS + 5 {
+            q.push_event(event("c"));
+        }
+        assert_eq!(q.events.len(), crate::query::watch::MAX_EVENTS);
+    }
+
+    #[test]
+    fn clear_node_data_keeps_saved_queries() {
+        use crate::query::saved::SavedQuery;
+        let mut app = App::default();
+        app.query.saved.upsert(SavedQuery::default());
+        app.query.error = Some("x".into());
+        app.clear_node_data();
+        assert_eq!(app.query.saved.queries.len(), 1);
+        assert!(app.query.error.is_none());
+    }
+
+    #[test]
+    fn sankey_history_goes_back_and_forward() {
+        let mut s = SankeyState::default();
+        s.start("a".into(), Some("block".into()));
+        assert!(s.open && s.loading);
+        assert_eq!(s.block_hint.as_deref(), Some("block"));
+        s.navigate("b".into());
+        s.navigate("b".into());
+        s.navigate("c".into());
+        assert_eq!(s.back, vec!["a".to_string(), "b".to_string()]);
+        assert!(s.go_back());
+        assert_eq!(s.txid.as_deref(), Some("b"));
+        assert_eq!(s.forward, vec!["c".to_string()]);
+        assert!(s.go_forward());
+        assert_eq!(s.txid.as_deref(), Some("c"));
+        assert!(!s.go_forward());
+        // A late answer for a transaction no longer on show is dropped.
+        s.set_result("a", Err("late".into()));
+        assert!(s.loading && s.error.is_none());
+        s.set_result("c", Err("gone".into()));
+        assert!(!s.loading && s.error.as_deref() == Some("gone"));
+        s.close();
+        assert_eq!(s, SankeyState::default());
+    }
 
     // --- Connection ---
 
@@ -1047,7 +1519,14 @@ mod tests {
         let labels: Vec<_> = Tab::all().iter().map(Tab::label).collect();
         assert_eq!(
             labels,
-            ["Dashboard", "Explorer", "Monitoring", "Mempool", "RPC Cmds"]
+            [
+                "Dashboard",
+                "Explorer",
+                "Query",
+                "Monitoring",
+                "Mempool",
+                "RPC Cmds"
+            ]
         );
     }
 
@@ -1066,6 +1545,8 @@ mod tests {
         assert_eq!(app.active_tab, Tab::Dashboard);
         app.next_tab();
         assert_eq!(app.active_tab, Tab::Explorer);
+        app.next_tab();
+        assert_eq!(app.active_tab, Tab::Query);
         app.next_tab();
         assert_eq!(app.active_tab, Tab::Monitoring);
         app.next_tab();
@@ -1327,6 +1808,10 @@ mod tests {
             TimeWindow::TwentyFourHour
         );
         assert_eq!(state.window(AnalyticsPanel::Miners), TimeWindow::OneHour);
+        assert_eq!(
+            state.window(AnalyticsPanel::Protocols),
+            TimeWindow::TwentyFourHour
+        );
         assert!(state.view(TimeWindow::OneMin).is_none());
     }
 

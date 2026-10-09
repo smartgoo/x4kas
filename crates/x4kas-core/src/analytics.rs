@@ -8,8 +8,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::app::TimeWindow;
 use crate::tx_inspect::{
-    OpcodeUsage, ScriptClass, TransactionProtocol, coinbase_miner_tag, coinbase_node_version,
-    detect_protocol, output_script_opcodes, redeem_script_opcodes, script_class,
+    OpcodeUsage, ScriptClass, TransactionProtocol, coinbase_miner_address, coinbase_miner_tag,
+    coinbase_node_version, detect_protocol, output_script_opcodes, redeem_script_opcodes,
+    script_class,
 };
 
 // --- Metrics ---
@@ -174,8 +175,8 @@ pub fn summarize_chain_blocks(
     (summaries, removed)
 }
 
-/// The coinbases a VSPC v2 response adds: each miner's payout address (the coinbase's
-/// first output) and the miner tag from its payload. Feeds `labels::MinerTally`.
+/// The coinbases a VSPC v2 response adds: each block's miner (named in the coinbase's
+/// payload) and the miner tag from the same payload. Feeds `labels::MinerTally`.
 pub fn coinbase_miners(
     response: &GetVirtualChainFromBlockV2Response,
 ) -> Vec<(String, Option<String>)> {
@@ -185,18 +186,29 @@ pub fn coinbase_miners(
         .flat_map(|chain_block| chain_block.accepted_transactions.iter())
         .filter(|tx| tx.inputs.is_empty())
         .filter_map(|tx| {
-            let miner = tx
-                .outputs
-                .first()?
-                .verbose_data
-                .as_ref()?
-                .script_public_key_address
-                .as_ref()?
-                .to_string();
+            let miner = coinbase_miner(tx)?;
             let tag = tx.payload.as_deref().and_then(coinbase_miner_tag);
             Some((miner, tag))
         })
         .collect()
+}
+
+/// Who mined the block a coinbase belongs to: the payload's script, on the network of
+/// the outputs. The outputs themselves pay the mergeset blues' miners (the first the
+/// selected parent's), so the first output is only a fallback.
+fn coinbase_miner(tx: &RpcOptionalTransaction) -> Option<String> {
+    let first = tx
+        .outputs
+        .first()?
+        .verbose_data
+        .as_ref()?
+        .script_public_key_address
+        .as_ref()?;
+    let from_payload = tx
+        .payload
+        .as_deref()
+        .and_then(|payload| coinbase_miner_address(payload, first.prefix));
+    Some(from_payload.unwrap_or_else(|| first.clone()).to_string())
 }
 
 /// Count one accepted transaction into a chain block's metrics.
@@ -219,7 +231,7 @@ fn record_transaction(metrics: &mut Metrics, tx: &RpcOptionalTransaction) {
         if let Some(version) = coinbase_node_version(payload) {
             bump(&mut metrics.node_versions, version);
         }
-        if let Some(miner) = output_address(0) {
+        if let Some(miner) = coinbase_miner(tx) {
             bump(&mut metrics.miners, miner);
         }
         return;

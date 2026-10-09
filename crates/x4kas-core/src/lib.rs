@@ -12,6 +12,7 @@ pub mod format;
 pub mod index;
 pub mod labels;
 pub mod polling;
+pub mod query;
 pub mod rpc;
 pub mod tx_inspect;
 pub mod watch;

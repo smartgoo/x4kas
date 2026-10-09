@@ -20,7 +20,8 @@ use crate::index::query::{self, TxDetail};
 use crate::index::{IndexStore, parse_hex};
 use crate::rpc::types::BlockRewardInfo;
 use crate::tx_inspect::{
-    TransactionProtocol, coinbase_miner_tag, coinbase_node_version, detect_protocol, script_class,
+    TransactionProtocol, coinbase_miner_address, coinbase_miner_tag, coinbase_node_version,
+    detect_protocol, script_class,
 };
 
 /// Pages a sub tab can show.
@@ -42,6 +43,8 @@ pub enum ExplorerPage {
     /// A 64-hex id that may be a block hash or a transaction id. The controller finds
     /// out and [`ExplorerState::resolve`] replaces it with the page found.
     Lookup(String),
+    /// The indexed transactions of one protocol, newest first (a direct node only).
+    Protocol(TransactionProtocol),
 }
 
 impl PartialEq for ExplorerPage {
@@ -52,8 +55,25 @@ impl PartialEq for ExplorerPage {
             | (Self::Address(a), Self::Address(b))
             | (Self::Lookup(a), Self::Lookup(b)) => a == b,
             (Self::Transaction { txid: a, .. }, Self::Transaction { txid: b, .. }) => a == b,
+            (Self::Protocol(a), Self::Protocol(b)) => a == b,
             _ => false,
         }
+    }
+}
+
+/// The search field's prefix of a protocol page: `protocol:<slug>`.
+const PROTOCOL_QUERY_PREFIX: &str = "protocol:";
+
+/// A protocol page's query, `protocol:<slug>` ([`TransactionProtocol::slug`]).
+fn protocol_query(protocol: TransactionProtocol) -> &'static str {
+    use TransactionProtocol::*;
+    match protocol {
+        Krc => "protocol:krc",
+        Kns => "protocol:kns",
+        Kasia => "protocol:kasia",
+        Kasplex => "protocol:kasplex",
+        KSocial => "protocol:ksocial",
+        Igra => "protocol:igra",
     }
 }
 
@@ -88,15 +108,18 @@ impl ExplorerPage {
             Self::Address(addr) => shorten_middle(addr, 17),
             Self::Transaction { txid, .. } => format!("Tx {}", shorten_middle(txid, 11)),
             Self::Lookup(id) => shorten_middle(id, 15),
+            Self::Protocol(protocol) => protocol.label().to_string(),
         }
     }
 
-    /// The id the page is about, for the search field.
+    /// The id the page is about, for the search field (a protocol page's is
+    /// `protocol:<slug>`, which [`parse_query`] takes back).
     pub fn query(&self) -> &str {
         match self {
             Self::Home => "",
             Self::Block(hash) | Self::Address(hash) | Self::Lookup(hash) => hash,
             Self::Transaction { txid, .. } => txid,
+            Self::Protocol(protocol) => protocol_query(*protocol),
         }
     }
 
@@ -106,8 +129,9 @@ impl ExplorerPage {
     }
 }
 
-/// What a search field entry is: an address, or a block or transaction id (64 hex
-/// characters, with or without `0x`). Anything else is `None` (a label search, say).
+/// What a search field entry is: an address, a block or transaction id (64 hex
+/// characters, with or without `0x`), or a protocol page (`protocol:<slug>`). Anything
+/// else is `None` (a label search, say).
 pub fn parse_query(input: &str) -> Option<ExplorerPage> {
     let s = input.trim();
     if s.is_empty() {
@@ -115,6 +139,10 @@ pub fn parse_query(input: &str) -> Option<ExplorerPage> {
     }
     if Address::try_from(s).is_ok() {
         return Some(ExplorerPage::Address(s.to_string()));
+    }
+    if let Some(slug) = s.strip_prefix(PROTOCOL_QUERY_PREFIX) {
+        return TransactionProtocol::from_slug(&slug.trim().to_ascii_lowercase())
+            .map(ExplorerPage::Protocol);
     }
     let hex = s.strip_prefix("0x").unwrap_or(s);
     if hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -206,8 +234,20 @@ pub enum PageData {
     Block(BlockView),
     Address(AddressPageData),
     Transaction(TxView),
+    Protocol(ProtocolPageData),
     /// A lookup that turned out to be this page (which is cached on its own).
     Redirect(ExplorerPage),
+}
+
+/// A protocol page: its transactions, newest first, as far as the page has loaded.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProtocolPageData {
+    pub protocol: TransactionProtocol,
+    pub page: query::Page<query::ProtocolTxRow>,
+    /// An older page of transactions is on its way (`UiCommand::ProtocolPage`).
+    pub loading_more: bool,
+    /// A later request (more rows) failed.
+    pub error: Option<String>,
 }
 
 /// An address page (the info pane's and the Explorer's): the view plus what the page added.
@@ -475,6 +515,20 @@ impl ExplorerState {
         }
     }
 
+    /// The protocol page's data for `protocol`, if loaded.
+    pub fn protocol_page_mut(
+        &mut self,
+        protocol: TransactionProtocol,
+    ) -> Option<&mut ProtocolPageData> {
+        match self.cache.get_mut(&ExplorerPage::Protocol(protocol)) {
+            Some(PageLoad::Ready(data)) => match &mut **data {
+                PageData::Protocol(data) => Some(data),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// Evict the oldest cached pages neither a tab nor the pane shows until the cache
     /// fits.
     fn evict(&mut self) {
@@ -571,6 +625,21 @@ fn output_address(tx: &RpcTransaction, i: usize) -> Option<String> {
         .map(|v| v.script_public_key_address.to_string())
 }
 
+/// The block's own miner, named by its coinbase's payload script (the outputs pay the
+/// mergeset blues' miners, the first of them the selected parent's); the first output
+/// when the payload doesn't say. Its network is the outputs' network.
+fn coinbase_miner(coinbase: &RpcTransaction) -> Option<String> {
+    let prefix = coinbase
+        .outputs
+        .first()
+        .and_then(|o| o.verbose_data.as_ref())
+        .map(|v| v.script_public_key_address.prefix);
+    prefix
+        .and_then(|prefix| coinbase_miner_address(&coinbase.payload, prefix))
+        .map(|a| a.to_string())
+        .or_else(|| output_address(coinbase, 0))
+}
+
 fn protocol_of(tx: &RpcTransaction) -> Option<TransactionProtocol> {
     let scripts: Vec<&[u8]> = tx
         .inputs
@@ -612,7 +681,7 @@ impl BlockView {
             .iter()
             .find(|tx| tx.inputs.is_empty())
             .map(|coinbase| MinerInfo {
-                address: output_address(coinbase, 0),
+                address: coinbase_miner(coinbase),
                 node_version: coinbase_node_version(&coinbase.payload),
                 tag: coinbase_miner_tag(&coinbase.payload),
             });
@@ -693,6 +762,9 @@ pub struct TxView {
     pub lock_time: Option<u64>,
     pub subnetwork_id: Option<String>,
     pub payload: Option<Vec<u8>>,
+    /// The payload's full length when `payload` is only its head (the index keeps
+    /// `records::PAYLOAD_HEAD` bytes).
+    pub payload_len: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -760,7 +832,7 @@ impl TxView {
                 .map(|o| TxOutputView {
                     address: o.address,
                     amount: o.amount,
-                    script_class: None,
+                    script_class: o.script_class,
                     change: o.change,
                 })
                 .collect(),
@@ -768,10 +840,14 @@ impl TxView {
             mass: detail.mass,
             is_coinbase: detail.is_coinbase,
             protocol: detail.protocol,
-            version: None,
-            lock_time: None,
-            subnetwork_id: None,
-            payload: None,
+            version: detail.version,
+            lock_time: detail.lock_time,
+            subnetwork_id: (detail.subnetwork != "unknown").then(|| detail.subnetwork.to_string()),
+            // The index keeps the head of the payload; a truncated one is still worth
+            // showing (the Explorer says when it is).
+            payload_len: (detail.payload_len as usize > detail.payload_head.len())
+                .then_some(detail.payload_len as usize),
+            payload: (detail.payload_len > 0).then_some(detail.payload_head),
         }
     }
 
@@ -812,6 +888,7 @@ impl TxView {
             lock_time: Some(tx.lock_time),
             subnetwork_id: Some(tx.subnetwork_id.to_string()),
             payload: Some(tx.payload.clone()),
+            payload_len: None,
         }
     }
 
@@ -913,6 +990,19 @@ mod tests {
             Some(ExplorerPage::Lookup(h('a')))
         );
         assert_eq!(parse_query("Bybit"), None);
+        assert_eq!(
+            parse_query(" protocol:KNS "),
+            Some(ExplorerPage::Protocol(TransactionProtocol::Kns))
+        );
+        assert_eq!(parse_query("protocol:unknown"), None);
+        assert_eq!(
+            ExplorerPage::Protocol(TransactionProtocol::Kns).query(),
+            "protocol:kns"
+        );
+        assert_ne!(
+            ExplorerPage::Protocol(TransactionProtocol::Kns),
+            ExplorerPage::Protocol(TransactionProtocol::Krc)
+        );
         assert_eq!(parse_query(""), None);
         assert_eq!(parse_query(&"a".repeat(63)), None);
         assert_eq!(parse_query("kaspa:notanaddress"), None);
@@ -1045,16 +1135,8 @@ mod tests {
 
         let target = ExplorerPage::transaction(&h('a'));
         let tx = TxView::from_index(TxDetail {
-            txid: h('a'),
-            accepting_block: h('b'),
-            daa_score: 1,
-            time_ms: 2,
-            inputs: vec![],
-            outputs: vec![],
-            fee: None,
-            mass: 0,
             is_coinbase: true,
-            protocol: None,
+            ..TxDetail::minimal(&h('a'), &h('b'), 1, 2)
         });
         state.resolve(page.clone(), target.clone(), PageData::Transaction(tx));
         assert_eq!(state.active_tab().page, target);
@@ -1300,25 +1382,28 @@ mod tests {
         assert_eq!(view.payload_text(), None);
 
         let view = TxView::from_index(TxDetail {
-            txid: h('a'),
-            accepting_block: h('b'),
-            daa_score: 5,
-            time_ms: 6,
             inputs: vec![TxInputDetail {
                 address: Some("kaspa:in".into()),
                 amount: Some(200),
                 prev_txid: h('c'),
                 prev_index: 1,
+                script_class: Some("P2PK"),
             }],
             outputs: vec![TxOutputDetail {
                 address: Some("kaspa:out".into()),
                 amount: 150,
                 change: 80,
+                script_class: Some("P2SH"),
+                covenant: false,
             }],
             fee: Some(50),
             mass: 1,
-            is_coinbase: false,
-            protocol: None,
+            version: Some(0),
+            lock_time: Some(9),
+            subnetwork: "native",
+            payload_len: 5,
+            payload_head: b"hello".to_vec(),
+            ..TxDetail::minimal(&h('a'), &h('b'), 5, 6)
         });
         assert!(matches!(
             view.status,
@@ -1326,7 +1411,10 @@ mod tests {
         ));
         assert_eq!(view.input_total(), Some(200));
         assert_eq!(view.outputs[0].change, 80);
-        assert_eq!(view.version, None);
+        assert_eq!(view.outputs[0].script_class, Some("P2SH"));
+        assert_eq!((view.version, view.lock_time), (Some(0), Some(9)));
+        assert_eq!(view.subnetwork_id.as_deref(), Some("native"));
+        assert_eq!(view.payload_text().as_deref(), Some("hello"));
     }
 
     #[test]

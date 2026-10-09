@@ -15,8 +15,10 @@ use super::query::{self, FlowGraph, TxRow};
 use super::records::AddrId;
 use crate::config;
 use crate::explorer::BlockView;
-use crate::format::{format_utc, now_ms};
+use crate::format::{format_sompi_exact, format_utc, now_ms};
 use crate::labels::LabelBook;
+use crate::query::exec::{Cell, ResultSet};
+use crate::query::fields::FieldKind;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExportFormat {
@@ -99,7 +101,7 @@ pub fn transactions_csv(address: &str, rows: &[TxRow]) -> String {
             row.daa_score.to_string(),
             row.accepting_block.clone(),
             row.delta.to_string(),
-            kas(row.delta as f64),
+            kas(row.delta),
             row.fee.map(|f| f.to_string()).unwrap_or_default(),
             row.is_coinbase.to_string(),
             row.protocol
@@ -123,6 +125,112 @@ pub fn flows_json(graph: &FlowGraph) -> Result<String> {
 /// transactions with the index's acceptance and fees) as JSON.
 pub fn block_json(view: &BlockView) -> Result<String> {
     Ok(serde_json::to_string_pretty(view)?)
+}
+
+/// A query result as CSV: one column per result column, amounts as a `_sompi` and a
+/// `_kas` column, times as `_ms` and `_utc`, lists joined by `;`.
+pub fn result_csv(result: &ResultSet) -> String {
+    let mut header: Vec<String> = Vec::new();
+    for c in &result.columns {
+        match c.kind {
+            FieldKind::Amount => {
+                header.push(format!("{}_sompi", c.name));
+                header.push(format!("{}_kas", c.name));
+            }
+            FieldKind::Time => {
+                header.push(format!("{}_ms", c.name));
+                header.push(format!("{}_utc", c.name));
+            }
+            _ => header.push(c.name.clone()),
+        }
+    }
+    let mut out = String::with_capacity(64 + result.rows.len() * 160);
+    out.push_str(
+        &header
+            .iter()
+            .map(|h| csv_field(h))
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    out.push('\n');
+    for row in &result.rows {
+        let mut fields: Vec<String> = Vec::with_capacity(header.len());
+        for (cell, column) in row.iter().zip(&result.columns) {
+            match (column.kind, cell) {
+                (FieldKind::Amount, Cell::Amount(sompi)) => {
+                    fields.push(sompi.to_string());
+                    fields.push(kas(*sompi));
+                }
+                (FieldKind::Amount, _) => {
+                    fields.push(String::new());
+                    fields.push(String::new());
+                }
+                (FieldKind::Time, Cell::Time(ms)) => {
+                    fields.push(ms.to_string());
+                    fields.push(format_utc(*ms));
+                }
+                (FieldKind::Time, _) => {
+                    fields.push(String::new());
+                    fields.push(String::new());
+                }
+                (_, cell) => fields.push(csv_field(&cell.text())),
+            }
+        }
+        out.push_str(&fields.join(","));
+        out.push('\n');
+    }
+    out
+}
+
+/// A query result as JSON: the query's text, the columns, and one object per row
+/// (amounts in sompi, times in milliseconds, hashes in hex).
+pub fn result_json(result: &ResultSet, text: &str) -> Result<String> {
+    let columns: Vec<serde_json::Value> = result
+        .columns
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "name": c.name,
+                "label": c.label,
+                "kind": format!("{:?}", c.kind).to_lowercase().split('(').next().unwrap_or("").to_string(),
+            })
+        })
+        .collect();
+    let rows: Vec<serde_json::Value> = result
+        .rows
+        .iter()
+        .map(|row| {
+            serde_json::Value::Object(
+                row.iter()
+                    .zip(&result.columns)
+                    .map(|(cell, c)| (c.name.clone(), cell.to_json()))
+                    .collect(),
+            )
+        })
+        .collect();
+    let out = serde_json::json!({
+        "query": text,
+        "entity": result.entity.name(),
+        "matched": result.matched,
+        "scanned": result.scanned,
+        "truncated": result.truncated,
+        "partial": result.partial.map(|p| p.label()),
+        "window_ms": [result.window.0, result.window.1],
+        "plan": result.plan,
+        "columns": columns,
+        "rows": rows,
+    });
+    Ok(serde_json::to_string_pretty(&out)?)
+}
+
+/// A short file stem for a query: `query_<name>`.
+pub fn query_stem(name: &str) -> String {
+    let name = name.trim();
+    if name.is_empty() {
+        "query".to_string()
+    } else {
+        format!("query_{}", name.chars().take(32).collect::<String>())
+    }
 }
 
 /// A short file stem for a block: `block_<first 12 hex digits>`.
@@ -156,7 +264,7 @@ pub fn flows_csv(graph: &FlowGraph, labels: &LabelBook) -> String {
             csv_field(to),
             csv_field(labels.name(to).unwrap_or_default()),
             edge.amount.to_string(),
-            kas(edge.amount as f64),
+            kas(i64::try_from(edge.amount).unwrap_or(i64::MAX)),
             edge.tx_count.to_string(),
             edge.hops().to_string(),
             csv_field(&edge.via.join(" ")),
@@ -167,9 +275,14 @@ pub fn flows_csv(graph: &FlowGraph, labels: &LabelBook) -> String {
     out
 }
 
-/// Sompi as a KAS decimal without separators, for spreadsheets.
-fn kas(sompi: f64) -> String {
-    format!("{:.8}", sompi / 1e8)
+/// Sompi as an exact KAS decimal with eight places and no separators, for
+/// spreadsheets: `150000000` → `1.50000000`.
+fn kas(sompi: i64) -> String {
+    let exact = format_sompi_exact(sompi);
+    match exact.split_once('.') {
+        Some((int, frac)) => format!("{int}.{frac:0<8}"),
+        None => format!("{exact}.00000000"),
+    }
 }
 
 /// `s` quoted when it holds a comma, quote or line break.
@@ -239,6 +352,71 @@ mod tests {
             input_count: 1,
             output_count: 2,
         }
+    }
+
+    #[test]
+    fn result_csv_and_json_render_cells() {
+        use crate::query::Entity;
+        use crate::query::exec::{Column, ColumnSource};
+        use crate::query::fields::FieldId;
+        let result = ResultSet {
+            entity: Entity::Transactions,
+            columns: vec![
+                Column {
+                    name: "time".into(),
+                    label: "Time".into(),
+                    kind: FieldKind::Time,
+                    source: ColumnSource::Field(FieldId::TxTime),
+                },
+                Column {
+                    name: "fee".into(),
+                    label: "Fee".into(),
+                    kind: FieldKind::Amount,
+                    source: ColumnSource::Field(FieldId::TxFee),
+                },
+                Column {
+                    name: "label".into(),
+                    label: "Label".into(),
+                    kind: FieldKind::Text,
+                    source: ColumnSource::Field(FieldId::TxLabel),
+                },
+            ],
+            rows: vec![
+                vec![
+                    Cell::Time(1_759_926_896_000),
+                    Cell::Amount(150_000_000),
+                    Cell::List(vec![Cell::Text("a, b".into()), Cell::Text("c".into())]),
+                ],
+                vec![Cell::Null, Cell::Null, Cell::Null],
+            ],
+            matched: 2,
+            scanned: 10,
+            truncated: false,
+            partial: None,
+            elapsed: std::time::Duration::from_millis(5),
+            window: (0, u64::MAX),
+            plan: "test".into(),
+            primary: None,
+            time_column: Some(0),
+            balances_pending: false,
+        };
+        let csv = result_csv(&result);
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(lines[0], "time_ms,time_utc,fee_sompi,fee_kas,label");
+        assert_eq!(
+            lines[1],
+            "1759926896000,2025-10-08T12:34:56Z,150000000,1.50000000,\"a, b; c\""
+        );
+        assert_eq!(lines[2], ",,,,");
+        let json: serde_json::Value =
+            serde_json::from_str(&result_json(&result, "tx").unwrap()).unwrap();
+        assert_eq!(json["query"], "tx");
+        assert_eq!(json["rows"][0]["fee"], 150_000_000);
+        assert_eq!(json["rows"][0]["label"][0], "a, b");
+        assert_eq!(json["rows"][1]["fee"], serde_json::Value::Null);
+        assert_eq!(json["columns"][1]["kind"], "amount");
+        assert_eq!(query_stem(" Big fees "), "query_Big fees");
+        assert_eq!(query_stem(""), "query");
     }
 
     #[test]

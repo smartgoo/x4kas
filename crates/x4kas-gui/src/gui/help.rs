@@ -10,7 +10,7 @@ use super::widgets::{command_key, modal_window, section_title};
 fn shortcuts(ctx: &egui::Context) -> Vec<(String, &'static str)> {
     let cmd = command_key(ctx);
     vec![
-        ("1 – 5".to_string(), "Switch tab"),
+        ("1 – 6".to_string(), "Switch tab"),
         (
             "Ctrl+Tab / Ctrl+Shift+Tab".to_string(),
             "Next / previous tab",
@@ -20,6 +20,7 @@ fn shortcuts(ctx: &egui::Context) -> Vec<(String, &'static str)> {
             "Explorer: Home to open a new sub tab / close the sub tab",
         ),
         (format!("{cmd}+L"), "Explorer: focus the search field"),
+        (format!("{cmd}+Enter"), "Query: run the query"),
         (
             format!("{cmd}+[ / {cmd}+]"),
             "Back / forward (the info pane when open, else the Explorer tab; mouse back/forward buttons too)",

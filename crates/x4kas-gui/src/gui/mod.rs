@@ -13,7 +13,9 @@ mod help;
 mod mempool;
 mod monitoring;
 mod pane;
+mod query;
 mod rpc_explorer;
+mod sankey;
 mod settings;
 mod terminal;
 mod theme;
@@ -33,6 +35,8 @@ use explorer::ExplorerUi;
 use flows::FlowWindowUi;
 use monitoring::MonitoringTab;
 use pane::InfoPane;
+use query::QueryTab;
+use sankey::SankeyWindowUi;
 use settings::SettingsPage;
 use terminal::TerminalPane;
 use toasts::Toasts;
@@ -122,7 +126,10 @@ enum EscTarget {
     Help,
     Connection,
     Dialog,
+    Sankey,
     Flows,
+    /// The Query tab's save dialog.
+    QueryDialog,
     Pane,
     Settings,
 }
@@ -135,11 +142,18 @@ const SHUTDOWN_PATIENCE: Duration = Duration::from_secs(5);
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct Prefs {
     active_tab: Tab,
-    /// The analytics cards' time windows, by `AnalyticsPanel`.
-    windows: Option<[x4kas_core::app::TimeWindow; 6]>,
+    /// The analytics cards' time windows, by `AnalyticsPanel` (a list, so a saved
+    /// shorter one from before a panel was added still loads).
+    windows: Option<Vec<x4kas_core::app::TimeWindow>>,
     /// The Explorer's recently viewed pane is open (it is until closed).
     #[serde(default = "yes")]
     recents_open: bool,
+    /// The flow graph writes the amount over every edge.
+    #[serde(default)]
+    flow_amounts: bool,
+    /// The Query tab's saved queries pane is open.
+    #[serde(default = "yes")]
+    query_sidebar_open: bool,
 }
 
 fn yes() -> bool {
@@ -167,8 +181,10 @@ struct GuiApp {
     settings: SettingsPage,
     pane: InfoPane,
     flow_window: FlowWindowUi,
+    sankey_window: SankeyWindowUi,
     dialogs: dialogs::Dialogs,
     toasts: Toasts,
+    query: QueryTab,
 }
 
 impl GuiApp {
@@ -179,13 +195,19 @@ impl GuiApp {
         storage: Option<&dyn eframe::Storage>,
     ) -> Self {
         let mut explorer = ExplorerUi::default();
+        let mut flow_window = FlowWindowUi::default();
+        let mut query = QueryTab::default();
         if let Some(prefs) = storage.and_then(|s| eframe::get_value::<Prefs>(s, PREFS_KEY)) {
             let mut state = app.blocking_write();
             state.active_tab = prefs.active_tab;
             if let Some(windows) = prefs.windows {
-                state.analytics.windows = windows;
+                for (slot, window) in state.analytics.windows.iter_mut().zip(windows) {
+                    *slot = window;
+                }
             }
             explorer.recents_open = prefs.recents_open;
+            flow_window.show_amounts = prefs.flow_amounts;
+            query.sidebar_open = prefs.query_sidebar_open;
         }
         Self {
             app,
@@ -201,9 +223,11 @@ impl GuiApp {
             explorer,
             settings: SettingsPage::default(),
             pane: InfoPane::default(),
-            flow_window: FlowWindowUi::default(),
+            flow_window,
+            sankey_window: SankeyWindowUi::default(),
             dialogs: dialogs::Dialogs::default(),
             toasts: Toasts::default(),
+            query,
         }
     }
 
@@ -238,9 +262,15 @@ impl GuiApp {
         }
     }
 
-    /// A window (Help, Connection, a dialog, the flow graph) is on show.
+    /// A window (Help, Connection, a dialog, the transaction flow, the flow graph) is
+    /// on show.
     fn modal_open(&self, app: &App) -> bool {
-        self.show_help || self.connection.open || self.dialogs.any_open() || app.address.flows.open
+        self.show_help
+            || self.connection.open
+            || self.dialogs.any_open()
+            || app.sankey.open
+            || app.address.flows.open
+            || self.query.modal_open()
     }
 
     /// What this frame's Esc closes, if anything.
@@ -254,8 +284,12 @@ impl GuiApp {
             Some(EscTarget::Connection)
         } else if self.dialogs.any_open() {
             Some(EscTarget::Dialog)
+        } else if app.sankey.open {
+            Some(EscTarget::Sankey)
         } else if app.address.flows.open {
             Some(EscTarget::Flows)
+        } else if self.query.modal_open() {
+            Some(EscTarget::QueryDialog)
         } else if app.explorer.pane.is_some() {
             Some(EscTarget::Pane)
         } else if self.settings.open {
@@ -286,8 +320,10 @@ impl eframe::App for GuiApp {
         };
         let prefs = Prefs {
             active_tab: app.active_tab,
-            windows: Some(app.analytics.windows),
+            windows: Some(app.analytics.windows.to_vec()),
             recents_open: self.explorer.recents_open,
+            flow_amounts: self.flow_window.show_amounts,
+            query_sidebar_open: self.query.sidebar_open,
         };
         eframe::set_value(storage, PREFS_KEY, &prefs);
     }
@@ -314,6 +350,7 @@ impl eframe::App for GuiApp {
             .as_ref()
             .is_some_and(|s| s.network_id.contains("testnet"));
         widgets::set_testnet(ctx, testnet);
+        widgets::set_direct(ctx, app.connection.is_direct());
         widgets::set_labels(ctx, app.labels.clone());
 
         egui::TopBottomPanel::top("top_bar")
@@ -358,6 +395,13 @@ impl eframe::App for GuiApp {
             match app.active_tab {
                 Tab::Dashboard => dashboard::show(ui, &mut app),
                 Tab::Explorer => self.explorer.show(ui, &mut app, &self.cmd_tx),
+                Tab::Query => self.query.show(
+                    ui,
+                    &mut app,
+                    &self.cmd_tx,
+                    esc == Some(EscTarget::QueryDialog),
+                    modal_open,
+                ),
                 Tab::Monitoring => self.monitoring.show(ui, &mut app, &self.cmd_tx),
                 Tab::Mempool => mempool::show(ui, &app),
                 Tab::RpcExplorer => rpc_explorer::show(ui, &mut app, &self.cmd_tx),
@@ -393,8 +437,20 @@ impl eframe::App for GuiApp {
             app.explorer.open_pane(page);
             ctx.request_repaint();
         }
+        // "Query …" from an address's or a block's menu: the Query tab loads and runs it.
+        if let Some((query, id)) = widgets::take_query_request(ctx) {
+            app.query.preload = Some(query);
+            app.query.preload_id = id;
+            app.active_tab = Tab::Query;
+            self.settings.open = false;
+            app.explorer.close_pane();
+            ctx.request_repaint();
+        }
         self.flow_window
             .show(ctx, &mut app, &self.cmd_tx, esc == Some(EscTarget::Flows));
+        // The transaction flow, opened from a transaction page (also over the flow graph).
+        self.sankey_window
+            .show(ctx, &mut app, &self.cmd_tx, esc == Some(EscTarget::Sankey));
         // The label and watchlist dialogs, asked for by the action bar; above the flow
         // window, which can be open underneath.
         self.dialogs.take_requests(ctx, &app);
@@ -463,7 +519,14 @@ fn handle_shortcuts(
     explorer: &mut ExplorerUi,
     modal_open: bool,
 ) {
-    const TAB_KEYS: [Key; 5] = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5];
+    const TAB_KEYS: [Key; 6] = [
+        Key::Num1,
+        Key::Num2,
+        Key::Num3,
+        Key::Num4,
+        Key::Num5,
+        Key::Num6,
+    ];
 
     // Works even while the terminal or a text field has focus.
     if ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, Key::Backtick)) {
@@ -885,7 +948,18 @@ fn chain_chip(ui: &mut egui::Ui, app: &App, cmd_tx: &CommandSender) {
         widgets::subheader(ui, "Index");
         ui.end_row();
         kv(ui, "Transactions", format_number(status.txs_indexed));
+        kv(ui, "Blocks", format_number(status.blocks_indexed));
         kv(ui, "Addresses", format_number(status.addresses));
+        if let Some(format) = status.rebuilt_from {
+            kv(
+                ui,
+                "Rebuilt",
+                format!(
+                    "the index on disk was format {format}; this version needs {}",
+                    x4kas_core::index::FORMAT_VERSION
+                ),
+            );
+        }
         if let Some(pos) = status.position {
             kv(
                 ui,

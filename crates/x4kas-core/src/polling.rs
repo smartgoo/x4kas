@@ -27,6 +27,9 @@ pub struct PollingHandles {
     pub index: Option<JoinHandle<()>>,
     /// The watchlist's `UtxosChanged` subscription (`watch::start_watch`).
     pub watch: Option<JoinHandle<()>>,
+    /// The watched saved queries (`query::watch::start_query_watch`), which read the
+    /// store: stopped and awaited by [`Self::stop_index`] before the writer.
+    pub query_watch: Option<crate::query::watch::QueryWatchHandle>,
     /// One-off requests from the frontend (RPC calls, block lookups, commands).
     requests: JoinSet<()>,
 }
@@ -54,9 +57,11 @@ impl PollingHandles {
         self.requests.abort_all();
     }
 
-    /// Wait for the index writer to drain and close the store. Call after
-    /// [`Self::abort_all`], which drops the stream that feeds it.
+    /// Wait for the index writer to drain and close the store (after stopping the
+    /// watched queries, which read it). Call after [`Self::abort_all`], which drops the
+    /// stream that feeds it.
     pub async fn stop_index(&mut self) {
+        self.stop_query_watch().await;
         if let Some(h) = self.index.take() {
             let _ = h.await;
         }

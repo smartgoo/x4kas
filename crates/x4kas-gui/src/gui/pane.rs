@@ -160,6 +160,7 @@ impl InfoPane {
             ExplorerPage::Address(_) => "Address",
             ExplorerPage::Block(_) => "Block",
             ExplorerPage::Transaction { .. } => "Transaction",
+            ExplorerPage::Protocol(_) => "Protocol",
             ExplorerPage::Lookup(_) | ExplorerPage::Home => "Info",
         };
         let (can_back, can_forward) = app.explorer.pane.as_ref().map_or((false, false), |pane| {
@@ -260,6 +261,13 @@ impl InfoPane {
                     card(ui, &format!("Outputs ({})", view.outputs.len()), |ui| {
                         explorer::tx_outputs(ui, view)
                     });
+                }
+                PageData::Protocol(data) => {
+                    card(
+                        ui,
+                        &format!("{} transactions", data.protocol.label()),
+                        |ui| explorer::protocol_transactions(ui, data, cmd_tx),
+                    );
                 }
                 PageData::Redirect(_) => card(ui, "Info", |ui| placeholder(ui, "Resolving…")),
             },

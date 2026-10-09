@@ -7,12 +7,17 @@ use egui_extras::{Column, TableBuilder};
 use super::theme;
 use super::widgets::{
     address, card_with_header, direct_node_placeholder, fit_label, kv, kv_columns, kv_grid,
-    kv_with, or_dash, placeholder, request_address, section_title, signed_label, subheader,
+    kv_with, open_page, or_dash, placeholder, request_address, section_title, signed_label,
+    subheader,
 };
 use x4kas_core::analytics::{AggregatedView, InspectionCounts, ScriptClassCounts};
 use x4kas_core::app::{AnalyticsPanel, App, ChainPhase, TimeWindow};
+use x4kas_core::explorer::ExplorerPage;
 use x4kas_core::format::{format_kas, format_number};
 use x4kas_core::tx_inspect::TransactionProtocol;
+
+/// Protocols listed on the Explorer Home's card, most transactions first.
+const TOP_PROTOCOLS: usize = 10;
 
 /// Tables taller than this scroll.
 /// A [`wide_table`]'s body height.
@@ -390,6 +395,58 @@ pub(super) fn addresses(ui: &mut Ui, app: &App, entries: Option<&[(String, u64)]
         address,
         Some(request_address),
     );
+}
+
+/// The Explorer Home's protocols card: every protocol with its transactions over the
+/// window and their share of all transactions, most first. A click opens the
+/// protocol's transactions.
+pub(super) fn protocols(ui: &mut Ui, app: &App, view: Option<&AggregatedView>) {
+    let total = view.map_or(0, |v| v.totals.tx_count).max(1) as f64;
+    let mut counts: Vec<(TransactionProtocol, u64)> = TransactionProtocol::ALL
+        .into_iter()
+        .map(|p| (p, view.map_or(0, |v| v.protocol_count(p))))
+        .collect();
+    // Most transactions first; equal counts keep the display order.
+    counts.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+    let rows = counts
+        .into_iter()
+        .take(TOP_PROTOCOLS)
+        .map(|(p, n)| {
+            [
+                p.label().to_string(),
+                format_number(n),
+                format!("{:.2}%", n as f64 / total * 100.0),
+            ]
+        })
+        .collect();
+    wide_table(
+        ui,
+        "protocols",
+        ["Protocol", "Txs", "Share"],
+        rows,
+        if view.is_some() {
+            "No protocol data yet"
+        } else {
+            waiting_text(app)
+        },
+        protocol_cell,
+        Some(open_protocol),
+    );
+}
+
+/// A protocol's name as a link to its transactions.
+fn protocol_cell(ui: &mut Ui, label: &str) {
+    let response = fit_label(ui, label).on_hover_text(format!("{label} transactions"));
+    if response.clicked() {
+        open_protocol(ui.ctx(), label);
+    }
+}
+
+/// Open the transactions of the protocol with this label (a row click).
+fn open_protocol(ctx: &egui::Context, label: &str) {
+    if let Some(protocol) = TransactionProtocol::from_label(label) {
+        open_page(ctx, ExplorerPage::Protocol(protocol));
+    }
 }
 
 /// Full-width table: the first column takes the remaining width and is drawn by

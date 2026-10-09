@@ -35,7 +35,7 @@ use records::{AddrId, Hash32, SLAB_MS, addr_key, decode, encode, parse_addr_key,
 
 /// Bumped when the on-disk layout or the meaning of stored data changes; an index with
 /// another format is discarded and rebuilt from the node.
-pub const FORMAT_VERSION: u32 = 3;
+pub const FORMAT_VERSION: u32 = 5;
 
 /// Block cache shared by all keyspaces.
 const CACHE_BYTES: u64 = 256 * 1024 * 1024;
@@ -75,6 +75,9 @@ pub struct Manifest {
     pub position: Option<Position>,
     pub next_addr_id: AddrId,
     pub txs_indexed: u64,
+    /// Block records held (chain blocks and the merged blocks their transactions name).
+    #[serde(default)]
+    pub blocks_indexed: u64,
 }
 
 /// The keyspaces of one six-hour slab.
@@ -91,6 +94,14 @@ pub struct Slab {
     pub stats: Keyspace,
     /// `addr_id ‖ peer_id → PeerStats`
     pub peers: Keyspace,
+    /// `protocol code ‖ time_ms ‖ txid → ()`, the transactions of each protocol
+    pub protocol_tx: Keyspace,
+    /// `time_ms ‖ txid → TxSummary`, every transaction by time
+    pub time_tx: Keyspace,
+    /// `block_hash → BlockRecord`, the blocks whose own timestamp falls in the slab
+    pub blocks: Keyspace,
+    /// `time_ms ‖ block_hash → ()`, those blocks by time
+    pub time_blocks: Keyspace,
 }
 
 impl Slab {
@@ -102,21 +113,34 @@ impl Slab {
         (self.no + 1) * SLAB_MS
     }
 
-    fn keyspaces(&self) -> [&Keyspace; 5] {
+    /// Every keyspace of the slab.
+    pub fn keyspaces(&self) -> [&Keyspace; 9] {
         [
             &self.tx,
             &self.addr_tx,
             &self.block_tx,
             &self.stats,
             &self.peers,
+            &self.protocol_tx,
+            &self.time_tx,
+            &self.blocks,
+            &self.time_blocks,
         ]
+    }
+
+    /// Whether the slab holds anything timestamped within `from_ms..to_ms`.
+    pub fn overlaps(&self, from_ms: u64, to_ms: u64) -> bool {
+        self.start_ms() < to_ms && self.end_ms() > from_ms
     }
 }
 
-const SLAB_PREFIXES: [&str; 5] = ["tx", "atx", "btx", "ast", "apr"];
+const SLAB_PREFIXES: [&str; 9] = ["tx", "atx", "btx", "ast", "apr", "ptx", "ttx", "blk", "tbk"];
 
 pub struct IndexStore {
     db: Database,
+    network: String,
+    /// The format of the index that was on disk and had to be discarded, if any.
+    rebuilt_from: Option<u32>,
     /// `format`, `network`, `manifest`
     meta: Keyspace,
     /// `address → addr_id`
@@ -138,7 +162,7 @@ impl IndexStore {
     /// Open the index at `path`, discarding it first when its format or network doesn't
     /// match. Waits a few seconds for the directory lock if another process holds it.
     pub fn open_at(path: PathBuf, network: &str) -> Result<Self> {
-        let store = Self::open_dir(&path)?;
+        let store = Self::open_dir(&path, network)?;
         let format: Option<u32> = store.meta_get("format")?;
         let stored_network: Option<String> = store.meta_get("network")?;
         if format.is_none() {
@@ -152,13 +176,64 @@ impl IndexStore {
         // Outdated or foreign: start over. Release the lock before removing the files.
         drop(store);
         std::fs::remove_dir_all(&path).with_context(|| format!("reset {}", path.display()))?;
-        let store = Self::open_dir(&path)?;
+        let mut store = Self::open_dir(&path, network)?;
         store.meta_put("format", &FORMAT_VERSION)?;
         store.meta_put("network", &network.to_string())?;
+        store.rebuilt_from = format.filter(|_| stored_network.as_deref() == Some(network));
         Ok(store)
     }
 
-    fn open_dir(path: &PathBuf) -> Result<Self> {
+    /// Open the index of `network` as it is on disk, to read it: for a CLI command that
+    /// must never change it. Unlike [`IndexStore::open`] it fails at once, without
+    /// waiting for the lock, when another x4kas process holds the index, when there is
+    /// none yet, or when its format or network isn't this build's (`open` would discard
+    /// and rebuild it); it deletes nothing.
+    pub fn open_existing(network: &str) -> Result<Self> {
+        Self::open_existing_at(index_dir(network), network)
+    }
+
+    /// [`IndexStore::open_existing`] at `path`.
+    pub fn open_existing_at(path: PathBuf, network: &str) -> Result<Self> {
+        if !path.is_dir() {
+            return Err(anyhow!(
+                "no address index for {network} at {}: build it in the GUI with a direct \
+                 node or with `x4kas-cli index run --url …`",
+                path.display()
+            ));
+        }
+        let db = match Database::builder(&path).cache_size(CACHE_BYTES).open() {
+            Ok(db) => db,
+            Err(fjall::Error::Locked) => {
+                return Err(anyhow!(
+                    "the address index at {} is in use by another x4kas process",
+                    path.display()
+                ));
+            }
+            Err(e) => return Err(e).context("open address index"),
+        };
+        let store = Self::from_db(db, network)?;
+        let format: Option<u32> = store.meta_get("format")?;
+        let stored_network: Option<String> = store.meta_get("network")?;
+        if format != Some(FORMAT_VERSION) {
+            return Err(anyhow!(
+                "the address index at {} has format {}, this build reads format \
+                 {FORMAT_VERSION}: open it in the GUI or run `x4kas-cli index run --url …` \
+                 to rebuild it",
+                path.display(),
+                format.map_or("none".to_string(), |f| f.to_string())
+            ));
+        }
+        if stored_network.as_deref() != Some(network) {
+            return Err(anyhow!(
+                "the address index at {} is of {}, not {network}",
+                path.display(),
+                stored_network.unwrap_or_default()
+            ));
+        }
+        Ok(store)
+    }
+
+    fn open_dir(path: &PathBuf, network: &str) -> Result<Self> {
         std::fs::create_dir_all(path)?;
         let deadline = std::time::Instant::now() + LOCK_RETRY;
         let db = loop {
@@ -176,6 +251,11 @@ impl IndexStore {
                 Err(e) => return Err(e).context("open address index"),
             }
         };
+        Self::from_db(db, network)
+    }
+
+    /// The store over an open database: its global keyspaces and the slabs on disk.
+    fn from_db(db: Database, network: &str) -> Result<Self> {
         let meta = db.keyspace("meta", KeyspaceCreateOptions::default)?;
         let addr_by_str = db.keyspace("addr_by_str", KeyspaceCreateOptions::default)?;
         let str_by_id = db.keyspace("str_by_id", KeyspaceCreateOptions::default)?;
@@ -195,6 +275,8 @@ impl IndexStore {
         }
         Ok(Self {
             db,
+            network: network.to_string(),
+            rebuilt_from: None,
             meta,
             addr_by_str,
             str_by_id,
@@ -206,6 +288,17 @@ impl IndexStore {
 
     pub fn db(&self) -> &Database {
         &self.db
+    }
+
+    /// The network the index is of (`mainnet`, `testnet-10`, …).
+    pub fn network(&self) -> &str {
+        &self.network
+    }
+
+    /// The format of the index this open discarded (an older x4kas wrote it), so the
+    /// rebuild from the node can be explained.
+    pub fn rebuilt_from(&self) -> Option<u32> {
+        self.rebuilt_from
     }
 
     pub fn disk_space(&self) -> u64 {
@@ -290,6 +383,17 @@ impl IndexStore {
             .collect()
     }
 
+    /// The slabs holding anything timestamped within `from_ms..to_ms`, oldest first.
+    pub fn slabs_in(&self, from_ms: u64, to_ms: u64) -> Vec<Slab> {
+        self.slabs
+            .read()
+            .expect("slab map poisoned")
+            .values()
+            .filter(|s| s.overlaps(from_ms, to_ms))
+            .cloned()
+            .collect()
+    }
+
     /// The slab for `time_ms`, creating it if needed.
     pub fn slab_for(&self, time_ms: u64) -> Result<Slab> {
         let no = slab_of(time_ms);
@@ -355,7 +459,7 @@ fn open_slab(db: &Database, no: u64) -> Result<Slab> {
     let mut ks = SLAB_PREFIXES
         .iter()
         .map(|p| db.keyspace(&format!("{p}_{no}"), KeyspaceCreateOptions::default));
-    let mut next = || ks.next().expect("five slab keyspaces");
+    let mut next = || ks.next().expect("nine slab keyspaces");
     Ok(Slab {
         no,
         tx: next()?,
@@ -363,6 +467,10 @@ fn open_slab(db: &Database, no: u64) -> Result<Slab> {
         block_tx: next()?,
         stats: next()?,
         peers: next()?,
+        protocol_tx: next()?,
+        time_tx: next()?,
+        blocks: next()?,
+        time_blocks: next()?,
     })
 }
 
@@ -423,6 +531,14 @@ mod tests {
             store.slab_for(SLAB_MS * 3).unwrap();
             assert_eq!(store.slabs().len(), 2);
             assert_eq!(store.coverage(), Some((0, SLAB_MS * 4)));
+            assert_eq!(store.network(), "mainnet");
+            let nos = |slabs: Vec<Slab>| slabs.iter().map(|s| s.no).collect::<Vec<_>>();
+            assert_eq!(nos(store.slabs_in(0, 1)), vec![0]);
+            assert_eq!(nos(store.slabs_in(SLAB_MS, SLAB_MS * 3)), Vec::<u64>::new());
+            assert_eq!(
+                nos(store.slabs_in(SLAB_MS - 1, SLAB_MS * 3 + 1)),
+                vec![0, 3]
+            );
         }
         let store = IndexStore::open_at(path.clone(), "mainnet").unwrap();
         assert_eq!(store.slabs().len(), 2);
@@ -442,5 +558,54 @@ mod tests {
         }
         let store = IndexStore::open_at(path, "testnet-10").unwrap();
         assert!(store.slabs().is_empty());
+        assert_eq!(store.rebuilt_from(), None);
+    }
+
+    #[test]
+    fn an_older_format_resets_the_store_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index");
+        {
+            let store = IndexStore::open_at(path.clone(), "mainnet").unwrap();
+            store.slab_for(0).unwrap();
+            store.meta_put("format", &(FORMAT_VERSION - 1)).unwrap();
+        }
+        let store = IndexStore::open_at(path.clone(), "mainnet").unwrap();
+        assert!(store.slabs().is_empty());
+        assert_eq!(store.rebuilt_from(), Some(FORMAT_VERSION - 1));
+        drop(store);
+        let store = IndexStore::open_at(path, "mainnet").unwrap();
+        assert_eq!(store.rebuilt_from(), None);
+    }
+
+    #[test]
+    fn open_existing_never_resets_or_creates() {
+        fn refused(path: &std::path::Path, network: &str) -> String {
+            match IndexStore::open_existing_at(path.to_path_buf(), network) {
+                Ok(_) => panic!("opened {network} at {}", path.display()),
+                Err(e) => format!("{e:#}"),
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index");
+        assert!(refused(&path, "mainnet").contains("no address index"));
+        assert!(!path.exists());
+        {
+            let store = IndexStore::open_at(path.clone(), "mainnet").unwrap();
+            store.slab_for(0).unwrap();
+            // Held open: a second opener fails at once.
+            assert!(refused(&path, "mainnet").contains("in use"));
+        }
+        let store = IndexStore::open_existing_at(path.clone(), "mainnet").unwrap();
+        assert_eq!(store.slabs().len(), 1);
+        drop(store);
+        assert!(refused(&path, "testnet-10").contains("not testnet-10"));
+        let store = IndexStore::open_existing_at(path.clone(), "mainnet").unwrap();
+        store.meta_put("format", &(FORMAT_VERSION - 1)).unwrap();
+        drop(store);
+        assert!(refused(&path, "mainnet").contains("has format"));
+        // Nothing was discarded: the slab is still there for a normal open to reset.
+        let store = IndexStore::open_at(path, "mainnet").unwrap();
+        assert_eq!(store.rebuilt_from(), Some(FORMAT_VERSION - 1));
     }
 }

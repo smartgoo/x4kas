@@ -37,6 +37,14 @@ pub fn slab_of(time_ms: u64) -> u64 {
     time_ms / SLAB_MS
 }
 
+/// How many bytes of a transaction's payload are kept (`IndexedTx::payload_head`):
+/// enough for a protocol marker or a short message, not an inscription's body.
+pub const PAYLOAD_HEAD: usize = 128;
+
+/// `TxInput::script_class`/`TxOutput::script_class` when the script wasn't in the
+/// response (an unresolved input).
+pub const SCRIPT_UNKNOWN: u8 = 0xff;
+
 /// One accepted transaction, as stored under its id.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexedTx {
@@ -44,13 +52,37 @@ pub struct IndexedTx {
     pub daa_score: u64,
     /// The accepting chain block's timestamp, in unix ms.
     pub time_ms: u64,
+    /// The block the transaction is in (a merged block, or the chain block itself);
+    /// zero when the node didn't say.
+    pub block: Hash32,
+    /// `block`'s timestamp, in unix ms (the accepting block's when the node didn't say).
+    pub block_time_ms: u64,
     pub inputs: Vec<TxInput>,
     pub outputs: Vec<TxOutput>,
     /// `None` when a spent UTXO's amount wasn't resolved.
     pub fee: Option<u64>,
-    pub mass: u64,
+    pub storage_mass: u64,
+    pub compute_mass: u64,
     pub is_coinbase: bool,
     pub protocol: Option<TransactionProtocol>,
+    /// Transaction version, lock time, subnetwork and gas (Full verbosity; `None` or
+    /// `Unknown` when the node didn't send them).
+    pub version: Option<u16>,
+    pub lock_time: Option<u64>,
+    pub subnetwork: Subnetwork,
+    pub gas: Option<u64>,
+    pub payload_len: u32,
+    /// The first [`PAYLOAD_HEAD`] bytes of the payload.
+    pub payload_head: Vec<u8>,
+    /// Covenant-era opcodes used by the outputs' scripts and the redeem scripts the
+    /// inputs revealed (`tx_inspect::OpcodeUsage::to_bits`).
+    pub opcodes: u8,
+    /// Outputs that create a covenant.
+    pub covenant_created: u16,
+    /// Inputs that spend a covenant output (a lower bound: only resolved inputs count).
+    pub covenant_spent: u16,
+    /// Signature operations over every input.
+    pub sig_ops: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +92,9 @@ pub struct TxInput {
     pub amount: Option<u64>,
     pub prev_txid: Hash32,
     pub prev_index: u32,
+    /// The spent output's script class (`tx_inspect::ScriptClass::code`), or
+    /// [`SCRIPT_UNKNOWN`].
+    pub script_class: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,9 +103,160 @@ pub struct TxOutput {
     pub amount: u64,
     /// How likely this output is the sender's change, 0–100 (see `cluster::change_scores`).
     pub change: u8,
+    /// The script's class (`tx_inspect::ScriptClass::code`), or [`SCRIPT_UNKNOWN`].
+    pub script_class: u8,
+    /// The output creates a covenant.
+    pub covenant: bool,
+}
+
+/// A transaction's subnetwork, as far as the index cares: native, the coinbase
+/// subnetwork, or something else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Subnetwork {
+    /// The node didn't send it (a response below Full verbosity).
+    #[default]
+    Unknown,
+    Native,
+    Coinbase,
+    Other([u8; 20]),
+}
+
+impl Subnetwork {
+    /// From the 20 id bytes: all zero is native, `[1, 0, …]` is the coinbase subnetwork.
+    pub fn from_bytes(id: &[u8]) -> Self {
+        let Ok(bytes) = <[u8; 20]>::try_from(id) else {
+            return Self::Unknown;
+        };
+        if bytes.iter().all(|&b| b == 0) {
+            Self::Native
+        } else if bytes[0] == 1 && bytes[1..].iter().all(|&b| b == 0) {
+            Self::Coinbase
+        } else {
+            Self::Other(bytes)
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Native => "native",
+            Self::Coinbase => "coinbase",
+            Self::Other(_) => "other",
+        }
+    }
+}
+
+/// `TxSummary::flags` bits.
+pub const SUMMARY_COINBASE: u8 = 1;
+pub const SUMMARY_HAS_PAYLOAD: u8 = 2;
+/// Every output pays an input address back (nothing leaves the sender).
+pub const SUMMARY_SELF_TRANSFER: u8 = 4;
+
+/// What the time-ordered transaction index (`ttx_<n>`) stores with each entry: enough
+/// to filter and sort on the scalar properties of a transaction while scanning
+/// sequentially, so the full record is read only for the matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct TxSummary {
+    pub daa_score: u64,
+    pub fee: Option<u64>,
+    pub mass: u64,
+    pub input_total: Option<u64>,
+    pub output_total: u64,
+    pub max_output: u64,
+    pub min_output: u64,
+    pub inputs: u16,
+    pub outputs: u16,
+    pub flags: u8,
+    /// `TransactionProtocol::code`, or 0.
+    pub protocol: u8,
+    pub opcodes: u8,
+    pub payload_len: u32,
 }
 
 impl IndexedTx {
+    /// A transaction with nothing in it, accepted by `accepting_block`; the block it is
+    /// in is unknown.
+    pub fn empty(accepting_block: Hash32, daa_score: u64, time_ms: u64) -> Self {
+        Self {
+            accepting_block,
+            daa_score,
+            time_ms,
+            block: [0; 32],
+            block_time_ms: time_ms,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            fee: None,
+            storage_mass: 0,
+            compute_mass: 0,
+            is_coinbase: false,
+            protocol: None,
+            version: None,
+            lock_time: None,
+            subnetwork: Subnetwork::Unknown,
+            gas: None,
+            payload_len: 0,
+            payload_head: Vec::new(),
+            opcodes: 0,
+            covenant_created: 0,
+            covenant_spent: 0,
+            sig_ops: 0,
+        }
+    }
+
+    /// The mass the node charged: the larger of the storage and compute masses.
+    pub fn mass(&self) -> u64 {
+        self.storage_mass.max(self.compute_mass)
+    }
+
+    /// Sompi over the inputs, when every input's amount is known.
+    pub fn input_total(&self) -> Option<u64> {
+        self.inputs.iter().map(|i| i.amount).sum()
+    }
+
+    /// Sompi over the outputs.
+    pub fn output_total(&self) -> u64 {
+        self.outputs.iter().map(|o| o.amount).sum()
+    }
+
+    /// Every output pays an address that also signed an input (and there is one).
+    pub fn self_transfer(&self) -> bool {
+        if self.is_coinbase || self.outputs.is_empty() {
+            return false;
+        }
+        self.outputs.iter().all(|o| {
+            o.addr
+                .is_some_and(|addr| self.inputs.iter().any(|i| i.addr == Some(addr)))
+        })
+    }
+
+    pub fn summary(&self) -> TxSummary {
+        let mut flags = 0;
+        if self.is_coinbase {
+            flags |= SUMMARY_COINBASE;
+        }
+        if self.payload_len > 0 {
+            flags |= SUMMARY_HAS_PAYLOAD;
+        }
+        if self.self_transfer() {
+            flags |= SUMMARY_SELF_TRANSFER;
+        }
+        TxSummary {
+            daa_score: self.daa_score,
+            fee: self.fee,
+            mass: self.mass(),
+            input_total: self.input_total(),
+            output_total: self.output_total(),
+            max_output: self.outputs.iter().map(|o| o.amount).max().unwrap_or(0),
+            min_output: self.outputs.iter().map(|o| o.amount).min().unwrap_or(0),
+            inputs: self.inputs.len().min(u16::MAX as usize) as u16,
+            outputs: self.outputs.len().min(u16::MAX as usize) as u16,
+            flags,
+            protocol: self.protocol.map(|p| p.code()).unwrap_or(0),
+            opcodes: self.opcodes,
+            payload_len: self.payload_len,
+        }
+    }
+
     /// Sompi sent from `addr` in this transaction.
     pub fn sent_by(&self, addr: AddrId) -> u64 {
         self.inputs
@@ -100,6 +286,108 @@ impl IndexedTx {
         ids.sort_unstable();
         ids.dedup();
         ids
+    }
+}
+
+/// What kind of block a [`BlockRecord`] describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BlockKind {
+    /// A selected-chain block: the stream brings its header, and its own coinbase one
+    /// chain block later (under its child).
+    Chain,
+    /// A block a chain block merged: known only through the accepted transactions it
+    /// holds (no header, no miner; red blocks' transactions are accepted too).
+    Merged,
+}
+
+/// One output of a chain block's coinbase: the reward of one mergeset blue block, paid
+/// to that block's miner (the last output may instead pay the reds' rewards to the
+/// chain block's own miner).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Payout {
+    pub addr: Option<AddrId>,
+    pub amount: u64,
+}
+
+/// A block, as stored under its hash in `blk_<n>` (the slab of its own timestamp).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockRecord {
+    pub kind: BlockKind,
+    pub time_ms: u64,
+    /// The chain block that merged it (itself for a chain block).
+    pub merging_block: Hash32,
+
+    // --- Header: chain blocks only ---
+    pub version: Option<u16>,
+    pub daa_score: Option<u64>,
+    pub blue_score: Option<u64>,
+    /// Big-endian.
+    pub blue_work: Option<[u8; 24]>,
+    pub bits: Option<u32>,
+    pub nonce: Option<u64>,
+    /// Direct (level 0) parents.
+    pub parents: Vec<Hash32>,
+    pub parent_levels: u8,
+    pub hash_merkle_root: Option<Hash32>,
+    pub accepted_id_merkle_root: Option<Hash32>,
+    pub utxo_commitment: Option<Hash32>,
+    pub pruning_point: Option<Hash32>,
+
+    // --- Own coinbase: chain blocks only, written when the next chain block arrives ---
+    pub coinbase_txid: Option<Hash32>,
+    /// From the coinbase payload's script: who mined this block.
+    pub miner: Option<AddrId>,
+    pub miner_tag: Option<String>,
+    pub node_version: Option<String>,
+    pub subsidy: Option<u64>,
+    pub payouts: Vec<Payout>,
+
+    // --- Accepted transactions contained in this block (both kinds) ---
+    pub accepted_txs: u32,
+    pub accepted_mass: u64,
+    pub accepted_fees: u64,
+}
+
+impl BlockRecord {
+    /// An empty record of `kind` at `time_ms`, merged by `merging_block`.
+    pub fn new(kind: BlockKind, time_ms: u64, merging_block: Hash32) -> Self {
+        Self {
+            kind,
+            time_ms,
+            merging_block,
+            version: None,
+            daa_score: None,
+            blue_score: None,
+            blue_work: None,
+            bits: None,
+            nonce: None,
+            parents: Vec::new(),
+            parent_levels: 0,
+            hash_merkle_root: None,
+            accepted_id_merkle_root: None,
+            utxo_commitment: None,
+            pruning_point: None,
+            coinbase_txid: None,
+            miner: None,
+            miner_tag: None,
+            node_version: None,
+            subsidy: None,
+            payouts: Vec::new(),
+            accepted_txs: 0,
+            accepted_mass: 0,
+            accepted_fees: 0,
+        }
+    }
+
+    /// Sompi over the coinbase's outputs.
+    pub fn payout_total(&self) -> u64 {
+        self.payouts.iter().map(|p| p.amount).sum()
+    }
+
+    /// Nothing is known about the block beyond its existence: a merged record whose
+    /// transactions were all undone.
+    pub fn is_empty(&self) -> bool {
+        self.kind == BlockKind::Merged && self.accepted_txs == 0
     }
 }
 
@@ -199,6 +487,46 @@ pub fn parse_addr_tx_key(key: &[u8]) -> Option<(u64, Hash32)> {
     Some((time_ms, txid))
 }
 
+/// Key of a protocol's transaction entry: `protocol code ‖ time_ms ‖ txid`
+/// ([`TransactionProtocol::code`]), so a protocol's transactions sort by time under
+/// its one-byte prefix like an address's do.
+pub fn protocol_tx_key(protocol: TransactionProtocol, time_ms: u64, txid: &Hash32) -> [u8; 41] {
+    let mut key = [0u8; 41];
+    key[0] = protocol.code();
+    key[1..9].copy_from_slice(&time_ms.to_be_bytes());
+    key[9..].copy_from_slice(txid);
+    key
+}
+
+/// The `(time_ms, txid)` of a [`protocol_tx_key`].
+pub fn parse_protocol_tx_key(key: &[u8]) -> Option<(u64, Hash32)> {
+    if key.len() != 41 {
+        return None;
+    }
+    let time_ms = u64::from_be_bytes(key[1..9].try_into().ok()?);
+    let txid: Hash32 = key[9..].try_into().ok()?;
+    Some((time_ms, txid))
+}
+
+/// Key of a time-ordered entry: `time_ms ‖ hash`, the transactions of a slab by time
+/// (`ttx_<n>`, with a [`TxSummary`] value) and its blocks by time (`tbk_<n>`).
+pub fn time_key(time_ms: u64, hash: &Hash32) -> [u8; 40] {
+    let mut key = [0u8; 40];
+    key[..8].copy_from_slice(&time_ms.to_be_bytes());
+    key[8..].copy_from_slice(hash);
+    key
+}
+
+/// The `(time_ms, hash)` of a [`time_key`].
+pub fn parse_time_key(key: &[u8]) -> Option<(u64, Hash32)> {
+    if key.len() != 40 {
+        return None;
+    }
+    let time_ms = u64::from_be_bytes(key[..8].try_into().ok()?);
+    let hash: Hash32 = key[8..].try_into().ok()?;
+    Some((time_ms, hash))
+}
+
 /// Key of a peer entry: `addr_id ‖ peer_id`.
 pub fn peer_key(addr: AddrId, peer: AddrId) -> [u8; 8] {
     let mut key = [0u8; 8];
@@ -249,6 +577,140 @@ mod tests {
         assert!(a < b && b < c);
         assert_eq!(parse_addr_tx_key(&b), Some((200, [0; 32])));
         assert_eq!(parse_addr_tx_key(&b[..10]), None);
+    }
+
+    #[test]
+    fn protocol_tx_keys_sort_by_time_under_the_protocol() {
+        let a = protocol_tx_key(TransactionProtocol::Krc, 100, &[1; 32]);
+        let b = protocol_tx_key(TransactionProtocol::Krc, 200, &[0; 32]);
+        let c = protocol_tx_key(TransactionProtocol::Kns, 0, &[0; 32]);
+        assert!(a < b && b < c);
+        assert_eq!(parse_protocol_tx_key(&b), Some((200, [0; 32])));
+        assert_eq!(parse_protocol_tx_key(&b[..10]), None);
+    }
+
+    #[test]
+    fn time_keys_sort_by_time() {
+        let a = time_key(100, &[9; 32]);
+        let b = time_key(200, &[0; 32]);
+        assert!(a < b);
+        assert_eq!(parse_time_key(&b), Some((200, [0; 32])));
+        assert_eq!(parse_time_key(&b[..10]), None);
+    }
+
+    fn sample_tx() -> IndexedTx {
+        IndexedTx {
+            accepting_block: [1; 32],
+            daa_score: 7,
+            time_ms: 1_000,
+            block: [2; 32],
+            block_time_ms: 900,
+            inputs: vec![TxInput {
+                addr: Some(1),
+                amount: Some(100),
+                prev_txid: [0; 32],
+                prev_index: 0,
+                script_class: 0,
+            }],
+            outputs: vec![
+                TxOutput {
+                    addr: Some(2),
+                    amount: 60,
+                    change: 0,
+                    script_class: 0,
+                    covenant: false,
+                },
+                TxOutput {
+                    addr: Some(1),
+                    amount: 39,
+                    change: 90,
+                    script_class: 0,
+                    covenant: false,
+                },
+            ],
+            fee: Some(1),
+            storage_mass: 10,
+            compute_mass: 20,
+            is_coinbase: false,
+            protocol: Some(TransactionProtocol::Kns),
+            version: Some(0),
+            lock_time: Some(0),
+            subnetwork: Subnetwork::Native,
+            gas: Some(0),
+            payload_len: 3,
+            payload_head: b"kns".to_vec(),
+            opcodes: 0b101,
+            covenant_created: 0,
+            covenant_spent: 0,
+            sig_ops: 1,
+        }
+    }
+
+    #[test]
+    fn tx_summary_matches_record() {
+        let tx = sample_tx();
+        let s = tx.summary();
+        assert_eq!(tx.mass(), 20);
+        assert_eq!((s.mass, s.fee, s.daa_score), (20, Some(1), 7));
+        assert_eq!((s.input_total, s.output_total), (Some(100), 99));
+        assert_eq!((s.max_output, s.min_output), (60, 39));
+        assert_eq!((s.inputs, s.outputs), (1, 2));
+        assert_eq!(s.protocol, TransactionProtocol::Kns.code());
+        assert_eq!((s.opcodes, s.payload_len), (0b101, 3));
+        assert_eq!(s.flags, SUMMARY_HAS_PAYLOAD);
+
+        // Everything back to the sender is a self transfer; a coinbase never is.
+        let mut tx = sample_tx();
+        tx.outputs[0].addr = Some(1);
+        assert!(tx.self_transfer());
+        assert_eq!(
+            tx.summary().flags & SUMMARY_SELF_TRANSFER,
+            SUMMARY_SELF_TRANSFER
+        );
+        tx.is_coinbase = true;
+        tx.inputs.clear();
+        assert!(!tx.self_transfer());
+        assert_eq!(tx.summary().flags & SUMMARY_COINBASE, SUMMARY_COINBASE);
+        tx.inputs.push(TxInput {
+            addr: None,
+            amount: None,
+            prev_txid: [0; 32],
+            prev_index: 0,
+            script_class: SCRIPT_UNKNOWN,
+        });
+        assert_eq!(tx.input_total(), None);
+    }
+
+    #[test]
+    fn subnetwork_from_bytes() {
+        assert_eq!(Subnetwork::from_bytes(&[0; 20]), Subnetwork::Native);
+        let mut coinbase = [0u8; 20];
+        coinbase[0] = 1;
+        assert_eq!(Subnetwork::from_bytes(&coinbase), Subnetwork::Coinbase);
+        assert_eq!(Subnetwork::from_bytes(&[7; 20]), Subnetwork::Other([7; 20]));
+        assert_eq!(Subnetwork::from_bytes(&[0; 3]), Subnetwork::Unknown);
+        assert_eq!(Subnetwork::Coinbase.label(), "coinbase");
+    }
+
+    #[test]
+    fn block_record_defaults_and_payout_total() {
+        let mut b = BlockRecord::new(BlockKind::Merged, 5, [1; 32]);
+        assert!(b.is_empty());
+        b.accepted_txs = 1;
+        assert!(!b.is_empty());
+        let mut c = BlockRecord::new(BlockKind::Chain, 5, [1; 32]);
+        assert!(!c.is_empty());
+        c.payouts = vec![
+            Payout {
+                addr: Some(1),
+                amount: 10,
+            },
+            Payout {
+                addr: None,
+                amount: 5,
+            },
+        ];
+        assert_eq!(c.payout_total(), 15);
     }
 
     #[test]

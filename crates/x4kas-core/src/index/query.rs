@@ -12,12 +12,13 @@ use serde::{Deserialize, Serialize};
 use super::cluster;
 use super::peel::{self, PeelChain};
 use super::records::{
-    AddrId, AddrStats, Hash32, IndexedTx, PeerStats, addr_key, addr_tx_key, decode, decode_delta,
-    parse_addr_tx_key, parse_peer_key,
+    AddrId, AddrStats, BlockKind, BlockRecord, Hash32, IndexedTx, PeerStats, addr_key, addr_tx_key,
+    decode, decode_delta, parse_addr_tx_key, parse_peer_key, parse_protocol_tx_key,
+    protocol_tx_key,
 };
-use super::{IndexStore, hex, parse_hex};
+use super::{IndexStore, Slab, hex, parse_hex};
 use crate::labels::LabelBook;
-use crate::tx_inspect::TransactionProtocol;
+use crate::tx_inspect::{OpcodeUsage, ScriptClass, TransactionProtocol, difficulty_from_bits};
 
 /// An address's totals over everything the index holds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,6 +98,34 @@ pub struct Page<T> {
     pub next: Option<Cursor>,
 }
 
+impl<T> Page<T> {
+    /// Append an older page's rows, skipping the rows already here by `id` (a page
+    /// asked for twice, with the same cursor, must not double its rows), and continue
+    /// from where it ends.
+    pub fn append(&mut self, more: Page<T>, id: impl Fn(&T) -> &str) {
+        let have: HashSet<String> = self.items.iter().map(|t| id(t).to_string()).collect();
+        self.items
+            .extend(more.items.into_iter().filter(|t| !have.contains(id(t))));
+        self.next = more.next;
+    }
+}
+
+/// One row of a protocol's transaction list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProtocolTxRow {
+    pub txid: String,
+    pub time_ms: u64,
+    pub daa_score: u64,
+    pub accepting_block: String,
+    /// Sompi over the outputs.
+    pub output_total: u64,
+    pub fee: Option<u64>,
+    pub input_count: usize,
+    pub output_count: usize,
+    /// The first output's address.
+    pub recipient: Option<String>,
+}
+
 /// One row of an address's transaction list.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TxRow {
@@ -119,6 +148,9 @@ pub struct TxInputDetail {
     pub amount: Option<u64>,
     pub prev_txid: String,
     pub prev_index: u32,
+    /// The spent output's script class (`ScriptClass::label`), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script_class: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -127,6 +159,10 @@ pub struct TxOutputDetail {
     pub amount: u64,
     /// Likelihood this is the sender's change, 0–100.
     pub change: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script_class: Option<&'static str>,
+    #[serde(default)]
+    pub covenant: bool,
 }
 
 /// A stored transaction with its addresses resolved.
@@ -136,12 +172,213 @@ pub struct TxDetail {
     pub accepting_block: String,
     pub daa_score: u64,
     pub time_ms: u64,
+    /// The block holding the transaction (`None` when the node didn't say).
+    pub block: Option<String>,
+    pub block_time_ms: u64,
     pub inputs: Vec<TxInputDetail>,
     pub outputs: Vec<TxOutputDetail>,
     pub fee: Option<u64>,
+    /// The larger of the storage and compute masses.
     pub mass: u64,
+    pub storage_mass: u64,
+    pub compute_mass: u64,
     pub is_coinbase: bool,
     pub protocol: Option<TransactionProtocol>,
+    pub version: Option<u16>,
+    pub lock_time: Option<u64>,
+    /// `native`, `coinbase`, `other` or `unknown`.
+    pub subnetwork: &'static str,
+    pub gas: Option<u64>,
+    pub payload_len: u32,
+    /// The first `records::PAYLOAD_HEAD` bytes of the payload.
+    #[serde(with = "serde_bytes_hex")]
+    pub payload_head: Vec<u8>,
+    pub opcodes: OpcodeUsageDetail,
+    pub covenant_created: u16,
+    pub covenant_spent: u16,
+    pub sig_ops: u32,
+}
+
+impl TxDetail {
+    /// A coinbase-less, input-less transaction, for tests.
+    #[cfg(test)]
+    pub(crate) fn minimal(txid: &str, accepting_block: &str, daa_score: u64, time_ms: u64) -> Self {
+        Self {
+            txid: txid.to_string(),
+            accepting_block: accepting_block.to_string(),
+            daa_score,
+            time_ms,
+            block: None,
+            block_time_ms: time_ms,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            fee: None,
+            mass: 0,
+            storage_mass: 0,
+            compute_mass: 0,
+            is_coinbase: false,
+            protocol: None,
+            version: None,
+            lock_time: None,
+            subnetwork: "unknown",
+            gas: None,
+            payload_len: 0,
+            payload_head: Vec::new(),
+            opcodes: OpcodeUsageDetail::default(),
+            covenant_created: 0,
+            covenant_spent: 0,
+            sig_ops: 0,
+        }
+    }
+}
+
+/// Payload bytes as hex in JSON.
+mod serde_bytes_hex {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&bytes.iter().map(|b| format!("{b:02x}")).collect::<String>())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        let hex = String::deserialize(d)?;
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| {
+                u8::from_str_radix(hex.get(i..i + 2).unwrap_or("zz"), 16)
+                    .map_err(serde::de::Error::custom)
+            })
+            .collect()
+    }
+}
+
+/// The covenant-era opcodes a transaction used, spelled out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct OpcodeUsageDetail {
+    pub introspection: bool,
+    pub chainblock_seqcommit: bool,
+    pub zk_groth16: bool,
+    pub zk_r0succinct: bool,
+    pub zk_unknown: bool,
+}
+
+impl From<OpcodeUsage> for OpcodeUsageDetail {
+    fn from(u: OpcodeUsage) -> Self {
+        Self {
+            introspection: u.introspection,
+            chainblock_seqcommit: u.chainblock_seqcommit,
+            zk_groth16: u.zk_groth16,
+            zk_r0succinct: u.zk_r0succinct,
+            zk_unknown: u.zk_unknown,
+        }
+    }
+}
+
+/// A stored block with its addresses resolved.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BlockDetail {
+    pub hash: String,
+    /// `chain` or `merged`.
+    pub kind: &'static str,
+    pub time_ms: u64,
+    pub merging_block: String,
+    pub version: Option<u16>,
+    pub daa_score: Option<u64>,
+    pub blue_score: Option<u64>,
+    /// Hex.
+    pub blue_work: Option<String>,
+    pub bits: Option<u32>,
+    pub difficulty: Option<f64>,
+    pub nonce: Option<u64>,
+    pub parents: Vec<String>,
+    pub parent_levels: u8,
+    pub hash_merkle_root: Option<String>,
+    pub accepted_id_merkle_root: Option<String>,
+    pub utxo_commitment: Option<String>,
+    pub pruning_point: Option<String>,
+    pub coinbase_txid: Option<String>,
+    pub miner: Option<String>,
+    pub miner_tag: Option<String>,
+    pub node_version: Option<String>,
+    pub subsidy: Option<u64>,
+    /// The coinbase's outputs: `(address, sompi)`.
+    pub payouts: Vec<(Option<String>, u64)>,
+    pub accepted_txs: u32,
+    pub accepted_mass: u64,
+    pub accepted_fees: u64,
+}
+
+impl BlockKind {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Chain => "chain",
+            Self::Merged => "merged",
+        }
+    }
+}
+
+/// The stored block `hash`, if the index has it.
+pub fn block(store: &IndexStore, hash: &Hash32) -> Result<Option<BlockDetail>> {
+    for slab in store.slabs().into_iter().rev() {
+        let Some(bytes) = slab.blocks.get(hash)? else {
+            continue;
+        };
+        let record: BlockRecord = decode(&bytes)?;
+        return Ok(Some(block_detail(store, hash, &record)?));
+    }
+    Ok(None)
+}
+
+/// A [`BlockDetail`] of a stored record, its addresses resolved.
+pub fn block_detail(
+    store: &IndexStore,
+    hash: &Hash32,
+    record: &BlockRecord,
+) -> Result<BlockDetail> {
+    let h = |o: &Option<Hash32>| o.as_ref().map(hex);
+    let mut payouts = Vec::with_capacity(record.payouts.len());
+    for p in &record.payouts {
+        let address = match p.addr {
+            Some(id) => store.address_of(id)?,
+            None => None,
+        };
+        payouts.push((address, p.amount));
+    }
+    Ok(BlockDetail {
+        hash: hex(hash),
+        kind: record.kind.label(),
+        time_ms: record.time_ms,
+        merging_block: hex(&record.merging_block),
+        version: record.version,
+        daa_score: record.daa_score,
+        blue_score: record.blue_score,
+        blue_work: record
+            .blue_work
+            .map(|w| w.iter().map(|b| format!("{b:02x}")).collect::<String>())
+            .map(|s| s.trim_start_matches('0').to_string())
+            .map(|s| if s.is_empty() { "0".to_string() } else { s }),
+        bits: record.bits,
+        difficulty: record.bits.map(difficulty_from_bits),
+        nonce: record.nonce,
+        parents: record.parents.iter().map(hex).collect(),
+        parent_levels: record.parent_levels,
+        hash_merkle_root: h(&record.hash_merkle_root),
+        accepted_id_merkle_root: h(&record.accepted_id_merkle_root),
+        utxo_commitment: h(&record.utxo_commitment),
+        pruning_point: h(&record.pruning_point),
+        coinbase_txid: h(&record.coinbase_txid),
+        miner: match record.miner {
+            Some(id) => store.address_of(id)?,
+            None => None,
+        },
+        miner_tag: record.miner_tag.clone(),
+        node_version: record.node_version.clone(),
+        subsidy: record.subsidy,
+        payouts,
+        accepted_txs: record.accepted_txs,
+        accepted_mass: record.accepted_mass,
+        accepted_fees: record.accepted_fees,
+    })
 }
 
 /// A counterparty of an address.
@@ -482,6 +719,142 @@ pub fn transactions(
     Ok(Page { items, next })
 }
 
+/// `limit` transactions of `protocol`, newest first, older than `before` if given.
+pub fn protocol_transactions(
+    store: &IndexStore,
+    protocol: TransactionProtocol,
+    before: Option<Cursor>,
+    limit: usize,
+) -> Result<Page<ProtocolTxRow>> {
+    let mut items = Vec::with_capacity(limit);
+    let limit = limit.max(1);
+    let start = [protocol.code()];
+    'slabs: for slab in store.slabs().into_iter().rev() {
+        if before.is_some_and(|c| slab.start_ms() > c.time_ms) {
+            continue;
+        }
+        let end = match before {
+            Some(c) if c.time_ms < slab.end_ms() => {
+                protocol_tx_key(protocol, c.time_ms, &c.txid).to_vec()
+            }
+            _ => protocol_tx_key(protocol, u64::MAX, &[0xff; 32]).to_vec(),
+        };
+        for guard in slab.protocol_tx.range(start.to_vec()..end).rev() {
+            let (key, _) = guard.into_inner()?;
+            let Some((time_ms, txid)) = parse_protocol_tx_key(&key) else {
+                continue;
+            };
+            let Some(bytes) = slab.tx.get(txid)? else {
+                continue;
+            };
+            let tx: IndexedTx = decode(&bytes)?;
+            let recipient = match tx.outputs.first().and_then(|o| o.addr) {
+                Some(id) => store.address_of(id)?,
+                None => None,
+            };
+            items.push(ProtocolTxRow {
+                txid: hex(&txid),
+                time_ms,
+                daa_score: tx.daa_score,
+                accepting_block: hex(&tx.accepting_block),
+                output_total: tx.outputs.iter().map(|o| o.amount).sum(),
+                fee: tx.fee,
+                input_count: tx.inputs.len(),
+                output_count: tx.outputs.len(),
+                recipient,
+            });
+            if items.len() == limit {
+                break 'slabs;
+            }
+        }
+    }
+    let next = (items.len() == limit)
+        .then(|| items.last())
+        .flatten()
+        .map(|row| Cursor {
+            time_ms: row.time_ms,
+            txid: parse_hex(&row.txid).unwrap_or_default(),
+        });
+    Ok(Page { items, next })
+}
+
+/// How many of an address's transactions a spender search reads before giving up on
+/// an output: a busy address (an exchange) would otherwise cost a scan of everything
+/// it did since.
+pub const SPEND_SCAN_MAX: usize = 2_000;
+
+/// For each output of `txid`, the id of the indexed transaction that spent it, or
+/// `None` when nothing in the indexed window did (or the output's address isn't
+/// known, or the address was too busy to search: [`SPEND_SCAN_MAX`]). An empty vector
+/// when the index doesn't have `txid`. A spend is found by reading the output
+/// address's transactions from the spent transaction's time on and matching an
+/// input's outpoint.
+pub fn spenders(store: &IndexStore, txid: &Hash32) -> Result<Vec<Option<String>>> {
+    let mut found: Option<(IndexedTx, Slab)> = None;
+    for slab in store.slabs().into_iter().rev() {
+        if let Some(bytes) = slab.tx.get(txid)? {
+            found = Some((decode(&bytes)?, slab));
+            break;
+        }
+    }
+    let Some((tx, _)) = found else {
+        return Ok(Vec::new());
+    };
+    let mut spenders = vec![None; tx.outputs.len()];
+    // One scan per distinct address, matching every output it holds.
+    let mut addrs: Vec<AddrId> = tx.outputs.iter().filter_map(|o| o.addr).collect();
+    addrs.sort_unstable();
+    addrs.dedup();
+    for addr in addrs {
+        let wanted: Vec<usize> = tx
+            .outputs
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| o.addr == Some(addr))
+            .map(|(i, _)| i)
+            .collect();
+        let mut left = wanted.len();
+        let mut read = 0;
+        let start = addr_tx_key(addr, tx.time_ms, &[0; 32]).to_vec();
+        let end = addr_tx_key(addr, u64::MAX, &[0xff; 32]).to_vec();
+        'slabs: for slab in store.slabs() {
+            if slab.end_ms() <= tx.time_ms {
+                continue;
+            }
+            for guard in slab.addr_tx.range(start.clone()..end.clone()) {
+                let (key, _) = guard.into_inner()?;
+                let Some((_, candidate)) = parse_addr_tx_key(&key) else {
+                    continue;
+                };
+                if candidate == *txid {
+                    continue;
+                }
+                read += 1;
+                if read > SPEND_SCAN_MAX {
+                    break 'slabs;
+                }
+                let Some(bytes) = slab.tx.get(candidate)? else {
+                    continue;
+                };
+                let spend: IndexedTx = decode(&bytes)?;
+                for input in &spend.inputs {
+                    if input.prev_txid == *txid
+                        && let Some(&i) = wanted.iter().find(|&&i| i == input.prev_index as usize)
+                        && spenders[i].is_none()
+                    {
+                        spenders[i] = Some(hex(&candidate));
+                        left -= 1;
+                    }
+                }
+                if left == 0 {
+                    break 'slabs;
+                }
+            }
+        }
+    }
+    Ok(spenders)
+}
+
 /// The stored transaction `txid`, if the index has it.
 pub fn transaction(store: &IndexStore, txid: &Hash32) -> Result<Option<TxDetail>> {
     for slab in store.slabs().into_iter().rev() {
@@ -499,6 +872,7 @@ pub fn transaction(store: &IndexStore, txid: &Hash32) -> Result<Option<TxDetail>
             names.insert(id, name.clone());
             Ok(name)
         };
+        let class = |code: u8| ScriptClass::from_code(code).map(|c| c.label());
         let mut inputs = Vec::with_capacity(tx.inputs.len());
         for input in &tx.inputs {
             inputs.push(TxInputDetail {
@@ -506,6 +880,7 @@ pub fn transaction(store: &IndexStore, txid: &Hash32) -> Result<Option<TxDetail>
                 amount: input.amount,
                 prev_txid: hex(&input.prev_txid),
                 prev_index: input.prev_index,
+                script_class: class(input.script_class),
             });
         }
         let mut outputs = Vec::with_capacity(tx.outputs.len());
@@ -514,6 +889,8 @@ pub fn transaction(store: &IndexStore, txid: &Hash32) -> Result<Option<TxDetail>
                 address: resolve(output.addr)?,
                 amount: output.amount,
                 change: output.change,
+                script_class: class(output.script_class),
+                covenant: output.covenant,
             });
         }
         return Ok(Some(TxDetail {
@@ -521,12 +898,26 @@ pub fn transaction(store: &IndexStore, txid: &Hash32) -> Result<Option<TxDetail>
             accepting_block: hex(&tx.accepting_block),
             daa_score: tx.daa_score,
             time_ms: tx.time_ms,
+            block: (tx.block != [0; 32]).then(|| hex(&tx.block)),
+            block_time_ms: tx.block_time_ms,
             inputs,
             outputs,
             fee: tx.fee,
-            mass: tx.mass,
+            mass: tx.mass(),
+            storage_mass: tx.storage_mass,
+            compute_mass: tx.compute_mass,
             is_coinbase: tx.is_coinbase,
             protocol: tx.protocol,
+            version: tx.version,
+            lock_time: tx.lock_time,
+            subnetwork: tx.subnetwork.label(),
+            gas: tx.gas,
+            payload_len: tx.payload_len,
+            payload_head: tx.payload_head.clone(),
+            opcodes: OpcodeUsage::from_bits(tx.opcodes).into(),
+            covenant_created: tx.covenant_created,
+            covenant_spent: tx.covenant_spent,
+            sig_ops: tx.sig_ops,
         }));
     }
     Ok(None)
@@ -601,6 +992,64 @@ pub fn balance_curve(deltas: &[(u64, i64)], now_balance: Option<u64>) -> Vec<(u6
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn page_append_skips_rows_already_shown() {
+        let row = |n: u32| n.to_string();
+        let mut page = Page {
+            items: vec![row(3), row(2)],
+            next: Some(Cursor {
+                time_ms: 2,
+                txid: [0; 32],
+            }),
+        };
+        page.append(
+            Page {
+                items: vec![row(2), row(1)],
+                next: None,
+            },
+            |t| t.as_str(),
+        );
+        assert_eq!(page.items, vec![row(3), row(2), row(1)]);
+        assert!(page.next.is_none());
+    }
+
+    #[test]
+    fn spenders_finds_the_transaction_that_spent_each_output() {
+        use std::sync::Arc;
+
+        use crate::index::temp_store;
+        use crate::index::writer::IndexWriter;
+        use crate::index::writer::testing::{chain_block, hash, response, tx, with_outpoint};
+        use crate::labels::LabelBook;
+
+        let store = temp_store();
+        let mut writer =
+            IndexWriter::new(store.store.clone(), Arc::new(LabelBook::base())).unwrap();
+        // The coinbase pays 1, 2 and 3; 1 spends its output a block later, 3 spends
+        // its in the same block; 2's stays unspent.
+        let mut t1 = tx(1, &[(1, 100)], &[(4, 90)]);
+        with_outpoint(&mut t1, 0, 0, 0);
+        let mut t3 = tx(3, &[(3, 50)], &[(5, 40)]);
+        with_outpoint(&mut t3, 0, 0, 2);
+        let r = response(
+            vec![],
+            vec![
+                chain_block(
+                    1,
+                    1_000,
+                    vec![tx(0, &[], &[(1, 100), (2, 70), (3, 50)]), t3],
+                ),
+                chain_block(2, 2_000, vec![t1]),
+            ],
+        );
+        writer.apply(&r).unwrap();
+        let id = |n: u64| hash(n).as_bytes();
+        let found = spenders(&store.store, &id(0)).unwrap();
+        assert_eq!(found, vec![Some(hex(&id(1))), None, Some(hex(&id(3)))]);
+        // A transaction the index doesn't have has no outputs to speak of.
+        assert!(spenders(&store.store, &id(9)).unwrap().is_empty());
+    }
 
     #[test]
     fn cursor_roundtrip() {

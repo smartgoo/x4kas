@@ -543,7 +543,8 @@ impl RpcManager {
     }
 
     /// Fetch the virtual selected parent chain v2 from a given start hash.
-    /// Uses High verbosity for fee/address/payload data, and min_confirmation_count=10.
+    /// Uses Full verbosity (fees, addresses, payloads, and the transaction fields the
+    /// index keeps: version, lock time, subnetwork, gas), and min_confirmation_count=10.
     pub async fn fetch_vspc_v2(
         &self,
         start_hash: RpcHash,
@@ -552,7 +553,7 @@ impl RpcManager {
             .client
             .get_virtual_chain_from_block_v2(
                 start_hash,
-                Some(RpcDataVerbosityLevel::High),
+                Some(RpcDataVerbosityLevel::Full),
                 Some(10),
             )
             .await?;

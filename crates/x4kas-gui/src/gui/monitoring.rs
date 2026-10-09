@@ -395,7 +395,7 @@ fn activity(ui: &mut Ui, app: &mut App, fill: bool) {
 /// The alert dot at the start of an Activity row: filled while unread, a ring once
 /// read, and an empty space of the same width for an event without an alert. Returns
 /// whether it was clicked.
-fn alert_dot(ui: &mut Ui, dot: Option<&(bool, String)>) -> bool {
+pub(super) fn alert_dot(ui: &mut Ui, dot: Option<&(bool, String)>) -> bool {
     let size = ui.spacing().interact_size.y.min(14.0);
     let Some((read, hover)) = dot else {
         ui.allocate_exact_size(vec2(size, size), Sense::hover());

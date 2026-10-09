@@ -112,7 +112,7 @@ struct Balance {
 
 /// Open the index for `network` and run the command, printing JSON to stdout.
 pub fn run(network: &str, cmd: AddressCommand) -> Result<()> {
-    let store = IndexStore::open(network)?;
+    let store = IndexStore::open_existing(network)?;
     let out = match cmd {
         AddressCommand::Profile(a) => to_json(&query::profile(&store, &a.address)?)?,
         AddressCommand::Txs {

@@ -12,7 +12,7 @@ use eframe::egui::{self, Button, OpenUrl, Ui};
 use super::address::open_flow_graph;
 use super::dialogs;
 use super::theme;
-use super::widgets::{CARD_GAP, is_testnet};
+use super::widgets::{CARD_GAP, is_testnet, request_query};
 use x4kas_core::app::App;
 use x4kas_core::controller::{CommandSender, ExportRequest, UiCommand};
 use x4kas_core::explorer::{ExplorerPage, PageData, PageLoad};
@@ -21,6 +21,8 @@ use x4kas_core::format::{
     kaspa_stream_block_url, kaspa_stream_tx_url,
 };
 use x4kas_core::index::export::ExportFormat;
+use x4kas_core::index::parse_hex;
+use x4kas_core::query::Query;
 
 /// Draw the bar for `page`, if it is a page with actions (an address, a block or a
 /// transaction), with a rule under it and the gap to the first card.
@@ -40,18 +42,20 @@ pub fn bar(ui: &mut Ui, app: &mut App, page: &ExplorerPage, cmd_tx: &CommandSend
             explorer_tx_url(txid, testnet),
             (!testnet).then(|| kaspa_stream_tx_url(txid)),
         ),
-        ExplorerPage::Home | ExplorerPage::Lookup(_) => return,
+        ExplorerPage::Home | ExplorerPage::Lookup(_) | ExplorerPage::Protocol(_) => return,
     };
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 2.0;
-        // Open: the web explorers, and for an address its flow graph.
+        // Open: the web explorers, for an address its flow graph, for a transaction
+        // its flow diagram.
         let mut flows = false;
+        let mut sankey = false;
         MenuButton::from_button(action_button("Open ▾")).ui(ui, |ui| {
             menu_link(ui, "Kaspa Explorer ↗", &explorer);
             if let Some(stream) = &stream {
                 menu_link(ui, "Kaspa Stream ↗", stream);
             }
-            if matches!(page, ExplorerPage::Address(_)) {
+            if let ExplorerPage::Address(addr) = page {
                 ui.separator();
                 // The flow graph reads the index, which only a direct node fills.
                 let direct = app.connection.is_direct();
@@ -64,6 +68,67 @@ pub fn bar(ui: &mut Ui, app: &mut App, page: &ExplorerPage, cmd_tx: &CommandSend
                     .clicked()
                 {
                     flows = true;
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(direct, Button::new("Query transactions"))
+                    .on_hover_text(
+                        "The address's transactions in the Query tab, to filter and export",
+                    )
+                    .on_disabled_hover_text("Needs a direct node: queries read the address index")
+                    .clicked()
+                {
+                    request_query(ui.ctx(), Query::transactions_of(addr));
+                    ui.close();
+                }
+            }
+            if let ExplorerPage::Block(hash) = page
+                && let Some(block) = parse_hex(hash)
+            {
+                ui.separator();
+                let direct = app.connection.is_direct();
+                if ui
+                    .add_enabled(direct, Button::new("Query accepted transactions"))
+                    .on_hover_text("The transactions this chain block accepted, in the Query tab")
+                    .on_disabled_hover_text("Needs a direct node: queries read the address index")
+                    .clicked()
+                {
+                    request_query(ui.ctx(), Query::accepted_by(block));
+                    ui.close();
+                }
+                let miner = match app.explorer.load(page) {
+                    Some(PageLoad::Ready(data)) => match &**data {
+                        PageData::Block(view) => {
+                            view.miner.as_ref().and_then(|m| m.address.clone())
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(miner) = miner
+                    && ui
+                        .add_enabled(direct, Button::new("Query blocks by this miner"))
+                        .on_hover_text("The chain blocks this miner mined, in the Query tab")
+                        .on_disabled_hover_text(
+                            "Needs a direct node: queries read the address index",
+                        )
+                        .clicked()
+                {
+                    request_query(ui.ctx(), Query::mined_by(&miner));
+                    ui.close();
+                }
+            }
+            if matches!(page, ExplorerPage::Transaction { .. }) {
+                ui.separator();
+                if ui
+                    .button("Transaction flow")
+                    .on_hover_text(
+                        "Inputs and outputs as a Sankey diagram; follow an input to the \
+                         transaction that created it, an output to the one that spent it",
+                    )
+                    .clicked()
+                {
+                    sankey = true;
                     ui.close();
                 }
             }
@@ -80,12 +145,21 @@ pub fn bar(ui: &mut Ui, app: &mut App, page: &ExplorerPage, cmd_tx: &CommandSend
                 ui.separator();
                 block_export(ui, app, page, cmd_tx);
             }
+            ExplorerPage::Transaction { txid, block } if sankey => {
+                app.sankey.start(txid.clone(), block.clone());
+                let _ = cmd_tx.send(UiCommand::TxSankey {
+                    txid: txid.clone(),
+                    block_hint: block.clone(),
+                });
+            }
             _ => {}
         }
     });
     let rule_y = ui.cursor().top() + 2.0;
+    // The width left to this page, not the whole tab's: in the Explorer the recents
+    // pane takes the left of it, and the tab's rect still spans it.
     ui.painter().hline(
-        ui.max_rect().x_range(),
+        ui.available_rect_before_wrap().x_range(),
         rule_y,
         egui::Stroke::new(1.0_f32, theme::BORDER),
     );

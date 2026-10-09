@@ -4,8 +4,7 @@
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
-
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use tokio::sync::{RwLock, mpsc, oneshot};
@@ -13,14 +12,22 @@ use tokio::sync::{RwLock, mpsc, oneshot};
 use crate::analytics;
 use crate::app::{ActiveConnection, AddressView, App, ChainPhase, ConnectionStatus, ExportOrigin};
 use crate::chain_stream::{self, StreamStart};
-use crate::explorer::{self, AddressPageData, BlockView, ExplorerPage, PageData, TxView};
+use crate::explorer::{
+    self, AddressPageData, BlockView, ExplorerPage, PageData, ProtocolPageData, TxView,
+};
+use crate::format::now_ms;
 use crate::index::export::{self, ExportFormat};
 use crate::index::query::{self, AddressProfile, Cursor, FlowGraph};
 use crate::index::{self, IndexStore, parse_hex};
 use crate::labels::{self, LabelBook};
 use crate::polling::{PollingHandles, create_and_start_rpc, start_hashrate_polling};
+use crate::query::exec::{self, Cell, ColumnSource, Inputs, QUERY_BUDGET, RunControl};
+use crate::query::fields::FieldId;
+use crate::query::saved::SavedQueries;
+use crate::query::{Entity, Query};
 use crate::rpc::client::RpcManager;
 use crate::rpc::methods::parse_hash;
+use crate::tx_inspect::TransactionProtocol;
 use crate::watch::{self, Watchlist};
 
 /// Rows per page of an address's transactions.
@@ -31,6 +38,10 @@ const ADDRESS_PEERS: usize = 10;
 const CLUSTER_MEMBERS: usize = 50;
 /// Counterparties followed per node in the flow graph.
 pub const FLOW_TOP: usize = 12;
+/// Address rows whose balance the node is asked for after a query.
+const QUERY_BALANCES_MAX: usize = 200;
+/// How often a running query reports its progress to the frontend.
+const QUERY_PROGRESS_EVERY: Duration = Duration::from_millis(250);
 
 /// Commands sent from the frontend to the controller task.
 pub enum UiCommand {
@@ -43,17 +54,39 @@ pub enum UiCommand {
     /// Append the next (older) page of transactions to the address's loaded page
     /// (`app.explorer`'s cache, shown by the info pane or an Explorer tab).
     AddressPage { address: String, before: Cursor },
+    /// Append the next (older) page of a protocol's transactions to its loaded page.
+    ProtocolPage {
+        protocol: TransactionProtocol,
+        before: Cursor,
+    },
     /// Load a page into `app.explorer`'s cache (for the info pane or an Explorer tab):
     /// a block from the node, an address's profile, transactions, counterparties and
     /// balance, a transaction from the index, the mempool or the block it is known to
-    /// be in, or a lookup that may be either a block or a transaction.
+    /// be in, a lookup that may be either a block or a transaction, or a protocol's
+    /// transactions from the index.
     ExplorerLoad(ExplorerPage),
     /// Expand the flow graph from `address` by `hops` counterparties (merged into
     /// `app.address.flows`).
     AddressFlows { address: String, hops: u8 },
+    /// Load a transaction and its outputs' spenders for the transaction flow window
+    /// (`app.sankey`).
+    TxSankey {
+        txid: String,
+        block_hint: Option<String>,
+    },
     /// Write an export under `~/.x4kas/exports/`; the outcome lands in
     /// `app.address.export`.
     Export(ExportRequest),
+    /// Answer a query against the index; progress and the result land in `app.query`.
+    QueryRun {
+        query: Query,
+        /// The saved query it is run as, if any (named in the result and its export).
+        name: Option<String>,
+    },
+    /// Stop the query in progress.
+    QueryCancel,
+    /// Replace the saved queries: saved to disk, then `app.query.saved`.
+    QueriesSet(SavedQueries),
     /// Replace the watchlist: saved to disk, then the subscription restarts.
     WatchSet(Watchlist),
     /// Set (or with `None` remove) the user's label for an address.
@@ -88,6 +121,13 @@ pub enum ExportRequest {
     },
     /// A block as the Explorer shows it, as JSON.
     Block(Box<BlockView>),
+    /// A query's result as the Query tab shows it, named after the query.
+    Query {
+        name: String,
+        text: String,
+        result: Box<exec::ResultSet>,
+        format: ExportFormat,
+    },
 }
 
 /// A node reached over the network: a wRPC URL or the public resolver.
@@ -117,6 +157,9 @@ struct Controller {
     /// The address index of the current direct connection, for queries.
     index: Option<Arc<IndexStore>>,
     polling: PollingHandles,
+    /// The query being answered (`UiCommand::QueryRun`): it reads the store, so a
+    /// connection switch cancels it and waits for it before closing the store.
+    query_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// Spawn the controller on the given runtime and return the command channel.
@@ -134,6 +177,7 @@ pub fn spawn(
         rpc: None,
         index: None,
         polling: PollingHandles::default(),
+        query_task: None,
     };
     rt.spawn(controller.run(rx));
     tx
@@ -145,6 +189,10 @@ impl Controller {
             let mut app = self.app.write().await;
             app.watch.list = Watchlist::load().unwrap_or_default();
             app.labels = Arc::new(labels::LabelBook::load());
+            match SavedQueries::load() {
+                Ok(list) => app.query.saved = list,
+                Err(e) => app.query.save_error = Some(format!("load queries: {e}")),
+            }
         }
         // Connect on startup if `--url` was given; otherwise wait for the user to pick.
         self.connect_remote().await;
@@ -157,9 +205,16 @@ impl Controller {
                 UiCommand::AddressPage { address, before } => {
                     self.address_page(address, before).await
                 }
+                UiCommand::ProtocolPage { protocol, before } => {
+                    self.protocol_page(protocol, before).await
+                }
                 UiCommand::ExplorerLoad(page) => self.explorer_load(page).await,
                 UiCommand::AddressFlows { address, hops } => self.address_flows(address, hops),
+                UiCommand::TxSankey { txid, block_hint } => self.tx_sankey(txid, block_hint),
                 UiCommand::Export(request) => self.export(request).await,
+                UiCommand::QueryRun { query, name } => self.query_run(query, name).await,
+                UiCommand::QueryCancel => self.query_cancel().await,
+                UiCommand::QueriesSet(list) => self.queries_set(list).await,
                 UiCommand::WatchSet(list) => self.set_watchlist(list).await,
                 UiCommand::SetLabel { address, name } => self.set_label(address, name).await,
                 UiCommand::RefreshLabels => self.refresh_labels(),
@@ -260,7 +315,9 @@ impl Controller {
             Ok(sink) => sink,
             Err(e) => return self.chain_failed(e).await,
         };
-        self.index = Some(store);
+        self.index = Some(store.clone());
+        // Watched saved queries re-run as the index moves.
+        crate::query::watch::start_query_watch(store, self.app.clone(), &mut self.polling);
 
         chain_stream::start_chain_stream(
             rpc,
@@ -290,10 +347,12 @@ impl Controller {
             return;
         };
         self.polling.stop_chain().await;
+        self.stop_query().await;
         self.index = None;
         {
             let mut app = self.app.write().await;
             app.clear_chain_data();
+            app.query.clear();
             app.chain.phase = ChainPhase::Opening;
             app.mark_dirty();
         }
@@ -319,6 +378,7 @@ impl Controller {
     /// Stop polling and clear all node data.
     async fn stop_all(&mut self) {
         self.polling.abort_all();
+        self.stop_query().await;
         self.index = None;
         // The writer finishes its batch and releases the store before we go on, so a
         // reconnect can reopen it.
@@ -400,20 +460,43 @@ impl Controller {
                     data.loading_more = false;
                     match result {
                         Ok(page) => {
-                            // A page asked for twice (the same cursor) must not
-                            // double its rows.
-                            let have: std::collections::HashSet<String> = data
-                                .view
-                                .page
-                                .items
-                                .iter()
-                                .map(|t| t.txid.clone())
-                                .collect();
-                            data.view
-                                .page
-                                .items
-                                .extend(page.items.into_iter().filter(|t| !have.contains(&t.txid)));
-                            data.view.page.next = page.next;
+                            data.view.page.append(page, |t| &t.txid);
+                            data.error = None;
+                        }
+                        Err(e) => data.error = Some(e),
+                    }
+                }
+            },
+        );
+    }
+
+    async fn protocol_page(&mut self, protocol: TransactionProtocol, before: Cursor) {
+        let store = self.index.clone();
+        {
+            let mut app = self.app.write().await;
+            match app.explorer.protocol_page_mut(protocol) {
+                Some(data) if data.loading_more => return,
+                Some(data) => data.loading_more = true,
+                None => return,
+            }
+            app.mark_dirty();
+        }
+        self.spawn_rpc(
+            move |_rpc| async move {
+                let store = store.ok_or_else(|| anyhow!("no address index"))?;
+                tokio::task::spawn_blocking(move || {
+                    query::protocol_transactions(&store, protocol, Some(before), ADDRESS_PAGE)
+                })
+                .await
+                .map_err(|e| anyhow!("protocol page task: {e}"))?
+            },
+            move |app, result| {
+                let result = result.map_err(|e| format!("{e:#}"));
+                if let Some(data) = app.explorer.protocol_page_mut(protocol) {
+                    data.loading_more = false;
+                    match result {
+                        Ok(page) => {
+                            data.page.append(page, |t| &t.txid);
                             data.error = None;
                         }
                         Err(e) => data.error = Some(e),
@@ -456,6 +539,28 @@ impl Controller {
                     tx_view(rpc, store, txid, block)
                         .await
                         .map(PageData::Transaction)
+                },
+                done,
+            ),
+            ExplorerPage::Protocol(protocol) => self.spawn_rpc(
+                move |_rpc| async move {
+                    let store = store.ok_or_else(|| {
+                        anyhow!(
+                            "Protocol transactions need a direct node connection (a URL), not the resolver"
+                        )
+                    })?;
+                    tokio::task::spawn_blocking(move || {
+                        let page =
+                            query::protocol_transactions(&store, protocol, None, ADDRESS_PAGE)?;
+                        Ok(PageData::Protocol(ProtocolPageData {
+                            protocol,
+                            page,
+                            loading_more: false,
+                            error: None,
+                        }))
+                    })
+                    .await
+                    .map_err(|e| anyhow!("protocol page task: {e}"))?
                 },
                 done,
             ),
@@ -513,6 +618,31 @@ impl Controller {
         );
     }
 
+    /// The transaction flow window's data: the transaction as the Explorer shows it,
+    /// and from the index which transaction spent each output.
+    fn tx_sankey(&mut self, txid: String, block_hint: Option<String>) {
+        let store = self.index.clone();
+        let id = txid.clone();
+        self.spawn_rpc(
+            move |rpc| async move {
+                let view = tx_view(rpc, store.clone(), id.clone(), block_hint).await?;
+                let spenders = match (store, parse_hex(&id)) {
+                    (Some(store), Some(hash)) => {
+                        tokio::task::spawn_blocking(move || query::spenders(&store, &hash))
+                            .await
+                            .map_err(|e| anyhow!("spender lookup task: {e}"))??
+                    }
+                    _ => Vec::new(),
+                };
+                Ok((view, spenders))
+            },
+            move |app, result| {
+                app.sankey
+                    .set_result(&txid, result.map_err(|e| format!("{e:#}")));
+            },
+        );
+    }
+
     /// Write the export in a blocking task (the store and the disk are synchronous).
     async fn export(&mut self, request: ExportRequest) {
         let store = self.index.clone();
@@ -520,6 +650,7 @@ impl Controller {
             ExportRequest::Transactions { address, .. } => ExportOrigin::Address(address.clone()),
             ExportRequest::Flows { .. } => ExportOrigin::Flows,
             ExportRequest::Block(view) => ExportOrigin::Block(view.hash.clone()),
+            ExportRequest::Query { name, .. } => ExportOrigin::Query(name.clone()),
         };
         let labels = {
             let mut app = self.app.write().await;
@@ -561,6 +692,21 @@ impl Controller {
                         export::export_path(&export::block_stem(&view.hash), ExportFormat::Json),
                         export::block_json(&view)?,
                     ),
+                    ExportRequest::Query {
+                        name,
+                        text,
+                        result,
+                        format,
+                    } => {
+                        let contents = match format {
+                            ExportFormat::Csv => export::result_csv(&result),
+                            ExportFormat::Json => export::result_json(&result, &text)?,
+                        };
+                        (
+                            export::export_path(&export::query_stem(&name), format),
+                            contents,
+                        )
+                    }
                 };
                 export::write(&path, &contents)?;
                 Ok(path)
@@ -574,6 +720,110 @@ impl Controller {
                 .finish(result.map_err(|e| format!("{e:#}")));
             app.mark_dirty();
         });
+    }
+
+    /// Answer `query` in a blocking task (the store is synchronous), reporting progress
+    /// every `QUERY_PROGRESS_EVERY` and the result through `app.query`. An address
+    /// result with a balance column then gets its balances from the node.
+    async fn query_run(&mut self, query: Query, name: Option<String>) {
+        self.stop_query().await;
+        let store = self.index.clone();
+        let rpc = self.rpc.clone();
+        let (generation, cancel, labels, watchlist, prune_floor, not_open) = {
+            let mut app = self.app.write().await;
+            let (generation, cancel) = app.query.start(query.clone(), name);
+            app.mark_dirty();
+            (
+                generation,
+                cancel,
+                app.labels.clone(),
+                app.watch.list.clone(),
+                app.node.pruning_point_timestamp_ms,
+                index_not_open(&app),
+            )
+        };
+        let app = self.app.clone();
+        self.query_task = Some(tokio::spawn(async move {
+            let result = match store {
+                None => Err(anyhow!("{not_open}")),
+                Some(store) => {
+                    let progress_app = app.clone();
+                    let run_query = query.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let inputs = Inputs {
+                            store: &store,
+                            labels: &labels,
+                            watchlist: &watchlist,
+                            now_ms: now_ms(),
+                            prune_floor_ms: prune_floor,
+                        };
+                        let mut last = Instant::now();
+                        let mut ctl = RunControl {
+                            cancel,
+                            deadline: Some(Instant::now() + QUERY_BUDGET),
+                            progress: Some(Box::new(move |p| {
+                                if last.elapsed() >= QUERY_PROGRESS_EVERY {
+                                    last = Instant::now();
+                                    let mut app = progress_app.blocking_write();
+                                    app.query.progress(generation, p);
+                                    app.mark_dirty();
+                                }
+                            })),
+                        };
+                        exec::run(&inputs, &run_query, &mut ctl)
+                    })
+                    .await
+                    .map_err(|e| anyhow!("query task: {e}"))
+                    .and_then(|r| r)
+                }
+            };
+            let result = match (result, rpc) {
+                (Ok(mut result), Some(rpc)) if result.balances_pending => {
+                    {
+                        let mut app = app.write().await;
+                        app.query.fetching_balances(generation);
+                        app.mark_dirty();
+                    }
+                    fill_balances(&rpc, &mut result).await;
+                    Ok(result)
+                }
+                (result, _) => result,
+            };
+            let mut app = app.write().await;
+            app.query
+                .finish(generation, result.map_err(|e| format!("{e:#}")));
+            app.mark_dirty();
+        }));
+    }
+
+    async fn query_cancel(&mut self) {
+        let mut app = self.app.write().await;
+        app.query.cancel();
+        app.mark_dirty();
+    }
+
+    /// Cancel the query in progress and wait for it, so the store can be closed.
+    async fn stop_query(&mut self) {
+        if let Some(task) = self.query_task.take() {
+            self.app.write().await.query.cancel();
+            let _ = task.await;
+        }
+    }
+
+    /// Save the queries and show the new list. Queries another process (the CLI's
+    /// `query save`) added to the file since the list was loaded are kept.
+    async fn queries_set(&mut self, mut list: SavedQueries) {
+        let mut app = self.app.write().await;
+        if let Ok(on_disk) = SavedQueries::load() {
+            for q in on_disk.queries {
+                if list.get(&q.id).is_none() && app.query.saved.get(&q.id).is_none() {
+                    list.upsert(q);
+                }
+            }
+        }
+        app.query.save_error = list.save().err().map(|e| format!("save queries: {e}"));
+        app.query.saved = list;
+        app.mark_dirty();
     }
 
     /// Save the new watchlist and restart the subscription with it.
@@ -611,6 +861,66 @@ impl Controller {
         self.polling.spawn_request(async move {
             labels::refresh_kaspa_org(&app).await;
         });
+    }
+}
+
+/// Why a query can't run on `app`: the index isn't open (yet), and the reason.
+fn index_not_open(app: &App) -> String {
+    use crate::app::ChainPhase;
+    if !app.connection.is_direct() {
+        return "Queries read the address index, which needs a direct node connection (a URL), not the resolver".to_string();
+    }
+    match &app.chain.phase {
+        ChainPhase::Error(e) => format!("The address index isn't open: {e}"),
+        ChainPhase::Idle => "The address index isn't open yet: connecting".to_string(),
+        ChainPhase::Opening => {
+            "The address index is still opening; try again in a moment".to_string()
+        }
+        _ => "The address index isn't open yet".to_string(),
+    }
+}
+
+/// Fill an address result's balance column from the node, for the first
+/// `QUERY_BALANCES_MAX` rows (best effort: a failed call leaves them unknown).
+async fn fill_balances(rpc: &RpcManager, result: &mut exec::ResultSet) {
+    result.balances_pending = false;
+    if result.entity != Entity::Addresses {
+        return;
+    }
+    let (Some(address_col), Some(balance_col)) = (
+        result
+            .columns
+            .iter()
+            .position(|c| c.source == ColumnSource::Field(FieldId::AddrAddress)),
+        result
+            .columns
+            .iter()
+            .position(|c| c.source == ColumnSource::Field(FieldId::AddrBalance)),
+    ) else {
+        return;
+    };
+    let addresses: Vec<kaspa_rpc_core::RpcAddress> = result
+        .rows
+        .iter()
+        .take(QUERY_BALANCES_MAX)
+        .filter_map(|row| match &row[address_col] {
+            Cell::Address(a) => kaspa_rpc_core::RpcAddress::try_from(a.as_str()).ok(),
+            _ => None,
+        })
+        .collect();
+    if addresses.is_empty() {
+        return;
+    }
+    let Ok(balances) = rpc.balances(addresses).await else {
+        return;
+    };
+    let by_address: std::collections::HashMap<String, u64> = balances.into_iter().collect();
+    for row in &mut result.rows {
+        if let Cell::Address(a) = &row[address_col]
+            && let Some(balance) = by_address.get(a)
+        {
+            row[balance_col] = Cell::Amount(*balance as i64);
+        }
     }
 }
 

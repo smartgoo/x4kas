@@ -4,6 +4,7 @@
 mod address;
 mod index;
 mod labels;
+mod query;
 mod rpc;
 mod watch;
 
@@ -15,6 +16,7 @@ use clap::{Parser, Subcommand};
 use crate::address::AddressCommand;
 use crate::index::IndexCommand;
 use crate::labels::LabelsCommand;
+use crate::query::QueryCommand;
 use crate::rpc::RpcCall;
 use crate::watch::WatchArgs;
 
@@ -65,6 +67,12 @@ pub enum Command {
         #[command(subcommand)]
         cmd: LabelsCommand,
     },
+    /// Run, save and explain queries over the address index; needs no node
+    #[command(after_help = query::AFTER_HELP)]
+    Query {
+        #[command(subcommand)]
+        cmd: QueryCommand,
+    },
 }
 
 #[tokio::main]
@@ -78,6 +86,7 @@ async fn main() -> Result<()> {
         Command::Index { cmd } => index::run(url, &args.network, cmd).await,
         Command::Watch(watch_args) => watch::run(url, &args.network, watch_args).await,
         Command::Labels { cmd } => labels::run(cmd).await,
+        Command::Query { cmd } => query::run(url, &args.network, cmd).await,
     }
 }
 

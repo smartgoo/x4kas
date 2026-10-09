@@ -68,8 +68,10 @@ fn run(
         let manifest = *writer.manifest();
         let status = &mut app.chain;
         status.txs_indexed = manifest.txs_indexed;
+        status.blocks_indexed = manifest.blocks_indexed;
         status.addresses = manifest.next_addr_id as u64;
         status.position = manifest.position;
+        status.rebuilt_from = store.rebuilt_from();
         status.slabs = store.slabs().len();
         status.coverage = store.coverage();
         status.disk_bytes = store.disk_space();
@@ -110,6 +112,7 @@ fn run(
                 let status = &mut app.chain;
                 status.write_error = None;
                 status.txs_indexed = manifest.txs_indexed;
+                status.blocks_indexed = manifest.blocks_indexed;
                 status.addresses = manifest.next_addr_id as u64;
                 status.position = manifest.position;
                 status.record_write(report.txs, started.elapsed());

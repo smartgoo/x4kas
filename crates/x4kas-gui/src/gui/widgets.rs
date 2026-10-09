@@ -13,6 +13,7 @@ use x4kas_core::app::{ActiveConnection, App};
 use x4kas_core::explorer::ExplorerPage;
 use x4kas_core::format::{explorer_address_url, kaspa_stream_address_url, shorten_middle};
 use x4kas_core::labels::{Label, LabelBook, LabelSource};
+use x4kas_core::query::Query;
 use x4kas_core::rpc::hash_links::HashLink;
 
 /// Vertical space between stacked cards.
@@ -430,17 +431,28 @@ pub fn field_label(ui: &mut Ui, label: &str) -> egui::Response {
 
 /// One row of a [`kv_grid`]: the label on the left, the value against the right edge.
 /// A value too wide for the row is truncated (with the whole of it on hover) rather
-/// than running over the label or the column beside it.
+/// than running over the label or the column beside it. In a tooltip, which sizes to
+/// its contents, the value wraps at the tooltip's maximum width instead.
 pub fn kv(ui: &mut Ui, label: &str, value: impl Into<WidgetText>) {
     let value: WidgetText = value.into();
+    // A grid cell's available width is its column's width from the previous frame (the
+    // minimum cell width on the first), so truncating at it in a tooltip would cut the
+    // value short and then keep the column that narrow. The width the tooltip has left
+    // is its maximum width minus what the label column took.
+    let tooltip = ui.layer_id().order == egui::Order::Tooltip;
+    let grid_left = ui.max_rect().left();
     kv_with(ui, label, |ui| {
         let full = value.text().to_string();
-        let galley = value.into_galley(
-            ui,
-            Some(egui::TextWrapMode::Truncate),
-            ui.available_width(),
-            egui::TextStyle::Body,
-        );
+        let (wrap, width) = if tooltip {
+            let taken = ui.max_rect().left() - grid_left;
+            (
+                egui::TextWrapMode::Wrap,
+                (ui.spacing().tooltip_width - taken).max(1.0),
+            )
+        } else {
+            (egui::TextWrapMode::Truncate, ui.available_width())
+        };
+        let galley = value.into_galley(ui, Some(wrap), width, egui::TextStyle::Body);
         let elided = galley.elided;
         let response = ui.add(egui::Label::new(galley));
         if elided {
@@ -722,6 +734,19 @@ fn linked_value(ui: &mut Ui, value: &str, kind: LinkKind<'_>, selected: bool, ch
                         }
                     }
                     ui.separator();
+                    if ui
+                        .add_enabled(is_direct(ui.ctx()), egui::Button::new("Query transactions"))
+                        .on_hover_text(
+                            "The address's transactions in the Query tab, to filter and export",
+                        )
+                        .on_disabled_hover_text(
+                            "Needs a direct node: queries read the address index",
+                        )
+                        .clicked()
+                    {
+                        request_query(ui.ctx(), Query::transactions_of(value));
+                    }
+                    ui.separator();
                     let mut sites = vec![("Open in Kaspa Explorer", explorer_address_url(value))];
                     // Kaspa Stream only covers mainnet.
                     if !is_testnet(ui.ctx()) {
@@ -978,9 +1003,20 @@ pub fn take_pane_request(ctx: &egui::Context) -> Option<ExplorerPage> {
         .flatten()
 }
 
-/// [`request_pane`] with the address's page.
+/// Show `page` the way a click on a link does: inside the Explorer tab
+/// ([`set_in_explorer`]) it navigates the active sub tab, elsewhere it opens the info
+/// pane ([`request_pane`]).
+pub fn open_page(ctx: &egui::Context, page: ExplorerPage) {
+    if in_explorer(ctx) {
+        request_explorer(ctx, page, false);
+    } else {
+        request_pane(ctx, page);
+    }
+}
+
+/// [`open_page`] with the address's page.
 pub fn request_address(ctx: &egui::Context, address: &str) {
-    request_pane(ctx, ExplorerPage::Address(address.trim().to_string()));
+    open_page(ctx, ExplorerPage::Address(address.trim().to_string()));
 }
 
 fn labels_id() -> egui::Id {
@@ -992,7 +1028,7 @@ pub fn set_labels(ctx: &egui::Context, book: Arc<LabelBook>) {
     ctx.data_mut(|d| d.insert_temp(labels_id(), book));
 }
 
-fn labels(ctx: &egui::Context) -> Option<Arc<LabelBook>> {
+pub(super) fn labels(ctx: &egui::Context) -> Option<Arc<LabelBook>> {
     ctx.data(|d| d.get_temp(labels_id()))
 }
 
@@ -1063,6 +1099,29 @@ fn copy_button(ui: &mut Ui, id: egui::Id, value: &str, hint: &str) {
 /// [`request_pane`] with the block's page.
 pub fn request_block(ctx: &egui::Context, hash: &str) {
     request_pane(ctx, ExplorerPage::Block(hash.to_string()));
+}
+
+fn query_request_id() -> egui::Id {
+    egui::Id::new("query_tab_request")
+}
+
+/// Ask the Query tab to show and run `query`, from anywhere (an address's menu). The
+/// GUI frame loop picks it up with [`take_query_request`].
+pub fn request_query(ctx: &egui::Context, query: Query) {
+    ctx.data_mut(|d| d.insert_temp(query_request_id(), Some((query, None::<String>))));
+}
+
+/// Ask the Query tab to show and run the saved query `id` (a toast's, an alert's).
+pub fn request_saved_query(ctx: &egui::Context, query: Query, id: &str) {
+    ctx.data_mut(|d| {
+        d.insert_temp(query_request_id(), Some((query, Some(id.to_string()))));
+    });
+}
+
+/// The query requested this frame, if any, with the saved query it is.
+pub fn take_query_request(ctx: &egui::Context) -> Option<(Query, Option<String>)> {
+    ctx.data_mut(|d| d.remove_temp::<Option<(Query, Option<String>)>>(query_request_id()))
+        .flatten()
 }
 
 fn explorer_request_id() -> egui::Id {
@@ -1179,6 +1238,20 @@ pub fn set_testnet(ctx: &egui::Context, testnet: bool) {
 
 pub fn is_testnet(ctx: &egui::Context) -> bool {
     ctx.data(|d| d.get_temp(testnet_id())).unwrap_or(false)
+}
+
+fn direct_id() -> egui::Id {
+    egui::Id::new("direct_node")
+}
+
+/// Whether the connection is a direct node (the index and queries are available), for
+/// the menus that need to know (`is_direct`); set by the frame loop.
+pub fn set_direct(ctx: &egui::Context, direct: bool) {
+    ctx.data_mut(|d| d.insert_temp(direct_id(), direct));
+}
+
+pub fn is_direct(ctx: &egui::Context) -> bool {
+    ctx.data(|d| d.get_temp(direct_id())).unwrap_or(false)
 }
 
 /// Side of the square copy icon, a little taller than a capital letter.

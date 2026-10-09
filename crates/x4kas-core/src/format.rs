@@ -106,6 +106,173 @@ pub fn format_utc(ms: u64) -> String {
     format!("{year:04}-{month:02}-{day:02}T{h:02}:{m:02}:{s:02}Z")
 }
 
+/// The inverse of [`format_utc`]: `2026-10-08T12:34:56Z`, `2026-10-08T12:34Z`,
+/// `2026-10-08` (midnight), with an optional `.123` fraction, as unix milliseconds. UTC
+/// only; `None` for anything else.
+pub fn parse_utc(s: &str) -> Option<u64> {
+    let s = s.trim().trim_end_matches(['Z', 'z']);
+    let (date, time) = match s.split_once(['T', 't', ' ']) {
+        Some((d, t)) => (d, Some(t)),
+        None => (s, None),
+    };
+    let mut parts = date.split('-');
+    let year: i64 = parts.next()?.parse().ok()?;
+    let month: i64 = parts.next()?.parse().ok()?;
+    let day: i64 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let (mut h, mut m, mut sec, mut ms) = (0u64, 0u64, 0u64, 0u64);
+    if let Some(time) = time {
+        let (hms, frac) = match time.split_once('.') {
+            Some((hms, frac)) => (hms, Some(frac)),
+            None => (time, None),
+        };
+        let mut parts = hms.split(':');
+        h = parts.next()?.parse().ok()?;
+        m = parts.next()?.parse().ok()?;
+        sec = parts
+            .next()
+            .map(|p| p.parse())
+            .transpose()
+            .ok()?
+            .unwrap_or(0);
+        if parts.next().is_some() || h > 23 || m > 59 || sec > 59 {
+            return None;
+        }
+        if let Some(frac) = frac {
+            if frac.is_empty() || frac.len() > 3 || !frac.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            ms = format!("{frac:0<3}").parse().ok()?;
+        }
+    }
+    // Days from civil (Howard Hinnant's algorithm), the inverse of `format_utc`'s.
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    if days < 0 {
+        return None;
+    }
+    Some((days as u64 * 86_400 + h * 3_600 + m * 60 + sec) * 1_000 + ms)
+}
+
+/// A duration such as `24h`, `1d12h`, `90m`, `1h30m15s`, `500ms` or `2w` in
+/// milliseconds; `None` for anything else (no unit, an unknown unit, no digits).
+pub fn parse_duration_ms(s: &str) -> Option<u64> {
+    let s = s.trim().to_ascii_lowercase();
+    if s.is_empty() {
+        return None;
+    }
+    let mut total: u64 = 0;
+    let mut digits = String::new();
+    let mut unit = String::new();
+    let mut flush = |digits: &mut String, unit: &mut String| -> Option<()> {
+        if digits.is_empty() {
+            return None;
+        }
+        let n: u64 = digits.parse().ok()?;
+        let scale = match unit.as_str() {
+            "ms" => 1,
+            "s" => 1_000,
+            "m" => 60_000,
+            "h" => 3_600_000,
+            "d" => 86_400_000,
+            "w" => 7 * 86_400_000,
+            _ => return None,
+        };
+        total = total.checked_add(n.checked_mul(scale)?)?;
+        digits.clear();
+        unit.clear();
+        Some(())
+    };
+    for c in s.chars() {
+        if c.is_ascii_digit() {
+            if !unit.is_empty() {
+                flush(&mut digits, &mut unit)?;
+            }
+            digits.push(c);
+        } else if c.is_ascii_alphabetic() {
+            unit.push(c);
+        } else {
+            return None;
+        }
+    }
+    flush(&mut digits, &mut unit)?;
+    Some(total)
+}
+
+/// A duration in milliseconds in its units, largest first: `1d2h`, `90m` → `1h30m`,
+/// `1500ms` → `1s500ms`, `0` → `0s`. The inverse of [`parse_duration_ms`].
+pub fn format_duration_ms(ms: u64) -> String {
+    if ms == 0 {
+        return "0s".to_string();
+    }
+    let mut out = String::new();
+    let mut rest = ms;
+    for (scale, unit) in [
+        (86_400_000, "d"),
+        (3_600_000, "h"),
+        (60_000, "m"),
+        (1_000, "s"),
+        (1, "ms"),
+    ] {
+        let n = rest / scale;
+        if n > 0 {
+            out.push_str(&format!("{n}{unit}"));
+            rest %= scale;
+        }
+    }
+    out
+}
+
+/// A KAS amount written as a decimal (`1.5`, `-0.00000001`, `1,000`) as sompi, exactly:
+/// no floating point. `None` for more than 8 decimals or anything that isn't a number.
+pub fn parse_kas_to_sompi(s: &str) -> Option<i64> {
+    let s = s.trim().replace([',', '_'], "");
+    let (negative, s) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s.strip_prefix('+').unwrap_or(&s)),
+    };
+    let (int, frac) = match s.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (s, ""),
+    };
+    if (int.is_empty() && frac.is_empty())
+        || frac.len() > 8
+        || !int.bytes().all(|b| b.is_ascii_digit())
+        || !frac.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let int: i64 = if int.is_empty() { 0 } else { int.parse().ok()? };
+    let frac: i64 = if frac.is_empty() {
+        0
+    } else {
+        format!("{frac:0<8}").parse().ok()?
+    };
+    let sompi = int.checked_mul(100_000_000)?.checked_add(frac)?;
+    Some(if negative { -sompi } else { sompi })
+}
+
+/// Sompi as an exact KAS decimal with no trailing zeros: `150000000` → `1.5`,
+/// `1` → `0.00000001`, `-200000000` → `-2`. The inverse of [`parse_kas_to_sompi`].
+pub fn format_sompi_exact(sompi: i64) -> String {
+    let sign = if sompi < 0 { "-" } else { "" };
+    let abs = sompi.unsigned_abs();
+    let (int, frac) = (abs / 100_000_000, abs % 100_000_000);
+    if frac == 0 {
+        format!("{sign}{int}")
+    } else {
+        let frac = format!("{frac:08}");
+        format!("{sign}{int}.{}", frac.trim_end_matches('0'))
+    }
+}
+
 /// `s` unchanged if it has at most `max_chars` characters, otherwise its start and end
 /// joined by `...` in `max_chars` characters, e.g. `kaspa:qzv6...3gujgy`.
 pub fn shorten_middle(s: &str, max_chars: usize) -> String {
@@ -322,5 +489,70 @@ mod tests {
     #[test]
     fn format_hashrate_small() {
         assert_eq!(format_hashrate(500.0), "500.00 H/s");
+    }
+
+    #[test]
+    fn parse_utc_inverts_format_utc() {
+        for ms in [
+            0u64,
+            1_000,
+            1_700_000_000_123,
+            4_102_444_800_000,
+            253_402_300_799_000,
+        ] {
+            let text = format_utc(ms);
+            assert_eq!(parse_utc(&text), Some(ms / 1000 * 1000), "{text}");
+        }
+        assert_eq!(
+            parse_utc("2026-10-08T12:34:56.123Z"),
+            Some(1_791_462_896_123)
+        );
+        assert_eq!(parse_utc("2026-10-08T12:34:56.1Z"), Some(1_791_462_896_100));
+        assert_eq!(parse_utc("2026-10-08T12:34Z"), Some(1_791_462_840_000));
+        assert_eq!(parse_utc("2026-10-08"), Some(1_791_417_600_000));
+        assert_eq!(parse_utc("1970-01-01"), Some(0));
+        assert_eq!(parse_utc("2026-13-01"), None);
+        assert_eq!(parse_utc("2026-10-08T25:00Z"), None);
+        assert_eq!(parse_utc("yesterday"), None);
+        assert_eq!(parse_utc("1969-12-31"), None);
+    }
+
+    #[test]
+    fn durations_parse_and_print() {
+        assert_eq!(parse_duration_ms("24h"), Some(86_400_000));
+        assert_eq!(parse_duration_ms("1d12h"), Some(129_600_000));
+        assert_eq!(parse_duration_ms("90m"), Some(5_400_000));
+        assert_eq!(parse_duration_ms("1h30m15s"), Some(5_415_000));
+        assert_eq!(parse_duration_ms("500ms"), Some(500));
+        assert_eq!(parse_duration_ms("2W"), Some(1_209_600_000));
+        assert_eq!(parse_duration_ms("24"), None);
+        assert_eq!(parse_duration_ms("h"), None);
+        assert_eq!(parse_duration_ms("3y"), None);
+        assert_eq!(parse_duration_ms(""), None);
+        for ms in [0u64, 1, 999, 1_000, 5_415_000, 129_600_000, 90_061_001] {
+            let text = format_duration_ms(ms);
+            assert_eq!(parse_duration_ms(&text), Some(ms), "{text}");
+        }
+        assert_eq!(format_duration_ms(90_061_001), "1d1h1m1s1ms");
+        assert_eq!(format_duration_ms(0), "0s");
+    }
+
+    #[test]
+    fn kas_amounts_are_exact() {
+        assert_eq!(parse_kas_to_sompi("1.5"), Some(150_000_000));
+        assert_eq!(parse_kas_to_sompi("0.00000001"), Some(1));
+        assert_eq!(parse_kas_to_sompi("-2"), Some(-200_000_000));
+        assert_eq!(parse_kas_to_sompi("1,000.25"), Some(100_025_000_000));
+        assert_eq!(parse_kas_to_sompi(".5"), Some(50_000_000));
+        assert_eq!(parse_kas_to_sompi("0.000000001"), None);
+        assert_eq!(parse_kas_to_sompi("abc"), None);
+        assert_eq!(parse_kas_to_sompi(""), None);
+        for sompi in [0i64, 1, 150_000_000, -200_000_000, 123_456_789_012_345] {
+            let text = format_sompi_exact(sompi);
+            assert_eq!(parse_kas_to_sompi(&text), Some(sompi), "{text}");
+        }
+        assert_eq!(format_sompi_exact(150_000_000), "1.5");
+        assert_eq!(format_sompi_exact(1), "0.00000001");
+        assert_eq!(format_sompi_exact(-200_000_000), "-2");
     }
 }

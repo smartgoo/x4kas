@@ -97,32 +97,6 @@ pub fn show(ui: &mut Ui, app: &mut App) {
                 analytics::top_miners,
             );
         });
-        ui.add_space(CARD_GAP);
-        weighted_columns(ui, [1.0; 2], TABLE_CARD, |[left, right]| {
-            panel_card(
-                left,
-                app,
-                "Top Senders",
-                AnalyticsPanel::TopSenders,
-                |ui, app, view| {
-                    analytics::addresses(ui, app, view.map(|v| v.top_senders.as_slice()), "sender")
-                },
-            );
-            panel_card(
-                right,
-                app,
-                "Top Receivers",
-                AnalyticsPanel::TopReceivers,
-                |ui, app, view| {
-                    analytics::addresses(
-                        ui,
-                        app,
-                        view.map(|v| v.top_receivers.as_slice()),
-                        "receiver",
-                    )
-                },
-            );
-        });
     });
 }
 

@@ -44,6 +44,33 @@ impl Default for ConnectionSettings {
     }
 }
 
+/// Why `url` can't be connected to, if it can't: a wRPC URL is `ws://host[:port]` or
+/// `wss://host[:port]`.
+pub fn validate_url(url: &str) -> Result<(), String> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Err("Enter a URL".to_string());
+    }
+    let rest = url
+        .strip_prefix("ws://")
+        .or_else(|| url.strip_prefix("wss://"))
+        .ok_or_else(|| "The URL must start with ws:// or wss://".to_string())?;
+    let host_port = rest.split('/').next().unwrap_or("");
+    let (host, port) = match host_port.rsplit_once(':') {
+        Some((host, port)) if !host.ends_with(']') || host.starts_with('[') => (host, Some(port)),
+        _ => (host_port, None),
+    };
+    if host.is_empty() || host.chars().any(char::is_whitespace) {
+        return Err("The URL needs a host, e.g. ws://127.0.0.1:17110".to_string());
+    }
+    if let Some(port) = port
+        && port.parse::<u16>().is_err()
+    {
+        return Err(format!("\"{port}\" is not a valid port"));
+    }
+    Ok(())
+}
+
 impl ConnectionSettings {
     pub fn path() -> PathBuf {
         data_dir().join("connection.toml")
@@ -70,6 +97,27 @@ impl ConnectionSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn url_validation() {
+        assert!(validate_url("ws://127.0.0.1:17110").is_ok());
+        assert!(validate_url("wss://node.example.com").is_ok());
+        assert!(validate_url(" ws://[::1]:17110 ").is_ok());
+        assert!(validate_url("").unwrap_err().contains("Enter"));
+        assert!(
+            validate_url("127.0.0.1:17110")
+                .unwrap_err()
+                .contains("ws://")
+        );
+        assert!(validate_url("http://x:1").unwrap_err().contains("ws://"));
+        assert!(validate_url("ws://").unwrap_err().contains("host"));
+        assert!(validate_url("ws://host:abc").unwrap_err().contains("port"));
+        assert!(
+            validate_url("ws://host:70000")
+                .unwrap_err()
+                .contains("port")
+        );
+    }
 
     #[test]
     fn connection_settings_roundtrip() {

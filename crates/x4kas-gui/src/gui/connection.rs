@@ -18,6 +18,9 @@ pub struct ConnectionWindow {
     /// Working copy of the form; saved to disk on Connect.
     form: ConnectionSettings,
     error: Option<String>,
+    /// Connect was clicked: the window stays until the connection is up, so a failure
+    /// is seen where it was caused.
+    connecting: bool,
 }
 
 impl ConnectionWindow {
@@ -26,23 +29,33 @@ impl ConnectionWindow {
             open,
             form,
             error: None,
+            connecting: false,
         }
     }
 
     pub fn toggle(&mut self) {
         self.open = !self.open;
+        self.connecting = false;
     }
 
     pub fn show(&mut self, ctx: &egui::Context, app: &mut App, cmd_tx: &CommandSender) {
         if !self.open {
             return;
         }
+        // Close once the connection the window asked for is up.
+        if self.connecting && matches!(app.node.connection_status, ConnectionStatus::Connected) {
+            self.open = false;
+            self.connecting = false;
+            return;
+        }
         let window = egui::Window::new("Connection")
             .resizable(false)
             .default_width(440.0);
-        // `contents` closes the window itself after a successful Connect.
         let still_open = modal_window(ctx, window, |ui| self.contents(ui, app, cmd_tx));
-        self.open &= still_open;
+        if !still_open {
+            self.open = false;
+            self.connecting = false;
+        }
     }
 
     fn contents(&mut self, ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
@@ -57,20 +70,33 @@ impl ConnectionWindow {
         });
         ui.add_space(4.0);
 
+        let mut submit = false;
+        let url_problem = match self.form.kind {
+            ConnectionKind::Url => config::validate_url(&self.form.url).err(),
+            ConnectionKind::Resolver => None,
+        };
         match self.form.kind {
             ConnectionKind::Url => {
                 kv_grid(ui, "connection_url", |ui| {
                     field_label(ui, "URL");
-                    ui.add(
+                    let field = ui.add(
                         TextEdit::singleline(&mut self.form.url)
                             .hint_text("ws://host:17110")
                             .desired_width(280.0),
                     );
+                    // Enter connects, like a form.
+                    submit = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     ui.end_row();
                     field_label(ui, "Network");
                     network_combo(ui, &mut self.form.network);
                     ui.end_row();
                 });
+                // Only once something is typed: an empty field isn't a mistake yet.
+                if let Some(problem) = url_problem.as_deref()
+                    && !self.form.url.trim().is_empty()
+                {
+                    ui.label(RichText::new(problem).color(theme::ERROR));
+                }
             }
             ConnectionKind::Resolver => {
                 kv_grid(ui, "connection_resolver", |ui| {
@@ -92,21 +118,21 @@ impl ConnectionWindow {
         ui.add_space(8.0);
 
         ui.horizontal(|ui| {
-            let can_connect = match self.form.kind {
-                ConnectionKind::Url => !self.form.url.trim().is_empty(),
-                ConnectionKind::Resolver => true,
-            };
+            let can_connect = url_problem.is_none();
             if ui
                 .add_enabled(can_connect, primary_button("Connect"))
                 .clicked()
+                || (submit && can_connect)
             {
                 self.connect(cmd_tx);
             }
             let connected = app.connection != ActiveConnection::None;
             if ui
                 .add_enabled(connected, Button::new("Disconnect"))
+                .on_hover_text("Also stops a connection attempt")
                 .clicked()
             {
+                self.connecting = false;
                 let _ = cmd_tx.send(UiCommand::Disconnect);
             }
         });
@@ -125,16 +151,20 @@ impl ConnectionWindow {
             network: self.form.network.clone(),
         };
         let _ = cmd_tx.send(UiCommand::Connect(target));
-        if self.error.is_none() {
-            self.open = false;
-        }
+        self.connecting = true;
     }
 }
 
+/// The connection's current state and target; while connecting, a spinner, and on an
+/// error its message.
 fn current(ui: &mut Ui, app: &App) {
     let (text, color) = theme::connection_status(&app.node.connection_status);
     ui.horizontal(|ui| {
-        ui.label(RichText::new("●").color(color));
+        if matches!(app.node.connection_status, ConnectionStatus::Connecting) {
+            ui.spinner();
+        } else {
+            ui.label(RichText::new("●").color(color));
+        }
         // With no target, "Not connected" says it all; otherwise status + target.
         if app.connection == ActiveConnection::None {
             ui.label(RichText::new(app.connection.label()).color(color));
@@ -143,8 +173,25 @@ fn current(ui: &mut Ui, app: &App) {
             ui.label(RichText::new(app.connection.label()).weak());
         }
     });
-    if let ConnectionStatus::Error(ref e) = app.node.connection_status {
-        ui.label(RichText::new(e).color(theme::ERROR));
+    match app.node.connection_status {
+        ConnectionStatus::Error(ref e) => {
+            ui.label(RichText::new(e).color(theme::ERROR));
+        }
+        ConnectionStatus::Connecting => {
+            let reason = app
+                .node
+                .last_error
+                .as_deref()
+                .map(|e| format!("{e}. "))
+                .unwrap_or_default();
+            ui.label(
+                RichText::new(format!(
+                    "{reason}Keeps trying until the node answers; Disconnect stops it."
+                ))
+                .weak(),
+            );
+        }
+        _ => {}
     }
 }
 

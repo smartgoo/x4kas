@@ -125,6 +125,9 @@ impl RpcManager {
 
         let mut app = self.app_state.write().await;
         let mut errors: Vec<String> = Vec::new();
+        // Whether anything came back: a poll that failed entirely (the connection is
+        // down) must not count as a refresh.
+        let any_ok = server_info.is_ok() || dag_info.is_ok() || mempool.is_ok();
 
         match server_info {
             Ok(v) => app.node.server_info = Some(v.into()),
@@ -182,8 +185,10 @@ impl RpcManager {
         }
 
         let poll_duration_ms = start.elapsed().as_secs_f64() * 1000.0;
-        app.node.last_refresh = Some(std::time::Instant::now());
-        app.node.last_poll_duration_ms = Some(poll_duration_ms);
+        if any_ok {
+            app.node.last_refresh = Some(std::time::Instant::now());
+            app.node.last_poll_duration_ms = Some(poll_duration_ms);
+        }
         app.node.last_error = if errors.is_empty() {
             None
         } else {
@@ -194,7 +199,9 @@ impl RpcManager {
 
     /// Feed the DAG visualizer from the node's `BlockAdded` notifications until the
     /// surrounding task is aborted. The node drops subscriptions with the connection (and
-    /// the client rebuilds its notifier), so subscribe again on every connect.
+    /// the client rebuilds its notifier), so subscribe again on every connect. This is
+    /// also where the connection's ups and downs are tracked: the client reconnects by
+    /// itself, so a lost connection shows as `Connecting` until it is back.
     pub async fn stream_blocks(&self) {
         let ctl = self.client.rpc_ctl().multiplexer().channel();
         let (sender, receiver) = async_channel::unbounded();
@@ -204,8 +211,17 @@ impl RpcManager {
         loop {
             tokio::select! {
                 state = ctl.receiver.recv() => match state {
-                    Ok(RpcState::Connected) => self.subscribe_blocks(&sender).await,
-                    Ok(RpcState::Disconnected) => {}
+                    Ok(RpcState::Connected) => {
+                        self.set_status(ConnectionStatus::Connected, None).await;
+                        self.subscribe_blocks(&sender).await;
+                    }
+                    Ok(RpcState::Disconnected) => {
+                        self.set_status(
+                            ConnectionStatus::Connecting,
+                            Some("Connection lost, reconnecting…".to_string()),
+                        )
+                        .await;
+                    }
                     Err(_) => return,
                 },
                 notification = receiver.recv() => match notification {
@@ -215,6 +231,14 @@ impl RpcManager {
                 },
             }
         }
+    }
+
+    /// Record a change of the connection's state (and the reason, if any) for the GUI.
+    async fn set_status(&self, status: ConnectionStatus, error: Option<String>) {
+        let mut app = self.app_state.write().await;
+        app.node.connection_status = status;
+        app.node.last_error = error;
+        app.mark_dirty();
     }
 
     async fn subscribe_blocks(&self, sender: &async_channel::Sender<Notification>) {

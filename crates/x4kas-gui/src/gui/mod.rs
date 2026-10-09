@@ -512,54 +512,60 @@ fn format_seconds(secs: f64) -> String {
     }
 }
 
-/// Node sync indicator; details (version, block counts, last poll) on hover.
-fn node_chip(ui: &mut egui::Ui, app: &App) {
-    if !matches!(app.node.connection_status, ConnectionStatus::Connected) {
-        return;
-    }
+/// The connection chip's hover: the target, the node's details (version, sync, block
+/// counts, last poll), the last error, and what a click does.
+fn connection_details(ui: &mut egui::Ui, app: &App) {
     let node = &app.node;
-    let (text, color) = match node.server_info {
-        None => ("◌ Node", theme::TEXT_DIM),
-        Some(ref info) if info.is_synced => ("● Node synced", theme::OK),
-        Some(_) => ("◐ Node syncing", theme::WARN),
-    };
-    widgets::divider(ui);
-    widgets::status_chip(ui, "node_status", text, color, |ui| {
-        if let Some(ref info) = node.server_info {
-            kv(ui, "Version", &info.server_version);
-            kv(ui, "Synced", widgets::yes_no(info.is_synced));
-            kv(ui, "UTXO index", widgets::yes_no(info.has_utxo_index));
-            kv(ui, "DAA score", format_number(info.virtual_daa_score));
-        }
-        if let Some(ref dag) = node.dag_info {
-            kv(
-                ui,
-                "Blocks / headers",
-                format!(
-                    "{} / {}",
-                    format_number(dag.block_count),
-                    format_number(dag.header_count)
-                ),
-            );
-        }
-        if let Some(secs) = app.seconds_behind_tip(now_ms()) {
-            kv(ui, "Behind tip", format!("{}s", format_seconds(secs)));
-        }
-        if let Some(at) = node.last_refresh {
-            let took = node
-                .last_poll_duration_ms
-                .map(|ms| format!(", took {ms:.0} ms"))
-                .unwrap_or_default();
-            kv(
-                ui,
-                "Last poll",
-                format!("{} ago{took}", format_duration(at.elapsed())),
-            );
-        }
-        if let Some(ref err) = node.last_error {
-            kv(ui, "Error", RichText::new(err).color(theme::ERROR));
-        }
+    // The resolver's node URL is only known once connected.
+    let url = node.node_url.as_deref().or(match app.connection {
+        ActiveConnection::Url(ref url) => Some(url.as_str()),
+        _ => None,
     });
+    match app.connection {
+        ActiveConnection::None => {}
+        ActiveConnection::Url(_) => kv(ui, "Node", url.unwrap_or("—")),
+        ActiveConnection::Resolver => kv(ui, "Resolver node", url.unwrap_or("choosing…")),
+    }
+    if let Some(ref info) = node.server_info {
+        kv(ui, "Version", &info.server_version);
+        kv(ui, "Synced", widgets::yes_no(info.is_synced));
+        kv(ui, "UTXO index", widgets::yes_no(info.has_utxo_index));
+        kv(ui, "DAA score", format_number(info.virtual_daa_score));
+    }
+    if let Some(ref dag) = node.dag_info {
+        kv(
+            ui,
+            "Blocks / headers",
+            format!(
+                "{} / {}",
+                format_number(dag.block_count),
+                format_number(dag.header_count)
+            ),
+        );
+    }
+    if let Some(secs) = app.seconds_behind_tip(now_ms())
+        && !app.paused
+    {
+        kv(ui, "Behind tip", format!("{}s", format_seconds(secs)));
+    }
+    if let Some(at) = node.last_refresh {
+        let took = node
+            .last_poll_duration_ms
+            .map(|ms| format!(", took {ms:.0} ms"))
+            .unwrap_or_default();
+        kv(
+            ui,
+            "Last poll",
+            format!("{} ago{took}", format_duration(at.elapsed())),
+        );
+    }
+    let error = match node.connection_status {
+        ConnectionStatus::Error(ref e) => Some(e.as_str()),
+        _ => node.last_error.as_deref(),
+    };
+    if let Some(err) = error {
+        kv(ui, "Error", RichText::new(err).color(theme::ERROR));
+    }
 }
 
 /// The chain pipeline indicator ("Analyzing DAG (73%)", "Analyzer synced"…): the
@@ -776,32 +782,24 @@ fn chain_chip(ui: &mut egui::Ui, app: &App, cmd_tx: &CommandSender) {
     });
 }
 
-/// Hover text for the connection button: the node URL, then what a click does.
-fn connection_tooltip(app: &App) -> String {
-    // The resolver's node URL is only known once connected.
-    let url = app.node.node_url.as_deref().or(match app.connection {
-        ActiveConnection::Url(ref url) => Some(url.as_str()),
-        _ => None,
-    });
-    match url {
-        Some(url) => format!("{url}\nClick to change connection"),
-        None => "Click to change connection".to_string(),
-    }
-}
-
-/// Status bar text, e.g. "Connected to node".
-fn connection_summary(app: &App) -> String {
-    // The URL is in the hover text, so the label stays short.
+/// The connection chip's text and color: the connection's state, and once connected
+/// the node's sync state folded in ("Connected" is a synced node). The target and
+/// every detail are in the hover.
+fn connection_summary(app: &App) -> (String, egui::Color32) {
     let target = match app.connection {
         ActiveConnection::Url(_) => "node",
         ActiveConnection::Resolver => "public resolver",
-        ActiveConnection::None => return "Not connected".to_string(),
+        ActiveConnection::None => return ("● Not connected".to_string(), theme::ERROR),
     };
     match app.node.connection_status {
-        ConnectionStatus::Connected => format!("Connected to {target}"),
-        ConnectionStatus::Connecting => format!("Connecting to {target}…"),
-        ConnectionStatus::Disconnected => format!("Disconnected from {target}"),
-        ConnectionStatus::Error(_) => format!("Error connecting to {target}"),
+        ConnectionStatus::Connected => match app.node.server_info {
+            None => ("◌ Connected".to_string(), theme::TEXT_DIM),
+            Some(ref info) if info.is_synced => ("● Connected".to_string(), theme::OK),
+            Some(_) => ("◐ Connected, node syncing".to_string(), theme::WARN),
+        },
+        ConnectionStatus::Connecting => (format!("◌ Connecting to {target}…"), theme::WARN),
+        ConnectionStatus::Disconnected => ("● Disconnected".to_string(), theme::ERROR),
+        ConnectionStatus::Error(_) => ("× Connection error".to_string(), theme::ERROR),
     }
 }
 
@@ -813,18 +811,19 @@ fn status_bar(
     cmd_tx: &CommandSender,
 ) {
     ui.horizontal(|ui| {
-        let (_, color) = theme::connection_status(&app.node.connection_status);
+        let (text, color) = connection_summary(app);
         if ui
-            .selectable_label(
-                connection.open,
-                RichText::new(format!("● {}", connection_summary(app))).color(color),
-            )
-            .on_hover_text(connection_tooltip(app))
+            .selectable_label(connection.open, RichText::new(text).color(color))
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_ui(|ui| {
+                widgets::kv_grid(ui, "connection_status", |ui| connection_details(ui, app));
+                ui.add_space(4.0);
+                ui.label(RichText::new("Click to change the connection").weak());
+            })
             .clicked()
         {
             connection.toggle();
         }
-        node_chip(ui, app);
         chain_chip(ui, app, cmd_tx);
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -841,22 +840,28 @@ fn status_bar(
                 app.paused = !app.paused;
             }
 
-            if app.paused {
-                ui.label(RichText::new("PAUSED").color(theme::WARN));
-            }
             if let Some(ref info) = app.node.server_info {
                 widgets::divider(ui);
-                // Colored by how far the node lags the DAG tip.
+                // Colored by how far the view lags the DAG tip; while paused the view
+                // is deliberately frozen, so no lag is implied.
                 let behind = app.seconds_behind_tip(now_ms());
                 let color = match behind {
+                    _ if app.paused => theme::TEXT_DIM,
                     Some(s) if s > 30.0 => theme::ERROR,
                     Some(s) if s > 10.0 => theme::WARN,
                     _ => theme::TEXT,
                 };
                 let daa =
                     ui.label(RichText::new(format_number(info.virtual_daa_score)).color(color));
-                if let Some(secs) = behind {
-                    daa.on_hover_text(format!("{} seconds behind DAG sink", format_seconds(secs)));
+                if app.paused {
+                    let since = app
+                        .node
+                        .last_refresh
+                        .map(|at| format!(", last poll {} ago", format_duration(at.elapsed())))
+                        .unwrap_or_default();
+                    daa.on_hover_text(format!("Polling paused{since}"));
+                } else if let Some(secs) = behind {
+                    daa.on_hover_text(format!("{} seconds behind tip", format_seconds(secs)));
                 }
                 widgets::field_label(ui, "daa");
                 widgets::divider(ui);

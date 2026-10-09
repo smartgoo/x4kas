@@ -1,10 +1,12 @@
 //! egui/eframe desktop frontend.
 
+mod actions;
 mod address;
 mod analytics;
 mod blockdag;
 mod connection;
 mod dashboard;
+mod dialogs;
 mod explorer;
 mod flows;
 mod help;
@@ -119,6 +121,7 @@ pub fn run(rt: &tokio::runtime::Runtime, args: Args) -> Result<()> {
 enum EscTarget {
     Help,
     Connection,
+    Dialog,
     Flows,
     Pane,
     Settings,
@@ -164,6 +167,7 @@ struct GuiApp {
     settings: SettingsPage,
     pane: InfoPane,
     flow_window: FlowWindowUi,
+    dialogs: dialogs::Dialogs,
     toasts: Toasts,
 }
 
@@ -198,6 +202,7 @@ impl GuiApp {
             settings: SettingsPage::default(),
             pane: InfoPane::default(),
             flow_window: FlowWindowUi::default(),
+            dialogs: dialogs::Dialogs::default(),
             toasts: Toasts::default(),
         }
     }
@@ -233,9 +238,9 @@ impl GuiApp {
         }
     }
 
-    /// A window (Help, Connection, the flow graph) is on show.
+    /// A window (Help, Connection, a dialog, the flow graph) is on show.
     fn modal_open(&self, app: &App) -> bool {
-        self.show_help || self.connection.open || app.address.flows.open
+        self.show_help || self.connection.open || self.dialogs.any_open() || app.address.flows.open
     }
 
     /// What this frame's Esc closes, if anything.
@@ -247,6 +252,8 @@ impl GuiApp {
             Some(EscTarget::Help)
         } else if self.connection.open {
             Some(EscTarget::Connection)
+        } else if self.dialogs.any_open() {
+            Some(EscTarget::Dialog)
         } else if app.address.flows.open {
             Some(EscTarget::Flows)
         } else if app.explorer.pane.is_some() {
@@ -388,6 +395,11 @@ impl eframe::App for GuiApp {
         }
         self.flow_window
             .show(ctx, &mut app, &self.cmd_tx, esc == Some(EscTarget::Flows));
+        // The label and watchlist dialogs, asked for by the action bar; above the flow
+        // window, which can be open underneath.
+        self.dialogs.take_requests(ctx, &app);
+        self.dialogs
+            .show(ctx, &app, &self.cmd_tx, esc == Some(EscTarget::Dialog));
         // Watchlist alerts pop up over any tab.
         self.toasts.collect(&app);
         self.toasts.show(ctx, &app);

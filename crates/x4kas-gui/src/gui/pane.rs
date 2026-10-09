@@ -10,7 +10,8 @@
 
 use eframe::egui::{self, Button, CursorIcon, Id, Rect, RichText, Sense, Stroke, Ui, pos2, vec2};
 
-use super::address::{self, AddressForms};
+use super::actions;
+use super::address;
 use super::explorer;
 use super::theme;
 use super::widgets::{CARD_GAP, card, copy_value, placeholder, request_explorer, section_title};
@@ -29,7 +30,6 @@ const SLIDE_SECS: f32 = 0.135;
 const HANDLE: f32 = 6.0;
 
 pub struct InfoPane {
-    forms: AddressForms,
     /// The page drawn: the open page, kept while the pane slides out.
     shown: Option<ExplorerPage>,
     /// The pane's width, frame included.
@@ -39,7 +39,6 @@ pub struct InfoPane {
 impl Default for InfoPane {
     fn default() -> Self {
         Self {
-            forms: AddressForms::default(),
             shown: None,
             width: DEFAULT_WIDTH,
         }
@@ -146,8 +145,8 @@ impl InfoPane {
         }
     }
 
-    /// The title row (back, forward, what the page is, "Open in Explorer", close) and
-    /// the page.
+    /// The title row (back, forward, what the page is, "Open in Explorer", close), the
+    /// action bar and the page.
     fn contents(
         &mut self,
         ui: &mut Ui,
@@ -190,29 +189,18 @@ impl InfoPane {
             });
         });
         ui.add_space(4.0);
+        actions::bar(ui, app, page, cmd_tx);
 
-        let mut open_flows = false;
         let mut retry = false;
         // One scroll position per page, so a newly shown page starts at its top.
         egui::ScrollArea::vertical()
             .id_salt(("pane_page", &page))
             .auto_shrink(false)
             .show(ui, |ui| {
-                self.page(
-                    ui,
-                    app,
-                    page,
-                    connected,
-                    cmd_tx,
-                    &mut open_flows,
-                    &mut retry,
-                );
+                self.page(ui, app, page, connected, cmd_tx, &mut retry);
                 // Room under the last card for its shadow and the scroll bar's end.
                 ui.add_space(CARD_GAP);
             });
-        if open_flows && let ExplorerPage::Address(addr) = page {
-            address::open_flow_graph(app, addr, cmd_tx);
-        }
         if retry {
             app.explorer.start_loading(page.clone());
             let _ = cmd_tx.send(UiCommand::ExplorerLoad(page.clone()));
@@ -220,7 +208,6 @@ impl InfoPane {
     }
 
     /// The page as stacked cards, or its state in one card.
-    #[allow(clippy::too_many_arguments)]
     fn page(
         &mut self,
         ui: &mut Ui,
@@ -228,7 +215,6 @@ impl InfoPane {
         page: &ExplorerPage,
         connected: bool,
         cmd_tx: &CommandSender,
-        open_flows: &mut bool,
         retry: &mut bool,
     ) {
         match app.explorer.load(page) {
@@ -262,7 +248,7 @@ impl InfoPane {
                     );
                 }
                 PageData::Address(data) => {
-                    *open_flows = self.address_page(ui, app, page.query(), data, cmd_tx);
+                    address_page(ui, app, page.query(), data, cmd_tx);
                 }
                 PageData::Transaction(view) => {
                     card(ui, "Transaction", |ui| explorer::tx_overview(ui, app, view));
@@ -279,31 +265,24 @@ impl InfoPane {
             },
         }
     }
+}
 
-    /// The address page's cards: header (address, links, label), the body's and the
-    /// watch settings, as in the Explorer.
-    fn address_page(
-        &mut self,
-        ui: &mut Ui,
-        app: &App,
-        addr: &str,
-        data: &AddressPageData,
-        cmd_tx: &CommandSender,
-    ) -> bool {
-        self.forms.sync(app, addr);
-        card(ui, "Address", |ui| {
-            self.forms
-                .header(ui, app, addr, data.online_result.as_deref(), cmd_tx);
-            if let Some(error) = &data.error {
-                ui.label(RichText::new(error).color(theme::ERROR));
-            }
-        });
-        ui.add_space(CARD_GAP);
-        let open_flows = address::body(ui, app, addr, &data.view, data.loading_more, cmd_tx);
-        ui.add_space(CARD_GAP);
-        card(ui, "Watch", |ui| {
-            self.forms.watch_settings(ui, app, addr, cmd_tx);
-        });
-        open_flows
-    }
+/// The address page's cards: header (address, label, online lookup), the body's and,
+/// for a watched address, the watch card, as in the Explorer.
+fn address_page(
+    ui: &mut Ui,
+    app: &App,
+    addr: &str,
+    data: &AddressPageData,
+    cmd_tx: &CommandSender,
+) {
+    card(ui, "Address", |ui| {
+        address::header(ui, app, addr, data.online_result.as_deref(), cmd_tx);
+        if let Some(error) = &data.error {
+            ui.label(RichText::new(error).color(theme::ERROR));
+        }
+    });
+    ui.add_space(CARD_GAP);
+    address::body(ui, app, addr, &data.view, data.loading_more, cmd_tx);
+    address::watch_card(ui, app, addr);
 }

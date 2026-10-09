@@ -20,12 +20,13 @@ use eframe::egui::{
 };
 use egui_extras::Column;
 
-use super::address::{self, AddressForms};
+use super::actions;
+use super::address;
 use super::theme;
 use super::widgets::{
     CARD_GAP, address as address_widget, block_hash, card, card_with_header, command_key,
-    copy_value, is_testnet, kv, kv_columns, kv_grid, kv_with, label_search_popup, link_table,
-    or_dash, page_table, placeholder, primary_button, set_in_explorer, subheader, table_header,
+    copy_value, kv, kv_columns, kv_grid, kv_with, label_search_popup, link_table, or_dash,
+    page_table, placeholder, primary_button, set_in_explorer, subheader, table_header,
     table_row_height, transaction_id, transaction_id_in_block, weighted_columns, yes_no,
 };
 use x4kas_core::app::{App, ConnectionStatus};
@@ -33,10 +34,7 @@ use x4kas_core::controller::{CommandSender, UiCommand};
 use x4kas_core::explorer::{
     AddressPageData, BlockView, ExplorerPage, PageData, PageLoad, TxStatus, TxView, parse_query,
 };
-use x4kas_core::format::{
-    explorer_block_url, explorer_tx_url, format_kas, format_number, format_when,
-    kaspa_stream_block_url, kaspa_stream_tx_url, shorten_middle,
-};
+use x4kas_core::format::{format_kas, format_number, format_when, shorten_middle};
 use x4kas_core::index::cluster::CHANGE_THRESHOLD;
 
 /// Blocks listed on the Home page.
@@ -74,7 +72,6 @@ pub struct ExplorerUi {
     reload: Option<ExplorerPage>,
     /// "Clear" on a Recently viewed card was clicked.
     clear_recent: bool,
-    forms: AddressForms,
 }
 
 impl Default for ExplorerUi {
@@ -87,7 +84,6 @@ impl Default for ExplorerUi {
             shown_tab: None,
             reload: None,
             clear_recent: false,
-            forms: AddressForms::default(),
         }
     }
 }
@@ -124,7 +120,7 @@ impl ExplorerUi {
                         });
                 });
         }
-        let mut open_flows = false;
+        actions::bar(ui, app, &page, cmd_tx);
         // One scroll position per page of each sub tab, so a page opens at its top and
         // comes back (through the history) where it was.
         let tab_id = app.explorer.active_tab().id;
@@ -132,11 +128,8 @@ impl ExplorerUi {
             .id_salt(("explorer_page", tab_id, &page))
             .auto_shrink(false)
             .show(ui, |ui| {
-                self.page(ui, app, &page, connected, cmd_tx, &mut open_flows);
+                self.page(ui, app, &page, connected, cmd_tx);
             });
-        if open_flows && let ExplorerPage::Address(addr) = &page {
-            address::open_flow_graph(app, addr, cmd_tx);
-        }
         if let Some(page) = self.reload.take() {
             app.explorer.start_loading(page.clone());
             let _ = cmd_tx.send(UiCommand::ExplorerLoad(page));
@@ -375,7 +368,6 @@ impl ExplorerUi {
         page: &ExplorerPage,
         connected: bool,
         cmd_tx: &CommandSender,
-        open_flows: &mut bool,
     ) {
         let mut load = app.explorer.load(page);
         // A lookup already resolved: show what it resolved to (the tab was moved on,
@@ -416,42 +408,32 @@ impl ExplorerUi {
             }),
             (_, Some(PageLoad::Ready(data))) => match &**data {
                 PageData::Block(view) => block_page(ui, app, view),
-                PageData::Address(data) => {
-                    let addr = page.query();
-                    *open_flows = self.address_page(ui, app, addr, data, cmd_tx);
-                }
+                PageData::Address(data) => address_page(ui, app, page.query(), data, cmd_tx),
                 PageData::Transaction(view) => tx_page(ui, app, view),
                 PageData::Redirect(_) => placeholder(ui, "Resolving…"),
             },
         }
     }
+}
 
-    /// The address page's cards: the header, the body's (`address::body`) and the
-    /// watch settings last. The info pane draws the same.
-    fn address_page(
-        &mut self,
-        ui: &mut Ui,
-        app: &App,
-        addr: &str,
-        data: &AddressPageData,
-        cmd_tx: &CommandSender,
-    ) -> bool {
-        self.forms.sync(app, addr);
-        card(ui, "Address", |ui| {
-            self.forms
-                .header(ui, app, addr, data.online_result.as_deref(), cmd_tx);
-            if let Some(error) = &data.error {
-                ui.label(RichText::new(error).color(theme::ERROR));
-            }
-        });
-        ui.add_space(CARD_GAP);
-        let open_flows = address::body(ui, app, addr, &data.view, data.loading_more, cmd_tx);
-        ui.add_space(CARD_GAP);
-        card(ui, "Watch", |ui| {
-            self.forms.watch_settings(ui, app, addr, cmd_tx);
-        });
-        open_flows
-    }
+/// The address page's cards: the header, the body's (`address::body`) and, for a
+/// watched address, the watch card. The info pane draws the same.
+fn address_page(
+    ui: &mut Ui,
+    app: &App,
+    addr: &str,
+    data: &AddressPageData,
+    cmd_tx: &CommandSender,
+) {
+    card(ui, "Address", |ui| {
+        address::header(ui, app, addr, data.online_result.as_deref(), cmd_tx);
+        if let Some(error) = &data.error {
+            ui.label(RichText::new(error).color(theme::ERROR));
+        }
+    });
+    ui.add_space(CARD_GAP);
+    address::body(ui, app, addr, &data.view, data.loading_more, cmd_tx);
+    address::watch_card(ui, app, addr);
 }
 
 /// A sub tab's title: a labelled address shows its label.
@@ -759,22 +741,13 @@ fn block_page(ui: &mut Ui, app: &App, view: &BlockView) {
     );
 }
 
-/// The block's core: hash and explorer links, header fields, DAG standing (chain
+/// The block's core: hash, header fields, DAG standing (chain
 /// block, color, confirmations, reward, merging block, selected parent), miner and
 /// merkle roots. The page's first card; the info pane shows it too.
 pub(super) fn block_overview(ui: &mut Ui, app: &App, view: &BlockView) {
-    let testnet = is_testnet(ui.ctx());
     {
         kv_grid(ui, "block_ids", |ui| {
             kv_with(ui, "Hash", |ui| copy_value(ui, &view.hash, "Copy hash"));
-            kv_with(ui, "View on", |ui| {
-                // Kaspa Stream only covers mainnet.
-                if !testnet {
-                    ui.hyperlink_to("Kaspa Stream", kaspa_stream_block_url(&view.hash));
-                    ui.label(RichText::new("·").weak());
-                }
-                ui.hyperlink_to("Kaspa Explorer", explorer_block_url(&view.hash, testnet));
-            });
         });
         ui.add_space(6.0);
         kv_columns(ui, 320.0, |[left, right]| {
@@ -1007,22 +980,14 @@ fn tx_page(ui: &mut Ui, app: &App, view: &TxView) {
     });
 }
 
-/// The transaction's core: id and explorer links, status and accepting block,
+/// The transaction's core: id, status and accepting block,
 /// confirmations, type, fee, mass, totals, version, lock time, subnetwork and payload.
 /// The page's first card; the info pane shows it too.
 pub(super) fn tx_overview(ui: &mut Ui, app: &App, view: &TxView) {
-    let testnet = is_testnet(ui.ctx());
     {
         kv_grid(ui, "tx_ids", |ui| {
             kv_with(ui, "Transaction id", |ui| {
                 copy_value(ui, &view.txid, "Copy transaction id");
-            });
-            kv_with(ui, "View on", |ui| {
-                if !testnet {
-                    ui.hyperlink_to("Kaspa Stream", kaspa_stream_tx_url(&view.txid));
-                    ui.label(RichText::new("·").weak());
-                }
-                ui.hyperlink_to("Kaspa Explorer", explorer_tx_url(&view.txid, testnet));
             });
         });
         ui.add_space(6.0);

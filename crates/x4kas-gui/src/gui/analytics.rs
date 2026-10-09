@@ -549,8 +549,12 @@ const RUBBER_BAND_C: f32 = 0.55;
 /// Pulled rows are released once scrolling has stopped for this long, in seconds: a
 /// frame or two, so a pause between wheel steps doesn't let go, a lifted finger does.
 const RELEASE_AFTER: f64 = 0.04;
-/// Angular frequency of the critically damped spring back (2π / ~0.4s response).
-const SPRING_OMEGA: f32 = 16.0;
+/// Angular frequency of the critically damped spring back (2π / ~0.3s response).
+const SPRING_OMEGA: f32 = 20.0;
+/// Scroll steps shrinking this many times in a row are a trackpad's momentum.
+const MOMENTUM_STEPS: u8 = 2;
+/// A step this far under the pull's largest is momentum, however it got there.
+const MOMENTUM_FRACTION: f32 = 0.6;
 
 /// A table's overscroll, between frames.
 #[derive(Clone, Copy, Default)]
@@ -561,9 +565,16 @@ struct Overscroll {
     velocity: f32,
     /// When scrolling last pulled the rows.
     last_pull: f64,
-    /// The last scroll delta that pulled, to tell a trackpad's momentum (a run of
-    /// shrinking deltas after the fingers lift) from fingers still scrolling.
+    /// The last scroll step while pulled, and the largest of this pull, to tell a
+    /// trackpad's momentum (shrinking steps after the fingers lift) from fingers still
+    /// scrolling.
     last_delta: f32,
+    peak_delta: f32,
+    /// Shrinking steps in a row.
+    shrinking: u8,
+    /// The steps are momentum: none holds the rows until one grows past the peak (a
+    /// push) or the rows have sprung back.
+    momentum: bool,
     /// Last frame's body viewport, to catch scrolling back before the table does.
     viewport: Option<egui::Rect>,
 }
@@ -635,15 +646,35 @@ fn overscroll(ui: &Ui, id: egui::Id, output: &ScrollAreaOutput<()>) -> f32 {
             .input_mut(|i| std::mem::take(&mut i.smooth_scroll_delta.y));
         // A trackpad keeps scrolling by itself after the fingers lift, in shrinking
         // steps for a second or more. Those don't hold the rows (iOS lets go the moment
-        // the finger does): only a step as large as the last one is a finger.
-        let momentum = state.offset != 0.0 && leftover.abs() < state.last_delta.abs();
-        if leftover != 0.0 && !momentum {
-            let pull = rubber_band_pull(state.offset, d) + leftover;
-            state.offset = rubber_band(pull, d);
-            state.velocity = 0.0;
-            state.last_pull = now;
-        }
+        // the finger does): a few steps shrinking in a row, or one well under this
+        // pull's largest, is momentum, and it stays momentum until a step larger than
+        // any before (a push) or the rows are back.
         if leftover != 0.0 {
+            if state.offset == 0.0 || leftover.signum() != state.offset.signum() {
+                state.peak_delta = 0.0;
+                state.shrinking = 0;
+                state.momentum = false;
+            }
+            let size = leftover.abs();
+            if size < state.last_delta.abs() {
+                state.shrinking += 1;
+            } else {
+                state.shrinking = 0;
+            }
+            state.peak_delta = state.peak_delta.max(size);
+            if size >= state.peak_delta {
+                state.momentum = false;
+            } else if state.shrinking >= MOMENTUM_STEPS
+                || size < MOMENTUM_FRACTION * state.peak_delta
+            {
+                state.momentum = true;
+            }
+            if !state.momentum {
+                let pull = rubber_band_pull(state.offset, d) + leftover;
+                state.offset = rubber_band(pull, d);
+                state.velocity = 0.0;
+                state.last_pull = now;
+            }
             state.last_delta = leftover;
         }
     }

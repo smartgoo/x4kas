@@ -950,7 +950,7 @@ impl QueryTab {
                     ui.add_space(4.0);
                     section_title(ui, title);
                     if list.is_empty() {
-                        placeholder(ui, "Nothing saved yet: Save a query to keep it here.");
+                        placeholder(ui, "No saved queries");
                     }
                     for q in list {
                         tab.saved_row(ui, app, cmd_tx, q, &saved, &mut changed);

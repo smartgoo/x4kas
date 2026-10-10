@@ -3,7 +3,10 @@ use std::hash::Hash;
 use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
-use kaspa_rpc_core::{GetVirtualChainFromBlockV2Response, RpcOptionalTransaction};
+use kaspa_rpc_core::{
+    GetVirtualChainFromBlockV2Response, RpcChainBlockAcceptedTransactions, RpcHash,
+    RpcOptionalTransaction,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::app::TimeWindow;
@@ -151,9 +154,17 @@ pub fn summarize_chain_blocks(
         .iter()
         .map(|h| h.to_string())
         .collect();
+    (
+        summarize_blocks(&response.chain_block_accepted_transactions),
+        removed,
+    )
+}
 
-    let summaries = response
-        .chain_block_accepted_transactions
+/// One summary per chain block. A block keeps its top [`MAX_ADDRESSES_PER_BUCKET`]
+/// senders, receivers and miners, as a bucket does: at hundreds of transactions per block
+/// the full maps would make the last minute of blocks tens of megabytes.
+pub fn summarize_blocks(blocks: &[RpcChainBlockAcceptedTransactions]) -> Vec<BlockSummary> {
+    blocks
         .iter()
         .map(|chain_block| {
             let header = &chain_block.chain_block_header;
@@ -164,15 +175,20 @@ pub fn summarize_chain_blocks(
             for tx in &chain_block.accepted_transactions {
                 record_transaction(&mut metrics, tx);
             }
+            for map in [
+                &mut metrics.senders,
+                &mut metrics.receivers,
+                &mut metrics.miners,
+            ] {
+                cap_hashmap(map, MAX_ADDRESSES_PER_BUCKET);
+            }
             BlockSummary {
                 hash: header.hash.map(|h| h.to_string()).unwrap_or_default(),
                 timestamp_ms: header.timestamp.unwrap_or(0),
                 metrics,
             }
         })
-        .collect();
-
-    (summaries, removed)
+        .collect()
 }
 
 /// The coinbases a VSPC v2 response adds: each block's miner (named in the coinbase's
@@ -400,11 +416,13 @@ impl BucketWidth {
 pub type BucketKey = (BucketWidth, u64);
 
 /// What [`AnalyticsEngine::ingest`] changed, so a store can persist exactly that: the
-/// recent blocks always change, buckets only when blocks are finalized or pruned.
+/// recent blocks that came and went, buckets only when blocks are finalized or pruned.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Ingest {
-    /// Whether the recent blocks changed (blocks added, removed or finalized).
-    pub recent_changed: bool,
+    /// Blocks added to the recent set (and still there).
+    pub recent_added: Vec<String>,
+    /// Blocks that left the recent set (finalized into buckets, or reorged away).
+    pub recent_removed: Vec<String>,
     /// Buckets that gained blocks (new or updated).
     pub touched: BTreeSet<BucketKey>,
     /// Buckets pruned out of their window.
@@ -443,23 +461,51 @@ impl AnalyticsEngine {
         skip: &HashSet<String>,
         now_ms: u64,
     ) -> Ingest {
-        let (summaries, removed) = summarize_chain_blocks(response);
+        self.ingest_blocks(
+            &response.removed_chain_block_hashes,
+            &response.chain_block_accepted_transactions,
+            skip,
+            now_ms,
+        )
+    }
+
+    /// [`Self::ingest`] for part of a response: `removed` chain blocks undone, `blocks`
+    /// added (except `skip`), then finalize and prune by `now_ms`.
+    pub fn ingest_blocks(
+        &mut self,
+        removed: &[RpcHash],
+        blocks: &[RpcChainBlockAcceptedTransactions],
+        skip: &HashSet<String>,
+        now_ms: u64,
+    ) -> Ingest {
         let mut ingest = Ingest::default();
         for hash in removed {
+            let hash = hash.to_string();
             if self.remove_block(&hash) {
-                ingest.recent_changed = true;
+                ingest.recent_removed.push(hash);
             } else {
                 ingest.unresolved_reorgs.push(hash);
             }
         }
-        for summary in summaries {
+        for summary in summarize_blocks(blocks) {
             if !skip.contains(&summary.hash) {
+                ingest.recent_added.push(summary.hash.clone());
                 self.add_block(summary);
-                ingest.recent_changed = true;
             }
         }
-        ingest.touched = self.finalize_old_blocks(now_ms);
-        ingest.recent_changed |= !ingest.touched.is_empty();
+        let (touched, finalized) = self.finalize(now_ms);
+        ingest.touched = touched;
+        // A block added and finalized in the same call was never stored: nothing to
+        // remove, nothing to add.
+        let finalized: HashSet<String> = finalized.into_iter().collect();
+        let added_now: HashSet<&str> = ingest.recent_added.iter().map(String::as_str).collect();
+        ingest.recent_removed.extend(
+            finalized
+                .iter()
+                .filter(|h| !added_now.contains(h.as_str()))
+                .cloned(),
+        );
+        ingest.recent_added.retain(|h| !finalized.contains(h));
         ingest.removed = self.prune_buckets(now_ms);
         ingest
     }
@@ -467,6 +513,11 @@ impl AnalyticsEngine {
     /// Move blocks older than 1 minute from the recent cache into time buckets.
     /// Returns the buckets that changed.
     pub fn finalize_old_blocks(&mut self, now_ms: u64) -> BTreeSet<BucketKey> {
+        self.finalize(now_ms).0
+    }
+
+    /// [`Self::finalize_old_blocks`], also returning the hashes of the blocks finalized.
+    fn finalize(&mut self, now_ms: u64) -> (BTreeSet<BucketKey>, Vec<String>) {
         let cutoff = now_ms.saturating_sub(ONE_MINUTE_MS);
 
         let to_finalize: Vec<String> = self
@@ -477,15 +528,15 @@ impl AnalyticsEngine {
             .collect();
 
         let mut touched = BTreeSet::new();
-        for hash in to_finalize {
-            if let Some(block) = self.recent_blocks.swap_remove(&hash) {
+        for hash in &to_finalize {
+            if let Some(block) = self.recent_blocks.swap_remove(hash) {
                 for width in BucketWidth::ALL {
                     let start = add_to_bucket(self.buckets_mut(width), width.ms(), &block);
                     touched.insert((width, start));
                 }
             }
         }
-        touched
+        (touched, to_finalize)
     }
 
     /// Prune buckets older than their window (and beyond the count caps). Returns the

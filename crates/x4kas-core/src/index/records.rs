@@ -435,8 +435,8 @@ impl AddrStats {
     }
 }
 
-/// Flows between an address and one counterparty within a slab, from the address's
-/// point of view.
+/// Flows between an address and one counterparty, from the address's point of view: the
+/// sum of its [`PeerDelta`]s.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerStats {
     /// Sompi received from the peer.
@@ -453,16 +453,44 @@ impl PeerStats {
         self.tx_count += other.tx_count;
     }
 
-    pub fn apply(&mut self, in_amount: u64, out_amount: u64, undo: bool) {
-        if undo {
-            self.in_amount = self.in_amount.saturating_sub(in_amount);
-            self.out_amount = self.out_amount.saturating_sub(out_amount);
-            self.tx_count = self.tx_count.saturating_sub(1);
-        } else {
-            self.in_amount += in_amount;
-            self.out_amount += out_amount;
-            self.tx_count += 1;
+    /// The stats a summed delta amounts to (a reorg undone before its transaction was
+    /// ever indexed can leave a negative sum, which counts as nothing).
+    pub fn from_delta(delta: &PeerDelta) -> Self {
+        Self {
+            in_amount: delta.in_amount.max(0) as u64,
+            out_amount: delta.out_amount.max(0) as u64,
+            tx_count: delta.tx_count.max(0) as u64,
         }
+    }
+}
+
+/// What one commit changed about the flows between an address and a peer, stored under
+/// [`peer_delta_key`]: the writer never reads a counterparty record back, it appends a
+/// delta (an LSM insert), and readers sum the deltas of a pair. Signed, so a reorg's
+/// undo is a delta too.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerDelta {
+    pub in_amount: i64,
+    pub out_amount: i64,
+    pub tx_count: i64,
+}
+
+impl PeerDelta {
+    pub fn merge(&mut self, other: &PeerDelta) {
+        self.in_amount += other.in_amount;
+        self.out_amount += other.out_amount;
+        self.tx_count += other.tx_count;
+    }
+
+    pub fn apply(&mut self, in_amount: u64, out_amount: u64, undo: bool) {
+        let sign = if undo { -1 } else { 1 };
+        self.in_amount += sign * in_amount as i64;
+        self.out_amount += sign * out_amount as i64;
+        self.tx_count += sign;
+    }
+
+    pub fn is_zero(&self) -> bool {
+        *self == Self::default()
     }
 }
 
@@ -527,11 +555,21 @@ pub fn parse_time_key(key: &[u8]) -> Option<(u64, Hash32)> {
     Some((time_ms, hash))
 }
 
-/// Key of a peer entry: `addr_id ‖ peer_id`.
+/// Key of a pair entry: `addr_id ‖ peer_id` (a cluster's members, `cl_member`).
 pub fn peer_key(addr: AddrId, peer: AddrId) -> [u8; 8] {
     let mut key = [0u8; 8];
     key[..4].copy_from_slice(&addr.to_be_bytes());
     key[4..].copy_from_slice(&peer.to_be_bytes());
+    key
+}
+
+/// Key of a counterparty delta (`apr_<n>`): `addr_id ‖ peer_id ‖ seq`, the commit's
+/// [`crate::index::Manifest::seq`], so an address's deltas sort by peer under its prefix
+/// and every commit's delta for a pair is its own entry.
+pub fn peer_delta_key(addr: AddrId, peer: AddrId, seq: u64) -> [u8; 16] {
+    let mut key = [0u8; 16];
+    key[..8].copy_from_slice(&peer_key(addr, peer));
+    key[8..].copy_from_slice(&seq.to_be_bytes());
     key
 }
 
@@ -734,6 +772,31 @@ mod tests {
         assert_eq!((total.first_seen_ms, total.last_seen_ms), (5, 60));
         total.merge(&AddrStats::default());
         assert_eq!(total.first_seen_ms, 5);
+    }
+
+    #[test]
+    fn peer_deltas_sum_and_clamp() {
+        let mut d = PeerDelta::default();
+        d.apply(10, 0, false);
+        d.apply(0, 5, false);
+        assert_eq!((d.in_amount, d.out_amount, d.tx_count), (10, 5, 2));
+        d.apply(10, 0, true);
+        d.merge(&PeerDelta {
+            in_amount: -3,
+            out_amount: 1,
+            tx_count: -1,
+        });
+        assert_eq!((d.in_amount, d.out_amount, d.tx_count), (-3, 6, 0));
+        let s = PeerStats::from_delta(&d);
+        assert_eq!((s.in_amount, s.out_amount, s.tx_count), (0, 6, 0));
+        assert!(!d.is_zero());
+        assert!(PeerDelta::default().is_zero());
+
+        let a = peer_delta_key(7, 9, 1);
+        let b = peer_delta_key(7, 9, 2);
+        let c = peer_delta_key(7, 10, 0);
+        assert!(a < b && b < c);
+        assert_eq!(parse_peer_key(&c), Some(10));
     }
 
     #[test]

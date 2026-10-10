@@ -585,6 +585,16 @@ impl RpcManager {
         Ok(self.client.get_mempool_entry(txid, true, false).await?)
     }
 
+    /// A block's selected parent (from the block's verbose data).
+    pub async fn selected_parent(&self, hash: RpcHash) -> Result<RpcHash> {
+        self.client
+            .get_block(hash, false)
+            .await?
+            .verbose_data
+            .map(|v| v.selected_parent_hash)
+            .ok_or_else(|| anyhow::anyhow!("no verbose data for block {hash}"))
+    }
+
     /// A block's header timestamp in milliseconds.
     pub async fn get_block_timestamp(&self, hash: RpcHash) -> Result<u64> {
         Ok(self.client.get_block(hash, false).await?.header.timestamp)

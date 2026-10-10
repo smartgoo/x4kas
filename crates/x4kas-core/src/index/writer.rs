@@ -12,15 +12,16 @@ use anyhow::Result;
 use fjall::OwnedWriteBatch as WriteBatch;
 use kaspa_addresses::{Prefix, Version};
 use kaspa_rpc_core::{
-    GetVirtualChainFromBlockV2Response, RpcHash, RpcOptionalHeader, RpcOptionalTransaction,
+    GetVirtualChainFromBlockV2Response, RpcChainBlockAcceptedTransactions, RpcHash,
+    RpcOptionalHeader, RpcOptionalTransaction,
 };
 use kaspa_wrpc_client::prelude::NetworkId;
 
 use super::cluster::{self, CHANGE_THRESHOLD, Clusters, OutputTrait};
 use super::records::{
-    AddrId, AddrStats, BlockKind, BlockRecord, Hash32, IndexedTx, PAYLOAD_HEAD, Payout, PeerStats,
+    AddrId, AddrStats, BlockKind, BlockRecord, Hash32, IndexedTx, PAYLOAD_HEAD, Payout, PeerDelta,
     SCRIPT_UNKNOWN, Subnetwork, TxInput, TxOutput, addr_key, addr_tx_key, block_tx_key, decode,
-    encode, encode_delta, peer_key, protocol_tx_key, time_key,
+    encode, encode_delta, peer_delta_key, protocol_tx_key, time_key,
 };
 use super::{IndexStore, Manifest, Position, Slab, analytics};
 use crate::analytics::AnalyticsEngine;
@@ -38,6 +39,12 @@ const INTERN_CACHE_MAX: usize = 1_000_000;
 const MAX_PEER_PAIRS: usize = 10_000;
 /// Removed chain blocks are looked for in this many newest slabs.
 const REORG_SLABS: usize = 2;
+/// A response is committed in chunks of this many chain blocks (the node sends up to ten
+/// mergesets' worth, 2,480 at 10 BPS, which at full blocks is a batch of hundreds of
+/// megabytes). Each chunk is atomic and advances the manifest, and a chain block is never
+/// split, so a crash between chunks leaves a position to resume from and the skip of
+/// already-indexed chain blocks makes the replay harmless.
+const COMMIT_BLOCKS: usize = 250;
 
 /// What one applied response did.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -80,12 +87,15 @@ struct Converted {
     may_union: bool,
 }
 
-/// Per-batch read-modify-write buffer for stats and peers, so an address touched by
-/// many transactions in one response is read and written once.
+/// Per-commit buffer for stats (read-modify-write: an address touched by many
+/// transactions in one response is read and written once) and counterparty deltas
+/// (write-only: a transaction's sender × receiver pairs are many, and reading each pair's
+/// record back made the writer disk-bound once the counterparty keyspace outgrew the
+/// cache; every commit appends one delta per pair instead, and readers sum them).
 #[derive(Default)]
 struct Overlay {
     stats: HashMap<(u64, AddrId), AddrStats>,
-    peers: HashMap<(u64, AddrId, AddrId), PeerStats>,
+    peers: HashMap<(u64, AddrId, AddrId), PeerDelta>,
     slabs: HashMap<u64, Slab>,
 }
 
@@ -104,21 +114,13 @@ impl Overlay {
         }
     }
 
-    fn peer_mut(&mut self, slab: &Slab, addr: AddrId, peer: AddrId) -> Result<&mut PeerStats> {
+    fn peer_mut(&mut self, slab: &Slab, addr: AddrId, peer: AddrId) -> &mut PeerDelta {
         self.slabs.entry(slab.no).or_insert_with(|| slab.clone());
-        match self.peers.entry((slab.no, addr, peer)) {
-            std::collections::hash_map::Entry::Occupied(e) => Ok(e.into_mut()),
-            std::collections::hash_map::Entry::Vacant(e) => {
-                let stored = match slab.peers.get(peer_key(addr, peer))? {
-                    Some(bytes) => decode(&bytes)?,
-                    None => PeerStats::default(),
-                };
-                Ok(e.insert(stored))
-            }
-        }
+        self.peers.entry((slab.no, addr, peer)).or_default()
     }
 
-    fn flush(self, batch: &mut WriteBatch) -> Result<()> {
+    /// Write everything; the counterparty deltas under the commit's `seq`.
+    fn flush(self, batch: &mut WriteBatch, seq: u64) -> Result<()> {
         for ((slab_no, addr), stats) in self.stats {
             let slab = &self.slabs[&slab_no];
             if stats.tx_count == 0 {
@@ -127,13 +129,16 @@ impl Overlay {
                 batch.insert(&slab.stats, addr_key(addr), encode(&stats)?);
             }
         }
-        for ((slab_no, addr, peer), stats) in self.peers {
-            let slab = &self.slabs[&slab_no];
-            if stats.tx_count == 0 {
-                batch.remove(&slab.peers, peer_key(addr, peer));
-            } else {
-                batch.insert(&slab.peers, peer_key(addr, peer), encode(&stats)?);
+        for ((slab_no, addr, peer), delta) in self.peers {
+            if delta.is_zero() {
+                continue;
             }
+            let slab = &self.slabs[&slab_no];
+            batch.insert(
+                &slab.peers,
+                peer_delta_key(addr, peer, seq),
+                encode(&delta)?,
+            );
         }
         Ok(())
     }
@@ -302,13 +307,15 @@ impl IndexWriter {
         self.labels = labels;
     }
 
-    /// Apply one VSPC v2 response atomically: undo its removed chain blocks, index its
-    /// added ones, fold them into the analytics engine, advance the manifest.
+    /// Apply one VSPC v2 response: undo its removed chain blocks, index its added ones,
+    /// fold them into the analytics engine, advance the manifest. Committed in chunks of
+    /// [`COMMIT_BLOCKS`] chain blocks, each atomic; an error leaves the chunks before it
+    /// committed and the writer's state as the store has it.
     pub fn apply(&mut self, response: &GetVirtualChainFromBlockV2Response) -> Result<BatchReport> {
         let result = self.apply_inner(response);
         if result.is_err() {
-            // Ids handed out and metrics counted for this batch were never committed:
-            // forget them.
+            // Ids handed out and metrics counted for the failed chunk were never
+            // committed: forget them.
             self.intern_cache.clear();
             self.manifest = self.store.manifest()?;
             self.analytics = analytics::load(&self.store)?;
@@ -320,24 +327,54 @@ impl IndexWriter {
         &mut self,
         response: &GetVirtualChainFromBlockV2Response,
     ) -> Result<BatchReport> {
+        let blocks = &response.chain_block_accepted_transactions[..];
+        let mut report = BatchReport::default();
+        let mut start = 0;
+        loop {
+            let end = (start + COMMIT_BLOCKS).min(blocks.len());
+            // The removed blocks go first, with the first chunk.
+            let removed: &[RpcHash] = if start == 0 {
+                &response.removed_chain_block_hashes
+            } else {
+                &[]
+            };
+            self.commit(removed, &blocks[start..end], &mut report)?;
+            start = end;
+            if start >= blocks.len() {
+                return Ok(report);
+            }
+        }
+    }
+
+    /// One atomic commit: `removed` undone, `blocks` indexed, both folded into the
+    /// analytics engine, the manifest advanced. Adds to `report`.
+    fn commit(
+        &mut self,
+        removed: &[RpcHash],
+        blocks: &[RpcChainBlockAcceptedTransactions],
+        report: &mut BatchReport,
+    ) -> Result<()> {
         let mut batch = self.store.db().batch();
         let mut overlay = Overlay::default();
-        let mut blocks = BlockOverlay::default();
+        let mut block_records = BlockOverlay::default();
         let store = self.store.clone();
         let mut clusters = Clusters::new(store.clusters());
-        let mut report = BatchReport::default();
         // Chain blocks already indexed, which analytics must not count twice either.
         let mut seen = HashSet::new();
+        let txs_before = report.txs;
+        let mut txs_undone = 0;
 
-        for hash in response.removed_chain_block_hashes.iter() {
-            if self.undo_block(&mut batch, &mut overlay, &mut blocks, hash)? {
-                report.reorged_blocks += 1;
-            } else {
-                report.unresolved_reorgs.push(hash.to_string());
+        for hash in removed {
+            match self.undo_block(&mut batch, &mut overlay, &mut block_records, hash)? {
+                Some(undone) => {
+                    report.reorged_blocks += 1;
+                    txs_undone += undone;
+                }
+                None => report.unresolved_reorgs.push(hash.to_string()),
             }
         }
 
-        for chain_block in response.chain_block_accepted_transactions.iter() {
+        for chain_block in blocks {
             let header = &chain_block.chain_block_header;
             let (Some(hash), Some(time_ms)) = (header.hash, header.timestamp) else {
                 continue;
@@ -357,7 +394,7 @@ impl IndexWriter {
                 continue;
             }
             chain_header(
-                blocks.get_or_load(&store, &block, time_ms, BlockKind::Chain, block)?,
+                block_records.get_or_load(&store, &block, time_ms, BlockKind::Chain, block)?,
                 header,
             );
             for rpc_tx in &chain_block.accepted_transactions {
@@ -374,7 +411,7 @@ impl IndexWriter {
                 self.put_tx(&mut batch, &mut overlay, &slab, &block, &txid, &tx)?;
                 self.touch_block(
                     &mut batch,
-                    &mut blocks,
+                    &mut block_records,
                     &txid,
                     &tx,
                     rpc_tx.payload.as_deref(),
@@ -386,39 +423,44 @@ impl IndexWriter {
             }
         }
 
-        overlay.flush(&mut batch)?;
-        report.blocks = blocks.flush(&mut batch)?;
-        report.cluster_cap_hits = clusters.cap_hits;
+        let seq = self.manifest.seq + 1;
+        overlay.flush(&mut batch, seq)?;
+        let blocks_delta = block_records.flush(&mut batch)?;
+        report.blocks += blocks_delta;
+        report.cluster_cap_hits += clusters.cap_hits;
         clusters.flush(&mut batch);
-        let ingest = self.analytics.ingest(response, &seen, now_ms());
+        let ingest = self
+            .analytics
+            .ingest_blocks(removed, blocks, &seen, now_ms());
         analytics::write(&mut batch, &store, &self.analytics, &ingest)?;
-        report.analytics_reorgs = ingest.unresolved_reorgs;
+        report.analytics_reorgs.extend(ingest.unresolved_reorgs);
+        let mut manifest = self.manifest;
         if let Some(newest) = report.newest {
-            self.manifest.position = Some(newest);
+            manifest.position = Some(newest);
         }
-        self.manifest.txs_indexed += report.txs as u64;
-        self.manifest.blocks_indexed = self
-            .manifest
-            .blocks_indexed
-            .saturating_add_signed(report.blocks);
+        manifest.txs_indexed =
+            (manifest.txs_indexed + (report.txs - txs_before) as u64).saturating_sub(txs_undone);
+        manifest.blocks_indexed = manifest.blocks_indexed.saturating_add_signed(blocks_delta);
+        manifest.seq = seq;
         batch.insert(
             self.store.meta_keyspace(),
             "manifest",
-            IndexStore::encode_manifest(&self.manifest)?,
+            IndexStore::encode_manifest(&manifest)?,
         );
         batch.commit()?;
-        Ok(report)
+        self.manifest = manifest;
+        Ok(())
     }
 
-    /// Reverse every transaction a removed chain block accepted. Returns false when the
-    /// block isn't in the newest slabs.
+    /// Reverse every transaction a removed chain block accepted. Returns how many, or
+    /// `None` when the block isn't in the newest slabs.
     fn undo_block(
         &mut self,
         batch: &mut WriteBatch,
         overlay: &mut Overlay,
         blocks: &mut BlockOverlay,
         hash: &RpcHash,
-    ) -> Result<bool> {
+    ) -> Result<Option<u64>> {
         let block = hash.as_bytes();
         let slabs = self.store.slabs();
         for slab in slabs.iter().rev().take(REORG_SLABS) {
@@ -434,12 +476,14 @@ impl IndexWriter {
                 continue;
             }
             let mut time_ms = None;
+            let mut undone = 0;
             for txid in txids {
                 if let Some(bytes) = slab.tx.get(txid)? {
                     let tx: IndexedTx = decode(&bytes)?;
                     time_ms = Some(tx.time_ms);
                     self.remove_tx(batch, overlay, slab, &block, &txid, &tx)?;
                     self.untouch_block(blocks, &tx)?;
+                    undone += 1;
                 }
             }
             // The chain block's own record goes too; its slab is that of its timestamp,
@@ -447,9 +491,9 @@ impl IndexWriter {
             if let Some(time_ms) = time_ms {
                 blocks.remove(&self.store, &block, time_ms)?;
             }
-            return Ok(true);
+            return Ok(Some(undone));
         }
-        Ok(false)
+        Ok(None)
     }
 
     /// Count an accepted transaction into the block that holds it; a coinbase also
@@ -568,10 +612,10 @@ impl IndexWriter {
         }
         for (sender, receiver, amount) in peer_flows(tx) {
             overlay
-                .peer_mut(slab, sender, receiver)?
+                .peer_mut(slab, sender, receiver)
                 .apply(0, amount, false);
             overlay
-                .peer_mut(slab, receiver, sender)?
+                .peer_mut(slab, receiver, sender)
                 .apply(amount, 0, false);
         }
         Ok(())
@@ -604,10 +648,10 @@ impl IndexWriter {
         }
         for (sender, receiver, amount) in peer_flows(tx) {
             overlay
-                .peer_mut(slab, sender, receiver)?
+                .peer_mut(slab, sender, receiver)
                 .apply(0, amount, true);
             overlay
-                .peer_mut(slab, receiver, sender)?
+                .peer_mut(slab, receiver, sender)
                 .apply(amount, 0, true);
         }
         Ok(())
@@ -1303,6 +1347,70 @@ mod tests {
         let unknown = response(vec![hash(42)], vec![]);
         let report = w.apply(&unknown).unwrap();
         assert_eq!(report.unresolved_reorgs, vec![hash(42).to_string()]);
+    }
+
+    #[test]
+    fn reorg_undoes_counterparties_and_the_tx_count() {
+        let mut tw = writer();
+        let w = &mut tw.writer;
+        w.apply(&response(
+            vec![],
+            vec![
+                chain_block(1, 1_000, vec![tx(1, &[(1, 100)], &[(2, 90)])]),
+                chain_block(2, 2_000, vec![tx(2, &[(1, 50)], &[(2, 40), (3, 5)])]),
+            ],
+        ))
+        .unwrap();
+        let store = w.store();
+        let id = |n: u32| store.lookup(&address(n).to_string()).unwrap().unwrap();
+        let (a1, a3) = (id(1), id(3));
+        let peers = query::counterparties(store, a1, 10).unwrap();
+        assert_eq!(peers.len(), 2);
+        assert_eq!(peers[0].stats.out_amount, 130);
+        assert_eq!(peers[0].stats.tx_count, 2);
+        assert_eq!(w.manifest().txs_indexed, 2);
+
+        // Block 2 goes: 3 is no counterparty any more, 2 is one of a single transaction.
+        w.apply(&response(vec![chain_hash(2)], vec![])).unwrap();
+        let store = w.store();
+        let peers = query::counterparties(store, a1, 10).unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(
+            (peers[0].stats.out_amount, peers[0].stats.tx_count),
+            (90, 1)
+        );
+        assert!(query::counterparties(store, a3, 10).unwrap().is_empty());
+        assert_eq!(w.manifest().txs_indexed, 1);
+        // Every commit stamped its deltas with its own sequence number.
+        assert_eq!(w.manifest().seq, 2);
+    }
+
+    #[test]
+    fn a_large_response_is_committed_in_chunks() {
+        let mut tw = writer();
+        let w = &mut tw.writer;
+        let n = COMMIT_BLOCKS as u64 * 2 + 5;
+        let blocks: Vec<_> = (1..=n)
+            .map(|i| chain_block(i, i * 100, vec![tx(i, &[(1, 100)], &[(2, 90)])]))
+            .collect();
+        let r = response(vec![], blocks);
+        let report = w.apply(&r).unwrap();
+        assert_eq!((report.chain_blocks, report.txs), (n as usize, n as usize));
+        // One merged block per chain block plus the chain block itself.
+        assert_eq!(report.blocks, 2 * n as i64);
+        assert_eq!(w.manifest().seq, 3);
+        assert_eq!(w.manifest().txs_indexed, n);
+        assert_eq!(w.manifest().position.unwrap().daa_score, n);
+        let a1 = w.store().lookup(&address(1).to_string()).unwrap().unwrap();
+        assert_eq!(query::stats(w.store(), a1).unwrap().tx_count, n);
+        let peers = query::counterparties(w.store(), a1, 10).unwrap();
+        assert_eq!(peers[0].stats.tx_count, n);
+
+        // A replay (after a crash between chunks, say) changes nothing.
+        let report = w.apply(&r).unwrap();
+        assert_eq!(report.skipped_blocks, n as usize);
+        assert_eq!(w.manifest().txs_indexed, n);
+        assert_eq!(query::stats(w.store(), a1).unwrap().tx_count, n);
     }
 
     #[test]

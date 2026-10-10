@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use super::cluster;
 use super::peel::{self, PeelChain};
 use super::records::{
-    AddrId, AddrStats, BlockKind, BlockRecord, Hash32, IndexedTx, PeerStats, addr_key, addr_tx_key,
-    decode, decode_delta, parse_addr_tx_key, parse_peer_key, parse_protocol_tx_key,
+    AddrId, AddrStats, BlockKind, BlockRecord, Hash32, IndexedTx, PeerDelta, PeerStats, addr_key,
+    addr_tx_key, decode, decode_delta, parse_addr_tx_key, parse_peer_key, parse_protocol_tx_key,
     protocol_tx_key,
 };
 use super::{IndexStore, Slab, hex, parse_hex};
@@ -925,18 +925,22 @@ pub fn transaction(store: &IndexStore, txid: &Hash32) -> Result<Option<TxDetail>
 
 /// The `top` counterparties of `id` by volume, over every slab.
 pub fn counterparties(store: &IndexStore, id: AddrId, top: usize) -> Result<Vec<Peer>> {
-    let mut merged: HashMap<AddrId, PeerStats> = HashMap::new();
+    let mut merged: HashMap<AddrId, PeerDelta> = HashMap::new();
     for slab in store.slabs() {
         for guard in slab.peers.prefix(addr_key(id)) {
             let (key, value) = guard.into_inner()?;
             let Some(peer) = parse_peer_key(&key) else {
                 continue;
             };
-            let stats: PeerStats = decode(&value)?;
-            merged.entry(peer).or_default().merge(&stats);
+            let delta: PeerDelta = decode(&value)?;
+            merged.entry(peer).or_default().merge(&delta);
         }
     }
-    let mut peers: Vec<(AddrId, PeerStats)> = merged.into_iter().collect();
+    let mut peers: Vec<(AddrId, PeerStats)> = merged
+        .into_iter()
+        .map(|(peer, delta)| (peer, PeerStats::from_delta(&delta)))
+        .filter(|(_, s)| s.tx_count > 0)
+        .collect();
     peers.sort_unstable_by_key(|(id, s)| (std::cmp::Reverse(s.in_amount + s.out_amount), *id));
     peers.truncate(top);
     peers

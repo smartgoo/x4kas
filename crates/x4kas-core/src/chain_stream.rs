@@ -21,8 +21,11 @@ use crate::rpc::client::RpcManager;
 pub type ChainBatch = GetVirtualChainFromBlockV2Response;
 pub type BatchSender = mpsc::Sender<Arc<ChainBatch>>;
 
-/// Responses a sink may have queued before the fetcher waits for it.
-pub const SINK_QUEUE: usize = 4;
+/// Responses a sink may have queued before the fetcher waits for it. The node answers
+/// with up to ten mergesets' worth of chain blocks (2,480 at 10 BPS), which at full
+/// blocks is hundreds of thousands of transactions, so one queued response plus the one
+/// being fetched and the one being applied is as much as should sit in memory.
+pub const SINK_QUEUE: usize = 1;
 
 /// Delay between requests while catching up to the tip.
 const CATCH_UP_INTERVAL: Duration = Duration::from_millis(100);
@@ -115,6 +118,20 @@ pub async fn run(
             .unwrap_or(0);
         if let Some(last_added) = response.added_chain_block_hashes.last() {
             current_hash = *last_added;
+        } else if let Some(&oldest_removed) = response.removed_chain_block_hashes.last() {
+            // A reorg whose new chain blocks aren't confirmed enough to be sent yet: the
+            // start hash left the chain, and asking from it again would repeat the same
+            // removals every poll. Continue from the fork point, the selected parent of
+            // the oldest removed block (the node lists them from the start backwards).
+            match rpc.selected_parent(oldest_removed).await {
+                Ok(fork_point) => current_hash = fork_point,
+                Err(e) => {
+                    // Nothing applied yet: the same response comes again after the retry.
+                    set_phase(&app, ChainPhase::Error(format!("{e:#}"))).await;
+                    tokio::time::sleep(RETRY_DELAY).await;
+                    continue;
+                }
+            }
         }
 
         // Hand the batch to every sink; a full queue makes this wait (backpressure).

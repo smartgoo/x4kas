@@ -27,6 +27,7 @@ use std::sync::RwLock;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
+use fjall::config::PinningPolicy;
 use fjall::{Database, Keyspace, KeyspaceCreateOptions};
 use serde::{Deserialize, Serialize};
 
@@ -35,10 +36,14 @@ use records::{AddrId, Hash32, SLAB_MS, addr_key, decode, encode, parse_addr_key,
 
 /// Bumped when the on-disk layout or the meaning of stored data changes; an index with
 /// another format is discarded and rebuilt from the node.
-pub const FORMAT_VERSION: u32 = 5;
+pub const FORMAT_VERSION: u32 = 6;
 
 /// Block cache shared by all keyspaces.
 const CACHE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Memtable size of the small keyspaces (the manifest, cluster sizes, analytics): fjall's
+/// 64 MiB default is for the data keyspaces.
+const SMALL_MEMTABLE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// How long [`IndexStore::open`] keeps retrying while another process (or a writer that
 /// is still shutting down) holds the directory lock.
@@ -78,6 +83,10 @@ pub struct Manifest {
     /// Block records held (chain blocks and the merged blocks their transactions name).
     #[serde(default)]
     pub blocks_indexed: u64,
+    /// Commits so far; the writer stamps the counterparty deltas of each commit with it
+    /// (`records::peer_delta_key`), so no commit overwrites another's.
+    #[serde(default)]
+    pub seq: u64,
 }
 
 /// The keyspaces of one six-hour slab.
@@ -92,7 +101,8 @@ pub struct Slab {
     pub block_tx: Keyspace,
     /// `addr_id → AddrStats`
     pub stats: Keyspace,
-    /// `addr_id ‖ peer_id → PeerStats`
+    /// `addr_id ‖ peer_id ‖ seq → PeerDelta`, every commit's change to the flows between
+    /// an address and a counterparty (summed on read)
     pub peers: Keyspace,
     /// `protocol code ‖ time_ms ‖ txid → ()`, the transactions of each protocol
     pub protocol_tx: Keyspace,
@@ -133,8 +143,6 @@ impl Slab {
         self.start_ms() < to_ms && self.end_ms() > from_ms
     }
 }
-
-const SLAB_PREFIXES: [&str; 9] = ["tx", "atx", "btx", "ast", "apr", "ptx", "ttx", "blk", "tbk"];
 
 pub struct IndexStore {
     db: Database,
@@ -256,15 +264,15 @@ impl IndexStore {
 
     /// The store over an open database: its global keyspaces and the slabs on disk.
     fn from_db(db: Database, network: &str) -> Result<Self> {
-        let meta = db.keyspace("meta", KeyspaceCreateOptions::default)?;
-        let addr_by_str = db.keyspace("addr_by_str", KeyspaceCreateOptions::default)?;
-        let str_by_id = db.keyspace("str_by_id", KeyspaceCreateOptions::default)?;
+        let meta = db.keyspace("meta", small_keyspace)?;
+        let addr_by_str = db.keyspace("addr_by_str", point_read_keyspace)?;
+        let str_by_id = db.keyspace("str_by_id", point_read_keyspace)?;
         let clusters = cluster::ClusterKeyspaces {
-            parent: db.keyspace("cl_parent", KeyspaceCreateOptions::default)?,
-            size: db.keyspace("cl_size", KeyspaceCreateOptions::default)?,
+            parent: db.keyspace("cl_parent", point_read_keyspace)?,
+            size: db.keyspace("cl_size", small_point_read_keyspace)?,
             member: db.keyspace("cl_member", KeyspaceCreateOptions::default)?,
         };
-        let analytics = db.keyspace("analytics", KeyspaceCreateOptions::default)?;
+        let analytics = db.keyspace("analytics", small_keyspace)?;
 
         // Reopen the slabs that exist on disk.
         let mut slabs = BTreeMap::new();
@@ -455,22 +463,37 @@ impl IndexStore {
     }
 }
 
+/// A keyspace the writer looks keys up in while indexing (interning, stats, cluster
+/// parents, block records): its filter blocks stay in memory at every level, so a miss
+/// (a fresh address, most of the time) costs no disk read. fjall pins them for the first
+/// level only.
+fn point_read_keyspace() -> KeyspaceCreateOptions {
+    KeyspaceCreateOptions::default().filter_block_pinning_policy(PinningPolicy::new([true]))
+}
+
+fn small_keyspace() -> KeyspaceCreateOptions {
+    KeyspaceCreateOptions::default().max_memtable_size(SMALL_MEMTABLE_BYTES)
+}
+
+fn small_point_read_keyspace() -> KeyspaceCreateOptions {
+    point_read_keyspace().max_memtable_size(SMALL_MEMTABLE_BYTES)
+}
+
 fn open_slab(db: &Database, no: u64) -> Result<Slab> {
-    let mut ks = SLAB_PREFIXES
-        .iter()
-        .map(|p| db.keyspace(&format!("{p}_{no}"), KeyspaceCreateOptions::default));
-    let mut next = || ks.next().expect("nine slab keyspaces");
+    let open = |p: &str, options: fn() -> KeyspaceCreateOptions| {
+        db.keyspace(&format!("{p}_{no}"), options)
+    };
     Ok(Slab {
         no,
-        tx: next()?,
-        addr_tx: next()?,
-        block_tx: next()?,
-        stats: next()?,
-        peers: next()?,
-        protocol_tx: next()?,
-        time_tx: next()?,
-        blocks: next()?,
-        time_blocks: next()?,
+        tx: open("tx", point_read_keyspace)?,
+        addr_tx: open("atx", KeyspaceCreateOptions::default)?,
+        block_tx: open("btx", point_read_keyspace)?,
+        stats: open("ast", point_read_keyspace)?,
+        peers: open("apr", KeyspaceCreateOptions::default)?,
+        protocol_tx: open("ptx", KeyspaceCreateOptions::default)?,
+        time_tx: open("ttx", KeyspaceCreateOptions::default)?,
+        blocks: open("blk", point_read_keyspace)?,
+        time_blocks: open("tbk", KeyspaceCreateOptions::default)?,
     })
 }
 

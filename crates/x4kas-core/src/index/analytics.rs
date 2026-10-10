@@ -1,9 +1,10 @@
 //! The analytics engine's buckets as a keyspace of the index store, written in the same
 //! atomic batch as the transactions they count, so the engine and the index can never
-//! disagree about the position. Every bucket is its own key and only the buckets a batch
-//! changed are written, plus the last minute of blocks (`recent`), which changes with
-//! nearly every batch. The keyspace isn't slabbed: the engine prunes by its own windows
-//! (at most 24h), well inside the node's retention.
+//! disagree about the position. Every bucket and every block of the last minute (not yet
+//! in a bucket) is its own key, and only what a batch changed is written: the buckets it
+//! touched, the recent blocks it added and the ones it finalized or reorged away. The
+//! keyspace isn't slabbed: the engine prunes by its own windows (at most 24h), well
+//! inside the node's retention.
 
 use std::path::Path;
 
@@ -13,13 +14,20 @@ use fjall::OwnedWriteBatch as WriteBatch;
 use super::records::{decode, encode};
 use super::{IndexStore, Manifest, Position, parse_hex};
 use crate::analytics::{
-    AnalyticsEngine, BucketKey, BucketWidth, Ingest, TimeBucket, load_legacy_cache,
+    AnalyticsEngine, BlockSummary, BucketKey, BucketWidth, Ingest, TimeBucket, load_legacy_cache,
 };
 
-/// The last minute of blocks, not yet in any bucket.
-const RECENT_KEY: &[u8] = b"recent";
+/// Recent block keys: `r` ‖ the block's hex hash.
+const RECENT_PREFIX: u8 = b'r';
 /// Bucket keys: `b` ‖ width ‖ start_ms (big-endian), so a prefix scan walks them in order.
 const BUCKET_PREFIX: u8 = b'b';
+
+fn recent_key(hash: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(1 + hash.len());
+    key.push(RECENT_PREFIX);
+    key.extend_from_slice(hash.as_bytes());
+    key
+}
 
 fn bucket_key(width: BucketWidth, start_ms: u64) -> [u8; 10] {
     let mut key = [0u8; 10];
@@ -56,8 +64,9 @@ pub fn load(store: &IndexStore) -> Result<AnalyticsEngine> {
         let bucket: TimeBucket = decode(&value)?;
         engine.insert_bucket(width, bucket);
     }
-    if let Some(bytes) = ks.get(RECENT_KEY)? {
-        engine.recent_blocks = decode(&bytes)?;
+    for guard in ks.prefix([RECENT_PREFIX]) {
+        let block: BlockSummary = decode(&guard.value()?)?;
+        engine.recent_blocks.insert(block.hash.clone(), block);
     }
     Ok(engine)
 }
@@ -78,8 +87,13 @@ pub fn write(
             batch.insert(ks, bucket_key(width, start), encode(bucket)?);
         }
     }
-    if ingest.recent_changed {
-        batch.insert(ks, RECENT_KEY, encode(&engine.recent_blocks)?);
+    for hash in &ingest.recent_removed {
+        batch.remove(ks, recent_key(hash));
+    }
+    for hash in &ingest.recent_added {
+        if let Some(block) = engine.recent_blocks.get(hash) {
+            batch.insert(ks, recent_key(hash), encode(block)?);
+        }
     }
     Ok(())
 }
@@ -96,7 +110,9 @@ fn write_all(batch: &mut WriteBatch, store: &IndexStore, engine: &AnalyticsEngin
             );
         }
     }
-    batch.insert(ks, RECENT_KEY, encode(&engine.recent_blocks)?);
+    for (hash, block) in &engine.recent_blocks {
+        batch.insert(ks, recent_key(hash), encode(block)?);
+    }
     Ok(())
 }
 
@@ -194,7 +210,7 @@ mod tests {
         engine.add_block(block("old", now - 300_000, 4));
         engine.add_block(block("new", now, 1));
         let mut ingest = Ingest {
-            recent_changed: true,
+            recent_added: vec!["new".to_string()],
             ..Default::default()
         };
         ingest.touched = engine.finalize_old_blocks(now);
@@ -209,10 +225,14 @@ mod tests {
         assert_eq!(loaded.recent_blocks.len(), 1);
         assert!(loaded.recent_blocks.contains_key("new"));
 
-        // Pruning removes keys; an unchanged recent set isn't rewritten.
+        // Pruning removes keys; a recent block that left is removed, the rest untouched.
         let removed = engine.prune_buckets(now + 2 * 3_600_000);
+        engine.add_block(block("newer", now + 1, 2));
+        engine.remove_block("new");
         let ingest = Ingest {
             removed,
+            recent_added: vec!["newer".to_string()],
+            recent_removed: vec!["new".to_string()],
             ..Default::default()
         };
         let mut batch = store.db().batch();
@@ -222,6 +242,7 @@ mod tests {
         assert!(loaded.minute_buckets.is_empty());
         assert_eq!(loaded.ten_minute_buckets.len(), 1);
         assert_eq!(loaded.recent_blocks.len(), 1);
+        assert!(loaded.recent_blocks.contains_key("newer"));
     }
 
     #[test]
@@ -239,10 +260,28 @@ mod tests {
         let skip: HashSet<String> =
             HashSet::from([crate::index::writer::testing::hash(1_000_002).to_string()]);
         let ingest = engine.ingest(&r, &skip, now);
-        assert!(ingest.recent_changed);
+        // Two minutes old: added and finalized in the same call, so never stored.
+        assert!(ingest.recent_added.is_empty() && ingest.recent_removed.is_empty());
         assert_eq!(ingest.touched.len(), 2);
         assert_eq!(ingest.removed, BTreeSet::new());
         assert_eq!(engine.minute_buckets[0].metrics.chain_blocks, 1);
+
+        // A block of the last minute is added; when it ages out it is removed.
+        let fresh = crate::index::writer::testing::response(
+            vec![],
+            vec![crate::index::writer::testing::chain_block(
+                3,
+                now - 1_000,
+                vec![],
+            )],
+        );
+        let ingest = engine.ingest(&fresh, &HashSet::new(), now);
+        let h3 = crate::index::writer::testing::hash(1_000_003).to_string();
+        assert_eq!(ingest.recent_added, vec![h3.clone()]);
+        assert!(ingest.recent_removed.is_empty());
+        let later = engine.ingest(&fresh, &HashSet::from([h3.clone()]), now + 120_000);
+        assert_eq!(later.recent_removed, vec![h3]);
+        assert!(later.recent_added.is_empty());
 
         // Nothing new: nothing changes.
         let all: HashSet<String> = [1_000_001, 1_000_002]

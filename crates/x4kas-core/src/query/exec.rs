@@ -26,7 +26,7 @@ use super::{
 };
 use crate::format::{format_duration_ms, format_sompi_exact, format_utc};
 use crate::index::records::{
-    AddrId, AddrStats, BlockKind, BlockRecord, Hash32, IndexedTx, PeerStats, SUMMARY_COINBASE,
+    AddrId, AddrStats, BlockKind, BlockRecord, Hash32, IndexedTx, PeerDelta, SUMMARY_COINBASE,
     SUMMARY_SELF_TRANSFER, Subnetwork, TxSummary, addr_key, addr_tx_key, decode, parse_addr_key,
     parse_addr_tx_key, parse_peer_key, parse_protocol_tx_key, parse_time_key, protocol_tx_key,
     time_key,
@@ -691,21 +691,20 @@ impl Ctx<'_> {
         Ok(label)
     }
 
-    /// Distinct counterparties of `id` over the window's slabs.
+    /// Distinct counterparties of `id` over the window's slabs: the peers whose summed
+    /// deltas leave a transaction.
     fn peer_count(&self, id: AddrId) -> Result<usize> {
-        let mut peers = HashSet::new();
+        let mut peers: HashMap<AddrId, i64> = HashMap::new();
         for slab in &self.slabs {
             for guard in self.snapshot.prefix(&slab.peers, addr_key(id)) {
                 let (key, value) = guard.into_inner()?;
-                let stats: PeerStats = decode(&value)?;
-                if stats.tx_count > 0
-                    && let Some(peer) = parse_peer_key(&key)
-                {
-                    peers.insert(peer);
+                let delta: PeerDelta = decode(&value)?;
+                if let Some(peer) = parse_peer_key(&key) {
+                    *peers.entry(peer).or_default() += delta.tx_count;
                 }
             }
         }
-        Ok(peers.len())
+        Ok(peers.values().filter(|n| **n > 0).count())
     }
 
     /// Totals of `id` over the window's slabs.

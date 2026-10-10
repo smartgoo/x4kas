@@ -35,15 +35,24 @@ pub struct ClusterKeyspaces {
     pub member: Keyspace,
 }
 
-/// Union-find with a per-batch overlay, flushed into the batch at the end.
+/// Union-find with a per-batch overlay, flushed into the batch at the end. Only what a
+/// batch changed is written: the parents it set, the sizes it changed, the memberships
+/// it moved.
 pub struct Clusters<'a> {
     ks: &'a ClusterKeyspaces,
     /// A cluster that would grow past this stays as it is.
     cap: u32,
+    /// Parents read or set this batch (`None`: a root).
     parent: HashMap<AddrId, Option<AddrId>>,
+    /// Addresses whose parent this batch changed.
+    dirty_parent: HashSet<AddrId>,
+    /// Sizes read or set this batch (`None`: not a root any more, or never stored).
     size: HashMap<AddrId, Option<u32>>,
-    member_add: HashSet<(AddrId, AddrId)>,
-    member_del: HashSet<(AddrId, AddrId)>,
+    dirty_size: HashSet<AddrId>,
+    /// Members joining a root this batch, by root.
+    member_add: HashMap<AddrId, HashSet<AddrId>>,
+    /// Members leaving a root this batch, by root.
+    member_del: HashMap<AddrId, HashSet<AddrId>>,
     /// Unions refused by the size cap.
     pub cap_hits: u64,
 }
@@ -59,9 +68,11 @@ impl<'a> Clusters<'a> {
             ks,
             cap,
             parent: HashMap::new(),
+            dirty_parent: HashSet::new(),
             size: HashMap::new(),
-            member_add: HashSet::new(),
-            member_del: HashSet::new(),
+            dirty_size: HashSet::new(),
+            member_add: HashMap::new(),
+            member_del: HashMap::new(),
             cap_hits: 0,
         }
     }
@@ -79,6 +90,12 @@ impl<'a> Clusters<'a> {
         Ok(stored)
     }
 
+    fn set_parent(&mut self, id: AddrId, parent: AddrId) {
+        if self.parent.insert(id, Some(parent)) != Some(Some(parent)) {
+            self.dirty_parent.insert(id);
+        }
+    }
+
     fn size_of(&mut self, root: AddrId) -> Result<u32> {
         if let Some(s) = self.size.get(&root) {
             return Ok(s.unwrap_or(1));
@@ -92,6 +109,12 @@ impl<'a> Clusters<'a> {
         Ok(stored.unwrap_or(1))
     }
 
+    fn set_size(&mut self, root: AddrId, size: Option<u32>) {
+        if self.size.insert(root, size) != Some(size) {
+            self.dirty_size.insert(root);
+        }
+    }
+
     /// The cluster root of `id` (itself when it's in no cluster).
     pub fn find(&mut self, id: AddrId) -> Result<AddrId> {
         let mut path = Vec::new();
@@ -101,9 +124,7 @@ impl<'a> Clusters<'a> {
             cur = p;
         }
         for node in path {
-            if node != cur {
-                self.parent.insert(node, Some(cur));
-            }
+            self.set_parent(node, cur);
         }
         Ok(cur)
     }
@@ -116,14 +137,12 @@ impl<'a> Clusters<'a> {
                 set.insert(m);
             }
         }
-        for &(r, m) in &self.member_add {
-            if r == root {
-                set.insert(m);
-            }
+        if let Some(added) = self.member_add.get(&root) {
+            set.extend(added);
         }
-        for &(r, m) in &self.member_del {
-            if r == root {
-                set.remove(&m);
+        if let Some(deleted) = self.member_del.get(&root) {
+            for m in deleted {
+                set.remove(m);
             }
         }
         set.insert(root);
@@ -143,38 +162,44 @@ impl<'a> Clusters<'a> {
         }
         let (small, big) = if sa <= sb { (ra, rb) } else { (rb, ra) };
         for m in self.members(small)? {
-            self.parent.insert(m, Some(big));
-            if !self.member_del.insert((small, m)) || self.member_add.contains(&(small, m)) {
-                self.member_add.remove(&(small, m));
+            self.set_parent(m, big);
+            self.member_del.entry(small).or_default().insert(m);
+            if let Some(added) = self.member_add.get_mut(&small) {
+                added.remove(&m);
             }
-            self.member_add.insert((big, m));
+            self.member_add.entry(big).or_default().insert(m);
         }
         // The big root is its own member once it has company.
-        self.member_add.insert((big, big));
-        self.size.insert(small, None);
-        self.size.insert(big, Some(sa + sb));
+        self.member_add.entry(big).or_default().insert(big);
+        self.set_size(small, None);
+        self.set_size(big, Some(sa + sb));
         Ok(true)
     }
 
     pub fn flush(self, batch: &mut WriteBatch) {
-        for (id, parent) in self.parent {
-            if let Some(p) = parent {
-                batch.insert(&self.ks.parent, addr_key(id), addr_key(p));
+        for id in &self.dirty_parent {
+            if let Some(Some(p)) = self.parent.get(id) {
+                batch.insert(&self.ks.parent, addr_key(*id), addr_key(*p));
             }
         }
-        for (root, size) in self.size {
-            match size {
-                Some(s) => batch.insert(&self.ks.size, addr_key(root), s.to_be_bytes()),
-                None => batch.remove(&self.ks.size, addr_key(root)),
+        for root in &self.dirty_size {
+            match self.size.get(root) {
+                Some(Some(s)) => batch.insert(&self.ks.size, addr_key(*root), s.to_be_bytes()),
+                _ => batch.remove(&self.ks.size, addr_key(*root)),
             }
         }
-        for (root, m) in self.member_del {
-            if !self.member_add.contains(&(root, m)) {
-                batch.remove(&self.ks.member, peer_key(root, m));
+        for (root, members) in &self.member_del {
+            let re_added = self.member_add.get(root);
+            for m in members {
+                if !re_added.is_some_and(|a| a.contains(m)) {
+                    batch.remove(&self.ks.member, peer_key(*root, *m));
+                }
             }
         }
-        for (root, m) in self.member_add {
-            batch.insert(&self.ks.member, peer_key(root, m), []);
+        for (root, members) in &self.member_add {
+            for m in members {
+                batch.insert(&self.ks.member, peer_key(*root, *m), []);
+            }
         }
     }
 }
@@ -389,6 +414,45 @@ mod tests {
         expected.sort_unstable();
         assert_eq!(listed, expected);
         root
+    }
+
+    /// Reading a cluster writes nothing, and a batch of many unions doesn't degrade.
+    #[test]
+    fn finds_are_free_and_unions_scale() {
+        let temp = crate::index::temp_store();
+        let store = &temp.store;
+        let ks = store.clusters();
+        let mut c = Clusters::new(ks);
+        assert!(c.union(1, 2).unwrap());
+        let mut batch = store.db().batch();
+        c.flush(&mut batch);
+        batch.commit().unwrap();
+
+        // Only reads: nothing to flush.
+        let mut c = Clusters::new(ks);
+        assert_eq!(c.find(1).unwrap(), c.find(2).unwrap());
+        let root = c.find(1).unwrap();
+        assert_eq!(c.size_of(root).unwrap(), 2);
+        assert!(c.dirty_parent.is_empty() && c.dirty_size.is_empty());
+
+        let time = |n: u32| {
+            let mut c = Clusters::new(ks);
+            let t = std::time::Instant::now();
+            for i in 0..n {
+                c.union(1_000 + i * 2, 1_000 + i * 2 + 1).unwrap();
+            }
+            for i in 0..n / 10 {
+                c.union(1_000 + i * 20, 1_000 + i * 20 + 10).unwrap();
+            }
+            t.elapsed()
+        };
+        let small = time(5_000);
+        let large = time(40_000);
+        // Eight times the work: well under the sixty-four times a quadratic overlay took.
+        assert!(
+            large < small * 24,
+            "5k unions {small:?}, 40k unions {large:?}"
+        );
     }
 
     #[test]

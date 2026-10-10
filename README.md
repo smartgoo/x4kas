@@ -30,7 +30,7 @@ Two binaries are provided to support different modes of interaction:
 
 **Prebuilt binaries**: download the archive for your platform from [Releases](https://github.com/smartgoo/x4kas/releases) (`x4kas-<version>-<target>.tar.gz`, `.zip` on Windows). Releases contains both `x4kas` (GUI) and `x4kas-cli`.
 
-- macOS: the GUI is `x4kas.app` (from 0.1.1; 0.1.0 has a bare `x4kas` binary, which Finder opens in a Terminal window); drag it to Applications. It isn't signed yet, so macOS blocks it on first launch ("Apple could not verify…"). Clear the download's quarantine flag in the unpacked folder:
+- macOS: the GUI is `x4kas.app`; drag it to Applications. It isn't notarized yet, so macOS blocks it on first launch ("Apple could not verify…"). Clear the download's quarantine flag in the unpacked folder:
   ```bash
   xattr -dr com.apple.quarantine .
   ```

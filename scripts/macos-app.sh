@@ -45,3 +45,8 @@ cat > "${app}/Contents/Info.plist" <<PLIST
 </dict>
 </plist>
 PLIST
+
+# Sign the finished bundle (ad hoc: no Developer ID). The linker signs the bare binary
+# alone, and a bundle whose signature doesn't cover its Info.plist and resources is
+# reported as "damaged" by Gatekeeper.
+codesign --force --sign - "$app"

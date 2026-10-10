@@ -92,6 +92,11 @@ pub fn run(rt: &tokio::runtime::Runtime, args: Args) -> Result<()> {
         persistence_path: Some(x4kas_core::config::data_dir().join("gui.ron")),
         viewport: egui::ViewportBuilder::default()
             .with_title("x4kas")
+            // The dock/taskbar icon (egui's logo otherwise).
+            .with_icon(
+                eframe::icon_data::from_png_bytes(include_bytes!("../../assets/icon.png"))
+                    .expect("the bundled icon is a valid PNG"),
+            )
             .with_inner_size([1280.0, 820.0])
             .with_min_inner_size([1200.0, 750.0])
             // macOS: hide the title bar and draw under it, so the window buttons sit on

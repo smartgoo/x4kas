@@ -68,10 +68,15 @@ jobs:
           name="x4kas-${version}-${{ matrix.target }}"
           ext=""
           [ "${{ runner.os }}" = "Windows" ] && ext=".exe"
+          bin="target/${{ matrix.target }}/release"
           mkdir "$name"
-          cp "target/${{ matrix.target }}/release/x4kas${ext}" \
-             "target/${{ matrix.target }}/release/x4kas-cli${ext}" \
-             README.md LICENSE "$name/"
+          cp "${bin}/x4kas-cli${ext}" README.md LICENSE "$name/"
+          # macOS gets the GUI as an app bundle: Finder opens a bare binary in Terminal.
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            scripts/macos-app.sh "${bin}/x4kas" "${version#v}" "$name"
+          else
+            cp "${bin}/x4kas${ext}" "$name/"
+          fi
           if [ "${{ matrix.archive }}" = "zip" ]; then
             7z a "${name}.zip" "$name" > /dev/null
             file="${name}.zip"

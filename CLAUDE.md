@@ -114,7 +114,7 @@ Paths below are relative to each crate's `src/`.
 
 ## Conventions
 
-- Releases: pushing a `v*` tag (matching `[workspace.package] version`) runs `.github/workflows/release.yml`, which builds `x4kas` and `x4kas-cli` for macOS (arm64, x86_64), Linux (x86_64, arm64, on Ubuntu 22.04) and Windows (x86_64), packs them as `x4kas-<tag>-<target>.tar.gz`/`.zip` with one `SHA256SUMS` file and drafts a GitHub release (a pre-release for 0.x). Running it by hand builds without releasing. Keep the README's install section in step with the archive names.
+- Releases: pushing a `v*` tag (matching `[workspace.package] version`) runs `.github/workflows/release.yml`, which builds `x4kas` and `x4kas-cli` for macOS (arm64, x86_64), Linux (x86_64, arm64, on Ubuntu 22.04) and Windows (x86_64), packs them as `x4kas-<tag>-<target>.tar.gz`/`.zip` (on macOS the GUI as `x4kas.app`, `scripts/macos-app.sh`) with one `SHA256SUMS` file and drafts a GitHub release (a pre-release for 0.x). Running it by hand builds without releasing. Keep the README's install section in step with the archive names.
 - Run `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings` and `cargo test` after changes. Tests cover app state, config, types, formatting, analytics and CLI parsing. GUI code is not unit-tested.
 - Shared dependency versions live in the root `[workspace.dependencies]`; crates use `dep.workspace = true`.
 - Keep async and RPC work out of `gui/`. Add a `UiCommand` and handle it in the controller instead.

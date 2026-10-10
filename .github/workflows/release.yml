@@ -79,19 +79,12 @@ jobs:
             tar czf "${name}.tar.gz" "$name"
             file="${name}.tar.gz"
           fi
-          if command -v sha256sum > /dev/null; then
-            sha256sum "$file" > "${file}.sha256"
-          else
-            shasum -a 256 "$file" > "${file}.sha256"
-          fi
           echo "file=${file}" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
-          path: |
-            ${{ steps.package.outputs.file }}
-            ${{ steps.package.outputs.file }}.sha256
+          path: ${{ steps.package.outputs.file }}
 
   release:
     name: Draft release
@@ -105,6 +98,11 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+
+      # One checksum file for every archive (`sha256sum -c --ignore-missing SHA256SUMS`).
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS
 
       # A draft, so the notes can be edited before publishing; 0.x and `-suffix`
       # versions are marked as pre-releases.

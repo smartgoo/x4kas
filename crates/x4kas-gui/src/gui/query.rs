@@ -15,9 +15,9 @@ use super::monitoring::alert_dot;
 use super::theme;
 use super::toasts::primary_link;
 use super::widgets::{
-    CARD_GAP, address, block_hash, card_with_header, copy_value, direct_node_placeholder,
-    field_label, kv_grid, label_search_popup, modal_window, page_table, placeholder,
-    primary_button, request_explorer, request_pane, section_title, table_row_height,
+    CARD_GAP, address, block_hash, card_overhead, card_with_header, copy_value,
+    direct_node_placeholder, field_label, kv_grid, label_search_popup, modal_window, page_table,
+    placeholder, primary_button, request_explorer, request_pane, section_title, table_row_height,
     transaction_id,
 };
 use x4kas_core::app::{App, ChainPhase, ExportOrigin};
@@ -828,13 +828,18 @@ impl QueryTab {
         };
         // The Results card fills what the builder leaves of the tab, measured outside
         // the page's scroll area so it doesn't change with the scroll position.
-        let header = ui.spacing().interact_size.y + CARD_GAP * 2.0;
+        // What the Results card adds around its table: the gap above it, its own frame
+        // and the table's header row.
+        let header =
+            CARD_GAP + card_overhead(ui) + theme::ROW_HEIGHT + 4.0 + ui.spacing().item_spacing.y;
         let table_height =
             (ui.available_height() - self.builder_height - header).max(MIN_TABLE_HEIGHT);
 
         if self.sidebar_open {
             egui::SidePanel::left("query_sidebar")
                 .resizable(true)
+                // The card's border is the edge; a panel line beside it would be a stray.
+                .show_separator_line(false)
                 .default_width(SIDEBAR_WIDTH)
                 .width_range(SIDEBAR_WIDTH_RANGE)
                 .frame(egui::Frame::NONE.inner_margin(egui::Margin {

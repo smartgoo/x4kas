@@ -93,7 +93,7 @@ pub fn run(rt: &tokio::runtime::Runtime, args: Args) -> Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title("x4kas")
             .with_inner_size([1280.0, 820.0])
-            .with_min_inner_size([800.0, 500.0])
+            .with_min_inner_size([1200.0, 750.0])
             // macOS: hide the title bar and draw under it, so the window buttons sit on
             // the top bar. No effect on other platforms.
             .with_fullsize_content_view(true)

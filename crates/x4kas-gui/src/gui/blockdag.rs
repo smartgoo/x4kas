@@ -7,9 +7,11 @@ use eframe::egui::{
 };
 
 use super::theme;
-use super::widgets::{block_hash, kv, kv_columns, kv_grid, kv_with, or_dash, request_block};
+use super::widgets::{
+    block_hash, kv, kv_columns, kv_fit, kv_grid, kv_with, or_dash, request_block,
+};
 use x4kas_core::app::{App, ConnectionStatus, DAG_MAX_DAA_SCORES, DagBlock, DagVisualizer};
-use x4kas_core::format::{format_number, format_when, shorten_middle};
+use x4kas_core::format::{format_number, format_utc, format_when, shorten_middle};
 
 // The visualizer mirrors the one on the Kaspalytics home page: a band of the newest DAA
 // scores, one column each, blocks spread evenly down their column and joined to their
@@ -381,11 +383,15 @@ pub(super) fn stats(ui: &mut Ui, app: &App) {
                 "Pruning Point",
                 dag.map(|d| d.pruning_point_hash.as_str()),
             );
-            kv(
-                ui,
-                "Past Median Time",
-                or_dash(dag, |d| format_when(d.past_median_time)),
-            );
+            match dag {
+                Some(d) => kv_fit(
+                    ui,
+                    "Past Median Time",
+                    &format_when(d.past_median_time),
+                    &format_utc(d.past_median_time),
+                ),
+                None => kv(ui, "Past Median Time", "—"),
+            }
         });
 
         kv_grid(ghostdag, "ghostdag", |ui| {

@@ -115,6 +115,8 @@ impl ExplorerUi {
         if self.recents_open {
             egui::SidePanel::left("explorer_recents")
                 .resizable(true)
+                // The card's border is the edge; a panel line beside it would be a stray.
+                .show_separator_line(false)
                 .default_width(RECENTS_WIDTH)
                 .width_range(RECENTS_WIDTH_RANGE)
                 .frame(egui::Frame::NONE.inner_margin(egui::Margin {

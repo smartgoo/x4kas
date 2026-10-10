@@ -1,9 +1,14 @@
-use eframe::egui::{self, RichText, Sense, Ui};
-use egui_extras::{Column, TableBuilder};
+//! Mempool tab: the summary card and the entries as a page table in a card that fills
+//! the rest of the tab (scrolling inside). A row click shows the transaction's info
+//! pane, which highlights the row.
+
+use eframe::egui::{RichText, Ui};
+use egui_extras::Column;
 
 use super::theme;
 use super::widgets::{
-    CARD_GAP, card, kv, kv_grid, placeholder, request_pane, section_title, transaction_id, yes_no,
+    CARD_GAP, card, kv, kv_grid, page_table, placeholder, request_pane, table_header,
+    table_row_height, transaction_id, yes_no,
 };
 use x4kas_core::app::App;
 use x4kas_core::explorer::ExplorerPage;
@@ -12,8 +17,24 @@ use x4kas_core::format::{format_kas, format_number};
 pub fn show(ui: &mut Ui, app: &App) {
     card(ui, "Mempool Summary", |ui| summary(ui, app));
     ui.add_space(CARD_GAP);
+    let count = app
+        .node
+        .mempool_state
+        .as_ref()
+        .map_or(0, |m| m.entries.len());
+    let title = if count > 0 {
+        format!("Transactions ({})", format_number(count as u64))
+    } else {
+        "Transactions".to_string()
+    };
+    card(ui, &title, |ui| transactions(ui, app));
+}
 
+/// The entries, in a table that takes the rest of the card (the card takes the rest of
+/// the tab), or why there are none.
+fn transactions(ui: &mut Ui, app: &App) {
     let Some(ref mempool) = app.node.mempool_state else {
+        placeholder(ui, "Waiting for mempool data…");
         return;
     };
     if mempool.entries.is_empty() {
@@ -22,31 +43,22 @@ pub fn show(ui: &mut Ui, app: &App) {
     }
 
     let mut clicked = None;
-    TableBuilder::new(ui)
-        .striped(true)
-        .sense(Sense::click())
-        .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-        .column(Column::remainder().at_least(200.0))
-        .column(Column::auto().at_least(140.0))
-        .column(Column::auto().at_least(70.0))
-        .header(18.0, |mut header| {
-            header.col(|ui| {
-                section_title(ui, "Transaction ID");
-            });
-            header.col(|ui| {
-                section_title(ui, "Fee (KAS)");
-            });
-            header.col(|ui| {
-                section_title(ui, "Orphan");
-            });
-        })
-        .body(|body| {
+    ui.push_id("mempool_entries", |ui| {
+        let row_height = table_row_height(ui);
+        // The header row sits above the body, which gets the rest of the tab.
+        let header_height = theme::ROW_HEIGHT + 4.0 + ui.spacing().item_spacing.y;
+        let body_height = (ui.available_height() - header_height).max(3.0 * row_height);
+        let table = page_table(ui, body_height)
+            .column(Column::remainder().at_least(200.0))
+            .column(Column::auto().at_least(140.0))
+            .column(Column::auto().at_least(70.0));
+        table_header(table, &["Transaction ID", "Fee (KAS)", "Orphan"]).body(|body| {
             // The transaction shown in the info pane is highlighted.
             let open_tx = match app.explorer.pane_page() {
                 Some(ExplorerPage::Transaction { txid, .. }) => Some(txid),
                 _ => None,
             };
-            body.rows(16.0, mempool.entries.len(), |mut row| {
+            body.rows(row_height, mempool.entries.len(), |mut row| {
                 let i = row.index();
                 let entry = &mempool.entries[i];
                 row.set_selected(open_tx == Some(&entry.transaction_id));
@@ -64,6 +76,7 @@ pub fn show(ui: &mut Ui, app: &App) {
                 }
             });
         });
+    });
 
     // A row click shows the transaction's info pane, like a click on its id.
     if let Some(entry) = clicked.and_then(|i| mempool.entries.get(i)) {

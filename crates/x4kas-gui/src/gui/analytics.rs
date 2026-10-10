@@ -8,7 +8,7 @@ use super::theme;
 use super::widgets::{
     address, card_with_header, direct_node_placeholder, fit_label, kv, kv_columns, kv_grid,
     kv_with, open_page, or_dash, placeholder, request_address, section_title, signed_label,
-    subheader,
+    subheader, whole_rows,
 };
 use x4kas_core::analytics::{AggregatedView, InspectionCounts, ScriptClassCounts};
 use x4kas_core::app::{AnalyticsPanel, App, ChainPhase, TimeWindow};
@@ -502,6 +502,8 @@ pub fn wide_table_with_lead<const N: usize>(
         // over anything that spills past this one.
         let row_height =
             ui.spacing().interact_size.y + 2.0 * ui.visuals().widgets.hovered.expansion;
+        // Whole rows, so the body never cuts through its last visible row.
+        let height = whole_rows(ui, height, row_height);
         // Exact widths, recomputed every frame: a `Column::remainder` never shrinks below
         // what its content used last frame, so a fitted first column would only ever grow
         // and never shorten its values when the window narrows. All text is monospace, so
@@ -517,7 +519,8 @@ pub fn wide_table_with_lead<const N: usize>(
                     .chain([headers[i].chars().count()])
                     .max()
                     .unwrap_or(0);
-                (chars as f32 * glyph).max(60.0)
+                // A glyph of air before each column, so the headers don't run together.
+                (chars as f32 * glyph + glyph).max(60.0)
             })
             .collect();
         let rest: f32 = widths.iter().map(|w| w + spacing).sum();

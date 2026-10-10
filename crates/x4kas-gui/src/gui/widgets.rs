@@ -212,6 +212,25 @@ fn card_natural_id(column: &Ui) -> egui::Id {
     column.unique_id().with("card_natural")
 }
 
+/// A card's inner margin.
+const CARD_MARGIN: Margin = Margin {
+    left: 10,
+    right: 10,
+    top: 11,
+    bottom: 6,
+};
+
+fn card_title_font() -> FontId {
+    FontId::monospace(theme::CARD_TITLE_SIZE)
+}
+
+/// The height a [`card`] adds around its contents: the title's top half, the margins
+/// and the border. For sizing contents to fill the rest of a tab.
+pub fn card_overhead(ui: &Ui) -> f32 {
+    let title_height = ui.fonts_mut(|f| f.row_height(&card_title_font()));
+    title_height / 2.0 + CARD_MARGIN.sum().y + 2.0
+}
+
 /// A [`card`] with extra widgets (e.g. a dropdown) set into the top border right after
 /// the title: `┌─ Title [1h ▾] ───┐`. Both closures get `state`, so they can share
 /// mutable data such as the app. Returns the card's rect (its border).
@@ -222,23 +241,17 @@ pub fn card_with_header<T: ?Sized>(
     add_header: impl FnOnce(&mut Ui, &mut T),
     add_contents: impl FnOnce(&mut Ui, &mut T),
 ) -> egui::Rect {
-    let font = FontId::monospace(theme::CARD_TITLE_SIZE);
-    let galley = ui
-        .painter()
-        .layout_no_wrap(format!(" {title} "), font, theme::ACCENT);
+    let galley =
+        ui.painter()
+            .layout_no_wrap(format!(" {title} "), card_title_font(), theme::ACCENT);
     let title_height = galley.size().y;
 
     // Room above the border for the top half of the title.
     ui.add_space(title_height / 2.0);
-    let margin = Margin {
-        left: 10,
-        right: 10,
-        top: 11,
-        bottom: 6,
-    };
+    let margin = CARD_MARGIN;
     let stroke = Stroke::new(1.0_f32, theme::BORDER_HI);
     // Everything but the contents: the title's top half, the margins and the border.
-    let overhead = title_height / 2.0 + margin.sum().y + 2.0 * stroke.width;
+    let overhead = card_overhead(ui);
     let stretch_id = card_stretch_id(ui);
     let stretch_to: Option<f32> = ui.data_mut(|d| d.remove_temp(stretch_id));
     let mut natural = 0.0;
@@ -457,6 +470,24 @@ pub fn kv(ui: &mut Ui, label: &str, value: impl Into<WidgetText>) {
         let response = ui.add(egui::Label::new(galley));
         if elided {
             response.on_hover_text(full);
+        }
+    });
+}
+
+/// A [`kv`] row whose value has a `long` and a `short` form: the long one when it fits
+/// the row, else the short one with the long one on hover (e.g. a timestamp with and
+/// without how long ago it was), so a narrow card never shows an ellipsis.
+pub fn kv_fit(ui: &mut Ui, label: &str, long: &str, short: &str) {
+    kv_with(ui, label, |ui| {
+        let font = egui::TextStyle::Body.resolve(ui.style());
+        let width = ui
+            .fonts_mut(|f| f.layout_no_wrap(long.to_string(), font, egui::Color32::WHITE))
+            .size()
+            .x;
+        if width <= ui.available_width() {
+            ui.label(long);
+        } else {
+            ui.label(short).on_hover_text(long);
         }
     });
 }
@@ -1319,12 +1350,23 @@ fn arc(path: &mut Vec<egui::Pos2>, center: egui::Pos2, radius: f32, from: f32, t
 /// [`table_row_height`] tall.
 pub fn page_table(ui: &mut Ui, max_height: f32) -> TableBuilder<'_> {
     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+    let max_height = whole_rows(ui, max_height, table_row_height(ui));
     TableBuilder::new(ui)
         .striped(true)
         // Interactive cells, so egui_extras highlights the hovered row.
         .sense(egui::Sense::click())
         .max_scroll_height(max_height)
         .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+}
+
+/// `height` rounded down to a whole number of `row_height`-tall rows (at least one), so
+/// a scrolling table body ends on a row's edge instead of cutting through its last row.
+/// An `egui_extras` table spaces its rows by the item spacing, which the last visible
+/// row doesn't need below it.
+pub fn whole_rows(ui: &Ui, height: f32, row_height: f32) -> f32 {
+    let spacing = ui.spacing().item_spacing.y;
+    let pitch = row_height + spacing;
+    ((height + spacing) / pitch).floor().max(1.0) * pitch - spacing
 }
 
 /// A [`page_table`] row's height: room for clickable cells (a selectable label is at

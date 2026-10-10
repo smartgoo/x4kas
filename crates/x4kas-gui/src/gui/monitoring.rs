@@ -276,8 +276,11 @@ fn table_height(ui: &Ui, fill: bool) -> f32 {
     if !fill {
         return TABLE_HEIGHT;
     }
-    let hint = 2.0 + ui.text_style_height(&egui::TextStyle::Small) + ui.spacing().item_spacing.y;
-    (ui.available_height() - hint).max(3.0 * ui.spacing().interact_size.y)
+    let spacing = ui.spacing().item_spacing.y;
+    // The table's header row (`wide_table_with_lead`) sits above the body of `height`.
+    let header = theme::ROW_HEIGHT + spacing;
+    let hint = 2.0 + ui.text_style_height(&egui::TextStyle::Small) + spacing;
+    (ui.available_height() - header - hint).max(3.0 * ui.spacing().interact_size.y)
 }
 
 fn ago(time_ms: u64) -> String {

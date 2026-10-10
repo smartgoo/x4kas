@@ -596,7 +596,7 @@ pub static CATALOG: &[FieldSpec] = &[
         Text,
         Record,
         "Scripts",
-        "The first 128 bytes of the payload as text (contains, starts_with)."
+        "The payload as text (contains, starts_with; case-insensitive, invalid UTF-8 becomes �)."
     ),
     field!(
         TxOutputScriptClass,

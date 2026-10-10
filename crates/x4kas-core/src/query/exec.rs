@@ -660,6 +660,20 @@ impl Ctx<'_> {
         Ok(row.record.as_ref().expect("just loaded"))
     }
 
+    /// The whole payload of `row`'s transaction, read through the snapshot.
+    fn payload(&self, row: &mut TxRow) -> Result<Vec<u8>> {
+        let slab = &self.slabs[row.slab];
+        let txid = row.txid;
+        let r = self.tx_record(row)?;
+        if r.payload_len as usize <= r.payload_head.len() {
+            return Ok(r.payload_head.clone());
+        }
+        Ok(match self.snapshot.get(&slab.payloads, txid)? {
+            Some(bytes) => bytes.to_vec(),
+            None => r.payload_head.clone(),
+        })
+    }
+
     fn cluster(&mut self, id: AddrId) -> Result<(AddrId, u32)> {
         if let Some(c) = self.clusters.get(&id) {
             return Ok(*c);
@@ -779,9 +793,8 @@ impl Ctx<'_> {
                                 if r.payload_len == 0 {
                                     Cell::Null
                                 } else {
-                                    Cell::Text(
-                                        String::from_utf8_lossy(&r.payload_head).into_owned(),
-                                    )
+                                    let payload = self.payload(tx)?;
+                                    Cell::Text(String::from_utf8_lossy(&payload).into_owned())
                                 }
                             }
                             TxCovenantCreated => Cell::Int(r.covenant_created as i64),
@@ -2088,6 +2101,33 @@ mod tests {
     /// block 1's coinbase (miner 9, pool-x, paying 7 and 8), a self transfer 2 → 2, a
     /// fan-out 1 → 2, 5, 6. Block 3 (hour 9): block 2's coinbase (miner 10, pool-y),
     /// a Kasia message 6 → 1. Address 2 is labelled "Exchange A", 9 "Pool X".
+    /// A payload is matched whole, not only its first `PAYLOAD_HEAD` bytes.
+    #[test]
+    fn payload_matches_past_the_head() {
+        let f = fixture();
+        let mut writer =
+            IndexWriter::new(f.store.store.clone(), Arc::new(f.labels.clone())).unwrap();
+        let mut payload = vec![b'x'; 4_000];
+        payload.extend_from_slice(b"the NEEDLE");
+        let mut long = tx(40, &[(6, 300)], &[(1, 290)]);
+        long.payload = Some(payload.clone());
+        writer
+            .apply(&crate::index::writer::testing::response(
+                vec![],
+                vec![chain_block(40, 9 * HOUR, vec![long])],
+            ))
+            .unwrap();
+        drop(writer);
+        let r = f.run("tx all time where payload contains \"needle\" select txid, payload");
+        assert_eq!(txids(&r), vec![40]);
+        assert_eq!(
+            r.rows[0][col(&r, "payload")],
+            Cell::Text(String::from_utf8(payload).unwrap())
+        );
+        let r = f.run("tx all time where payload starts_with \"xxxx\"");
+        assert_eq!(txids(&r), vec![40]);
+    }
+
     fn fixture() -> Fixture {
         let store = temp_store();
         let mut labels = LabelBook::base();
@@ -2305,6 +2345,11 @@ mod tests {
         assert_eq!(txids(&r), vec![13, 14]);
         let r = f.run("tx all time where payload contains \"HELLO\"");
         assert_eq!(txids(&r), vec![13]);
+        assert!(
+            f.run("tx all time where payload contains \"needle\"")
+                .rows
+                .is_empty()
+        );
         let r = f.run(&format!(
             "tx all time where accepting_block = {}",
             chain_hash(2)

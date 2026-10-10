@@ -762,8 +762,7 @@ pub struct TxView {
     pub lock_time: Option<u64>,
     pub subnetwork_id: Option<String>,
     pub payload: Option<Vec<u8>>,
-    /// The payload's full length when `payload` is only its head (the index keeps
-    /// `records::PAYLOAD_HEAD` bytes).
+    /// The payload's full length when `payload` is only part of it.
     pub payload_len: Option<usize>,
 }
 
@@ -843,11 +842,11 @@ impl TxView {
             version: detail.version,
             lock_time: detail.lock_time,
             subnetwork_id: (detail.subnetwork != "unknown").then(|| detail.subnetwork.to_string()),
-            // The index keeps the head of the payload; a truncated one is still worth
-            // showing (the Explorer says when it is).
-            payload_len: (detail.payload_len as usize > detail.payload_head.len())
+            // The index keeps the whole payload; should it hand back less (an index
+            // written before it did), the Explorer says how much is shown.
+            payload_len: (detail.payload_len as usize > detail.payload.len())
                 .then_some(detail.payload_len as usize),
-            payload: (detail.payload_len > 0).then_some(detail.payload_head),
+            payload: (detail.payload_len > 0).then_some(detail.payload),
         }
     }
 
@@ -1402,7 +1401,7 @@ mod tests {
             lock_time: Some(9),
             subnetwork: "native",
             payload_len: 5,
-            payload_head: b"hello".to_vec(),
+            payload: b"hello".to_vec(),
             ..TxDetail::minimal(&h('a'), &h('b'), 5, 6)
         });
         assert!(matches!(

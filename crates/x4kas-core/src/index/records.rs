@@ -37,8 +37,10 @@ pub fn slab_of(time_ms: u64) -> u64 {
     time_ms / SLAB_MS
 }
 
-/// How many bytes of a transaction's payload are kept (`IndexedTx::payload_head`):
-/// enough for a protocol marker or a short message, not an inscription's body.
+/// How many bytes of a transaction's payload the record keeps (`IndexedTx::payload_head`):
+/// enough for a protocol marker or a short message, so pages and scans that don't need
+/// the payload never read more. A longer payload is kept whole beside the record, in the
+/// slab's `pay_<n>` keyspace (`IndexStore::payload`).
 pub const PAYLOAD_HEAD: usize = 128;
 
 /// `TxInput::script_class`/`TxOutput::script_class` when the script wasn't in the
@@ -72,7 +74,8 @@ pub struct IndexedTx {
     pub subnetwork: Subnetwork,
     pub gas: Option<u64>,
     pub payload_len: u32,
-    /// The first [`PAYLOAD_HEAD`] bytes of the payload.
+    /// The first [`PAYLOAD_HEAD`] bytes of the payload (all of it when no longer; the
+    /// rest is in the slab's `payloads`).
     pub payload_head: Vec<u8>,
     /// Covenant-era opcodes used by the outputs' scripts and the redeem scripts the
     /// inputs revealed (`tx_inspect::OpcodeUsage::to_bits`).

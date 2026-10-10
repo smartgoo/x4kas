@@ -32,11 +32,13 @@ use fjall::{Database, Keyspace, KeyspaceCreateOptions};
 use serde::{Deserialize, Serialize};
 
 use crate::config;
-use records::{AddrId, Hash32, SLAB_MS, addr_key, decode, encode, parse_addr_key, slab_of};
+use records::{
+    AddrId, Hash32, IndexedTx, SLAB_MS, addr_key, decode, encode, parse_addr_key, slab_of,
+};
 
 /// Bumped when the on-disk layout or the meaning of stored data changes; an index with
 /// another format is discarded and rebuilt from the node.
-pub const FORMAT_VERSION: u32 = 6;
+pub const FORMAT_VERSION: u32 = 7;
 
 /// Block cache shared by all keyspaces.
 const CACHE_BYTES: u64 = 256 * 1024 * 1024;
@@ -112,6 +114,9 @@ pub struct Slab {
     pub blocks: Keyspace,
     /// `time_ms ‖ block_hash → ()`, those blocks by time
     pub time_blocks: Keyspace,
+    /// `txid → payload`, the whole payload of a transaction whose payload is longer than
+    /// the record's head (`records::PAYLOAD_HEAD`)
+    pub payloads: Keyspace,
 }
 
 impl Slab {
@@ -124,7 +129,7 @@ impl Slab {
     }
 
     /// Every keyspace of the slab.
-    pub fn keyspaces(&self) -> [&Keyspace; 9] {
+    pub fn keyspaces(&self) -> [&Keyspace; 10] {
         [
             &self.tx,
             &self.addr_tx,
@@ -135,7 +140,20 @@ impl Slab {
             &self.time_tx,
             &self.blocks,
             &self.time_blocks,
+            &self.payloads,
         ]
+    }
+
+    /// The whole payload of `tx` (`txid`'s record in this slab): its head when that is
+    /// all of it, else the stored payload (the head if that is missing).
+    pub fn payload(&self, txid: &Hash32, tx: &IndexedTx) -> Result<Vec<u8>> {
+        if tx.payload_len as usize <= tx.payload_head.len() {
+            return Ok(tx.payload_head.clone());
+        }
+        Ok(match self.payloads.get(txid)? {
+            Some(bytes) => bytes.to_vec(),
+            None => tx.payload_head.clone(),
+        })
     }
 
     /// Whether the slab holds anything timestamped within `from_ms..to_ms`.
@@ -494,6 +512,7 @@ fn open_slab(db: &Database, no: u64) -> Result<Slab> {
         time_tx: open("ttx", KeyspaceCreateOptions::default)?,
         blocks: open("blk", point_read_keyspace)?,
         time_blocks: open("tbk", KeyspaceCreateOptions::default)?,
+        payloads: open("pay", KeyspaceCreateOptions::default)?,
     })
 }
 

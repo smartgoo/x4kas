@@ -409,6 +409,11 @@ impl IndexWriter {
                     may_union,
                 } = converted;
                 self.put_tx(&mut batch, &mut overlay, &slab, &block, &txid, &tx)?;
+                if let Some(payload) = rpc_tx.payload.as_deref()
+                    && payload.len() > PAYLOAD_HEAD
+                {
+                    batch.insert(&slab.payloads, txid, payload);
+                }
                 self.touch_block(
                     &mut batch,
                     &mut block_records,
@@ -631,6 +636,9 @@ impl IndexWriter {
         tx: &IndexedTx,
     ) -> Result<()> {
         batch.remove(&slab.tx, *txid);
+        if tx.payload_len as usize > PAYLOAD_HEAD {
+            batch.remove(&slab.payloads, *txid);
+        }
         batch.remove(&slab.block_tx, block_tx_key(block, txid));
         batch.remove(&slab.time_tx, time_key(tx.time_ms, txid));
         if let Some(protocol) = tx.protocol {
@@ -1386,6 +1394,43 @@ mod tests {
     }
 
     #[test]
+    fn long_payloads_are_kept_whole_and_undone() {
+        let mut tw = writer();
+        let w = &mut tw.writer;
+        // The largest payload consensus allows in a block, give or take the 220 bytes of
+        // the rest of the transaction.
+        let long: Vec<u8> = (0..249_780u32).map(|i| (i % 251) as u8).collect();
+        let mut big = tx(1, &[(1, 100)], &[(2, 90)]);
+        big.payload = Some(long.clone());
+        let mut short = tx(2, &[(1, 50)], &[(2, 40)]);
+        short.payload = Some(b"short".to_vec());
+        w.apply(&response(
+            vec![],
+            vec![chain_block(1, 1_000, vec![big, short])],
+        ))
+        .unwrap();
+        let store = w.store();
+        let d = query::transaction(store, &hash(1).as_bytes())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (d.payload_len as usize, d.payload.len()),
+            (long.len(), long.len())
+        );
+        assert_eq!(d.payload, long);
+        let d = query::transaction(store, &hash(2).as_bytes())
+            .unwrap()
+            .unwrap();
+        assert_eq!(d.payload, b"short");
+        // Only the long one is stored beside its record.
+        let slab = &store.slabs()[0];
+        assert_eq!(slab.payloads.len().unwrap(), 1);
+
+        w.apply(&response(vec![chain_hash(1)], vec![])).unwrap();
+        assert!(w.store().slabs()[0].payloads.is_empty().unwrap());
+    }
+
+    #[test]
     fn a_large_response_is_committed_in_chunks() {
         let mut tw = writer();
         let w = &mut tw.writer;
@@ -1745,7 +1790,7 @@ mod tests {
         );
         assert_eq!(d.subnetwork, "native");
         assert_eq!(d.payload_len, 300);
-        assert_eq!(d.payload_head.len(), PAYLOAD_HEAD);
+        assert_eq!(d.payload, vec![0x61; 300]);
         assert_eq!(d.sig_ops, 3);
         assert_eq!((d.covenant_created, d.covenant_spent), (1, 1));
         assert_eq!(d.inputs[0].script_class, Some("P2PK"));

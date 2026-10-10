@@ -28,9 +28,10 @@ use super::analytics::{self, panel_card};
 use super::theme;
 use super::widgets::{
     CARD_GAP, address as address_widget, block_hash, card, card_with_header, command_key,
-    copy_value, kv, kv_columns, kv_grid, kv_with, label_search_popup, link_table, open_page,
-    or_dash, page_table, placeholder, primary_button, set_in_explorer, subheader, table_header,
-    table_row_height, transaction_id, transaction_id_in_block, weighted_columns, yes_no,
+    copy_value, copy_value_of, kv, kv_columns, kv_grid, kv_with, label_search_popup, link_table,
+    open_page, or_dash, page_table, placeholder, primary_button, set_in_explorer, subheader,
+    table_header, table_row_height, transaction_id, transaction_id_in_block, weighted_columns,
+    yes_no,
 };
 use x4kas_core::app::{AnalyticsPanel, App, ConnectionStatus, ExportOrigin};
 use x4kas_core::controller::{CommandSender, UiCommand};
@@ -46,6 +47,9 @@ use x4kas_core::tx_inspect::TransactionProtocol;
 
 /// Blocks listed on the Home page.
 const LATEST_BLOCKS: usize = 25;
+/// Bytes (or characters) of a payload shown on a transaction page; the copy icon copies
+/// all of it.
+const PAYLOAD_PREVIEW: usize = 256;
 /// Rows a page's table shows before scrolling.
 const TABLE_MAX_HEIGHT: f32 = 420.0;
 /// The height of a block's parents, children and merge set lists before scrolling.
@@ -1238,23 +1242,43 @@ pub(super) fn tx_overview(ui: &mut Ui, app: &App, view: &TxView) {
                         ui.label("empty");
                     }
                     Some(payload) => {
+                        // A payload may be a quarter of a megabyte: show its start, copy
+                        // all of it.
+                        let preview = &payload[..payload.len().min(PAYLOAD_PREVIEW)];
                         match view.payload_text() {
-                            Some(text) => copy_value(ui, &text, "Copy payload"),
+                            Some(text) => {
+                                let shown: String = text.chars().take(PAYLOAD_PREVIEW).collect();
+                                copy_value_of(ui, &shown, &text, "Copy payload");
+                            }
                             None => {
-                                let hex: String =
-                                    payload.iter().map(|b| format!("{b:02x}")).collect();
-                                copy_value(ui, &hex, "Copy payload (hex)");
+                                let hex = |bytes: &[u8]| -> String {
+                                    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+                                    let mut s = String::with_capacity(bytes.len() * 2);
+                                    for b in bytes {
+                                        s.push(DIGITS[(b >> 4) as usize] as char);
+                                        s.push(DIGITS[(b & 0xf) as usize] as char);
+                                    }
+                                    s
+                                };
+                                copy_value_of(
+                                    ui,
+                                    &hex(preview),
+                                    &hex(payload),
+                                    "Copy payload (hex)",
+                                );
                             }
                         }
-                        if let Some(len) = view.payload_len {
-                            ui.label(
-                                RichText::new(format!(
-                                    "(first {} of {} bytes)",
-                                    payload.len(),
+                        let total = view.payload_len.unwrap_or(payload.len());
+                        if total > PAYLOAD_PREVIEW || view.payload_len.is_some() {
+                            let note = match view.payload_len {
+                                Some(len) => format!(
+                                    "({} of {} bytes)",
+                                    format_number(payload.len() as u64),
                                     format_number(len as u64)
-                                ))
-                                .weak(),
-                            );
+                                ),
+                                None => format!("({} bytes)", format_number(total as u64)),
+                            };
+                            ui.label(RichText::new(note).weak());
                         }
                     }
                     None => {

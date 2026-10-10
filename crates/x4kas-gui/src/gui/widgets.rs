@@ -1065,11 +1065,18 @@ pub(super) fn labels(ctx: &egui::Context) -> Option<Arc<LabelBook>> {
 
 /// `value` as plain text, fitted like [`fit_label`], followed by a copy icon.
 pub fn copy_value(ui: &mut Ui, value: &str, hint: &str) {
+    copy_value_of(ui, value, value, hint);
+}
+
+/// [`copy_value`] showing `shown` (a preview of a value too long to lay out, such as a
+/// whole payload) while the copy icon copies `value`.
+pub fn copy_value_of(ui: &mut Ui, shown: &str, value: &str, hint: &str) {
     if !ui.layout().is_horizontal() {
-        ui.horizontal(|ui| copy_value(ui, value, hint));
+        ui.horizontal(|ui| copy_value_of(ui, shown, value, hint));
         return;
     }
-    let id = ui.id().with(("copy_value", value));
+    let full = shown;
+    let id = ui.id().with(("copy_value", full));
     // Right to left (a right-aligned value): the icon first so it lands after the value.
     let rtl = ui.layout().prefer_right_to_left();
     if rtl {
@@ -1083,12 +1090,12 @@ pub fn copy_value(ui: &mut Ui, value: &str, hint: &str) {
         } else {
             COPY_ICON_SIZE + COPY_ICON_GAP
         };
-    let shown = fit_text(ui, value, room);
+    let fitted = fit_text(ui, full, room);
     let label = icon_gap(ui, !rtl, COPY_ICON_GAP, |ui| {
-        ui.add(egui::Label::new(shown.as_str()).wrap_mode(egui::TextWrapMode::Extend))
+        ui.add(egui::Label::new(fitted.as_str()).wrap_mode(egui::TextWrapMode::Extend))
     });
-    if shown != value {
-        label.on_hover_text(value);
+    if fitted != full {
+        label.on_hover_text(full);
     }
     if !rtl {
         copy_button(ui, id, value, hint);

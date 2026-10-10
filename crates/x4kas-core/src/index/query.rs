@@ -190,9 +190,9 @@ pub struct TxDetail {
     pub subnetwork: &'static str,
     pub gas: Option<u64>,
     pub payload_len: u32,
-    /// The first `records::PAYLOAD_HEAD` bytes of the payload.
+    /// The whole payload.
     #[serde(with = "serde_bytes_hex")]
-    pub payload_head: Vec<u8>,
+    pub payload: Vec<u8>,
     pub opcodes: OpcodeUsageDetail,
     pub covenant_created: u16,
     pub covenant_spent: u16,
@@ -223,7 +223,7 @@ impl TxDetail {
             subnetwork: "unknown",
             gas: None,
             payload_len: 0,
-            payload_head: Vec::new(),
+            payload: Vec::new(),
             opcodes: OpcodeUsageDetail::default(),
             covenant_created: 0,
             covenant_spent: 0,
@@ -913,7 +913,7 @@ pub fn transaction(store: &IndexStore, txid: &Hash32) -> Result<Option<TxDetail>
             subnetwork: tx.subnetwork.label(),
             gas: tx.gas,
             payload_len: tx.payload_len,
-            payload_head: tx.payload_head.clone(),
+            payload: slab.payload(txid, &tx)?,
             opcodes: OpcodeUsage::from_bits(tx.opcodes).into(),
             covenant_created: tx.covenant_created,
             covenant_spent: tx.covenant_spent,

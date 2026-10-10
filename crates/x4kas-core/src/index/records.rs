@@ -566,6 +566,15 @@ pub fn peer_key(addr: AddrId, peer: AddrId) -> [u8; 8] {
     key
 }
 
+/// Key of a revealed redeem script (`rds_<n>`): `txid ‖ input index`, so a transaction's
+/// redeem scripts sort by input under its id.
+pub fn redeem_key(txid: &Hash32, input: u32) -> [u8; 36] {
+    let mut key = [0u8; 36];
+    key[..32].copy_from_slice(txid);
+    key[32..].copy_from_slice(&input.to_be_bytes());
+    key
+}
+
 /// Key of a counterparty delta (`apr_<n>`): `addr_id ‖ peer_id ‖ seq`, the commit's
 /// [`crate::index::Manifest::seq`], so an address's deltas sort by peer under its prefix
 /// and every commit's delta for a pair is its own entry.

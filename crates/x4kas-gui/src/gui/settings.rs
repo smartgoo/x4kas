@@ -1,7 +1,8 @@
 //! Settings page (`SettingsPage`, opened from the ⚙ button in the top bar): a left
 //! navigation of sections with the chosen one's content on the right, in place of the
 //! active tab. Address Labels: the public list (its sources and refresh) and the user's
-//! every known label (label, address, source; add, edit in place, remove).
+//! every known label (label, address, source; add, edit in place, remove). Index: the
+//! opt-in data the address index keeps (full payloads, redeem scripts).
 
 use eframe::egui::{self, RichText, TextEdit, Ui};
 use egui_extras::{Column, TableBuilder};
@@ -13,6 +14,7 @@ use super::widgets::{
     placeholder, primary_button, request_label, section_title,
 };
 use x4kas_core::app::App;
+use x4kas_core::config::IndexFeature;
 use x4kas_core::controller::{CommandSender, UiCommand};
 use x4kas_core::format::{format_duration, format_number};
 use x4kas_core::labels::LabelSource;
@@ -27,14 +29,16 @@ const TABLE_HEIGHT: f32 = 420.0;
 enum Section {
     #[default]
     AddressLabels,
+    Index,
 }
 
 impl Section {
-    const ALL: [Self; 1] = [Self::AddressLabels];
+    const ALL: [Self; 2] = [Self::AddressLabels, Self::Index];
 
     fn label(self) -> &'static str {
         match self {
             Section::AddressLabels => "Address Labels",
+            Section::Index => "Index",
         }
     }
 }
@@ -99,6 +103,7 @@ impl SettingsPage {
             .show_inside(ui, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| match self.section {
                     Section::AddressLabels => self.address_labels(ui, app, cmd_tx),
+                    Section::Index => index(ui, app, cmd_tx),
                 });
             });
     }
@@ -353,5 +358,36 @@ fn labels_table(ui: &mut Ui, rows: &[LabelRow], confirm_delete: &mut Option<(Str
                     });
                 });
             });
+    });
+}
+
+/// The opt-in data the address index keeps, each a switch with what it costs. A change
+/// applies from the writer's next batch.
+fn index(ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
+    card(ui, "Optional Data", |ui| {
+        let mut settings = app.index_settings;
+        for feature in IndexFeature::ALL {
+            let mut on = settings.enabled(feature);
+            if ui.checkbox(&mut on, feature.label()).changed() {
+                settings.set(feature, on);
+                // Shown at once; the controller saves it and the writer picks it up.
+                app.index_settings = settings;
+                let _ = cmd_tx.send(UiCommand::IndexSettingsSet(settings));
+            }
+            ui.indent(("index_feature_doc", feature.label()), |ui| {
+                ui.label(RichText::new(feature.doc()).weak());
+            });
+            ui.add_space(6.0);
+        }
+        ui.label(
+            RichText::new(
+                "A change applies to transactions indexed from that moment on. To index the whole \
+                 window, Resync from the Analyzer chip in the status bar.",
+            )
+            .weak(),
+        );
+        if let Some(err) = &app.index_settings_error {
+            ui.label(RichText::new(err).color(theme::ERROR));
+        }
     });
 }

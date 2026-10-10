@@ -84,11 +84,16 @@ fn run(
     while let Some(batch) = receiver.blocking_recv() {
         // The latest labels for the clustering guard, and the node's pruning point
         // (which polling keeps in the app state) to prune behind.
-        let (labels, floor) = {
+        let (labels, floor, features) = {
             let app = app.blocking_read();
-            (app.labels.clone(), app.node.pruning_point_timestamp_ms)
+            (
+                app.labels.clone(),
+                app.node.pruning_point_timestamp_ms,
+                app.index_settings,
+            )
         };
         writer.set_labels(labels);
+        writer.set_features(features);
         let started = Instant::now();
         let result = writer.apply(&batch);
         batches += 1;

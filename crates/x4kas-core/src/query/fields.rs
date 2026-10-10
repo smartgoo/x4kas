@@ -4,6 +4,7 @@
 //! parser's suggestions and the CLI's `query fields`.
 
 use super::{Entity, Op};
+use crate::config::{IndexFeature, IndexSettings};
 
 /// A field of one entity. The variants are prefixed by entity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -37,6 +38,7 @@ pub enum FieldId {
     TxChangeMax,
     TxPayloadLen,
     TxPayload,
+    TxRedeemScript,
     TxIntrospection,
     TxSeqcommit,
     TxZk,
@@ -596,7 +598,18 @@ pub static CATALOG: &[FieldSpec] = &[
         Text,
         Record,
         "Scripts",
-        "The payload as text (contains, starts_with; case-insensitive, invalid UTF-8 becomes �)."
+        "The payload as text (contains, starts_with; case-insensitive, invalid UTF-8 becomes �). Needs \"Index full payloads\" in Settings."
+    ),
+    field!(
+        TxRedeemScript,
+        "redeem_script",
+        "Redeem script",
+        Transactions,
+        Text,
+        Record,
+        "Scripts",
+        "The redeem script of any P2SH spend, in hex (contains, starts_with). Needs \"Index redeem scripts\" in Settings.",
+        multi
     ),
     field!(
         TxOutputScriptClass,
@@ -1272,6 +1285,23 @@ impl FieldId {
 
     pub fn is_multi(self) -> bool {
         self.spec().multi
+    }
+
+    /// The opt-in index feature the field reads, if any: without it the index doesn't
+    /// keep the field's data, so the field can't be used.
+    pub fn feature(self) -> Option<IndexFeature> {
+        match self {
+            Self::TxPayload => Some(IndexFeature::FullPayloads),
+            Self::TxRedeemScript => Some(IndexFeature::RedeemScripts),
+            _ => None,
+        }
+    }
+
+    /// Why the field can't be used with `settings`, if it can't.
+    pub fn unavailable(self, settings: &IndexSettings) -> Option<String> {
+        self.feature()
+            .filter(|f| !settings.enabled(*f))
+            .map(IndexFeature::off_reason)
     }
 }
 

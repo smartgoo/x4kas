@@ -207,8 +207,9 @@ async fn run(
             _ = stop.notified() => return,
             _ = ticker.tick() => {}
         }
-        let (position, queries, labels, watchlist, prune_floor, raised) = {
+        let (position, queries, labels, watchlist, prune_floor, raised, features) = {
             let app = app.read().await;
+            let features = app.index_settings;
             (
                 app.chain.position.map(|p| p.chain_block),
                 app.query.saved.watched().cloned().collect::<Vec<_>>(),
@@ -221,6 +222,7 @@ async fn run(
                     .iter()
                     .map(|e| (e.query_id.clone(), e.primary.clone()))
                     .collect::<Vec<_>>(),
+                features,
             )
         };
         watched.retain(|id, _| queries.iter().any(|q| q.id == *id));
@@ -271,6 +273,7 @@ async fn run(
                     watchlist: &run_watchlist,
                     now_ms: now,
                     prune_floor_ms: prune_floor,
+                    features,
                 };
                 let mut ctl = RunControl::with_budget(RUN_BUDGET);
                 ctl.cancel = run_cancel;
@@ -376,6 +379,7 @@ mod tests {
             primary: Some(0),
             time_column: None,
             balances_pending: false,
+            notes: Vec::new(),
         }
     }
 

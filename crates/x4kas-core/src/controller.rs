@@ -96,6 +96,8 @@ pub enum UiCommand {
     },
     /// Fetch the public label list now.
     RefreshLabels,
+    /// Save the index's opt-in features; the writer applies them from its next batch.
+    IndexSettingsSet(crate::config::IndexSettings),
     /// Discard the index store (and with it the Dashboard's analytics) and rebuild it
     /// from the node, from scratch. Only with a direct node.
     Resync,
@@ -189,6 +191,10 @@ impl Controller {
             let mut app = self.app.write().await;
             app.watch.list = Watchlist::load().unwrap_or_default();
             app.labels = Arc::new(labels::LabelBook::load());
+            match crate::config::IndexSettings::load() {
+                Ok(settings) => app.index_settings = settings,
+                Err(e) => app.index_settings_error = Some(format!("load index settings: {e}")),
+            }
             match SavedQueries::load() {
                 Ok(list) => app.query.saved = list,
                 Err(e) => app.query.save_error = Some(format!("load queries: {e}")),
@@ -218,6 +224,7 @@ impl Controller {
                 UiCommand::WatchSet(list) => self.set_watchlist(list).await,
                 UiCommand::SetLabel { address, name } => self.set_label(address, name).await,
                 UiCommand::RefreshLabels => self.refresh_labels(),
+                UiCommand::IndexSettingsSet(settings) => self.index_settings_set(settings).await,
                 UiCommand::Resync => self.resync().await,
                 UiCommand::Shutdown(done) => {
                     self.stop_all().await;
@@ -729,7 +736,7 @@ impl Controller {
         self.stop_query().await;
         let store = self.index.clone();
         let rpc = self.rpc.clone();
-        let (generation, cancel, labels, watchlist, prune_floor, not_open) = {
+        let (generation, cancel, labels, watchlist, prune_floor, not_open, features) = {
             let mut app = self.app.write().await;
             let (generation, cancel) = app.query.start(query.clone(), name);
             app.mark_dirty();
@@ -740,6 +747,7 @@ impl Controller {
                 app.watch.list.clone(),
                 app.node.pruning_point_timestamp_ms,
                 index_not_open(&app),
+                app.index_settings,
             )
         };
         let app = self.app.clone();
@@ -756,6 +764,7 @@ impl Controller {
                             watchlist: &watchlist,
                             now_ms: now_ms(),
                             prune_floor_ms: prune_floor,
+                            features,
                         };
                         let mut last = Instant::now();
                         let mut ctl = RunControl {
@@ -853,6 +862,14 @@ impl Controller {
             app.watch.status.last_error = Some(format!("save labels: {e}"));
         }
         app.labels = Arc::new(book);
+        app.mark_dirty();
+    }
+
+    async fn index_settings_set(&mut self, settings: crate::config::IndexSettings) {
+        let saved = settings.save();
+        let mut app = self.app.write().await;
+        app.index_settings = settings;
+        app.index_settings_error = saved.err().map(|e| format!("save index settings: {e}"));
         app.mark_dirty();
     }
 

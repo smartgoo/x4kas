@@ -1133,6 +1133,11 @@ pub struct App {
     pub labels: Arc<LabelBook>,
     /// The public list fetch (on launch and periodically, `labels::start_label_refresh`).
     pub label_refresh: LabelRefresh,
+    /// The index's opt-in features (`~/.x4kas/index.toml`); the writer reads them before
+    /// every batch.
+    pub index_settings: crate::config::IndexSettings,
+    /// Why the last change to `index_settings` couldn't be saved.
+    pub index_settings_error: Option<String>,
     pub market_data: Option<MarketData>,
     /// Why the last market fetch failed; cleared by the next success.
     pub market_error: Option<String>,

@@ -94,9 +94,129 @@ impl ConnectionSettings {
     }
 }
 
+/// What the address index keeps beyond what every page and query needs, each costing
+/// disk space in proportion to how much of it the chain carries. Off by default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IndexFeature {
+    /// Payloads longer than a record's head (`index::records::PAYLOAD_HEAD`), up to
+    /// ~250 KB each.
+    FullPayloads,
+    /// The redeem script every P2SH spend reveals.
+    RedeemScripts,
+}
+
+impl IndexFeature {
+    pub const ALL: [Self; 2] = [Self::FullPayloads, Self::RedeemScripts];
+
+    /// The setting's name, as Settings shows it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::FullPayloads => "Index full payloads",
+            Self::RedeemScripts => "Index redeem scripts",
+        }
+    }
+
+    /// What the setting does and costs.
+    pub fn doc(self) -> &'static str {
+        match self {
+            Self::FullPayloads => {
+                "Keep every transaction's whole payload, so queries can search all of it and \
+                 transaction pages show it. If disabled, only the first 128 bytes are kept. \
+                 This can consume a significant amount of disk space."
+            }
+            Self::RedeemScripts => {
+                "Keep the redeem script every P2SH spend reveals, so queries can search its \
+                 bytes (multisig keys, time locks, covenant code). This can consume a \
+                 significant amount of disk space."
+            }
+        }
+    }
+
+    /// The CLI flag that sets it (`x4kas-cli index settings`).
+    pub fn flag(self) -> &'static str {
+        match self {
+            Self::FullPayloads => "--full-payloads",
+            Self::RedeemScripts => "--redeem-scripts",
+        }
+    }
+
+    /// Why a query field that needs this can't be used while it's off.
+    pub fn off_reason(self) -> String {
+        format!(
+            "{} is off: turn it on in Settings › Index (or `x4kas-cli index settings {} on`). \
+             It applies to transactions indexed from then on; Resync to cover the whole window.",
+            self.label(),
+            self.flag()
+        )
+    }
+}
+
+/// Which [`IndexFeature`]s are on (`~/.x4kas/index.toml`). The index writer reads it
+/// before every batch, so a change applies from the next one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexSettings {
+    #[serde(default)]
+    pub full_payloads: bool,
+    #[serde(default)]
+    pub redeem_scripts: bool,
+}
+
+impl IndexSettings {
+    pub fn path() -> PathBuf {
+        data_dir().join("index.toml")
+    }
+
+    pub fn load() -> Result<Self> {
+        let path = Self::path();
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        Ok(toml::from_str(&std::fs::read_to_string(&path)?)?)
+    }
+
+    pub fn save(&self) -> Result<()> {
+        let path = Self::path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, toml::to_string_pretty(self)?)?;
+        Ok(())
+    }
+
+    pub fn enabled(&self, feature: IndexFeature) -> bool {
+        match feature {
+            IndexFeature::FullPayloads => self.full_payloads,
+            IndexFeature::RedeemScripts => self.redeem_scripts,
+        }
+    }
+
+    pub fn set(&mut self, feature: IndexFeature, on: bool) {
+        match feature {
+            IndexFeature::FullPayloads => self.full_payloads = on,
+            IndexFeature::RedeemScripts => self.redeem_scripts = on,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn index_settings_default_off_and_round_trip() {
+        let s = IndexSettings::default();
+        assert!(IndexFeature::ALL.iter().all(|f| !s.enabled(*f)));
+        let mut s = s;
+        s.set(IndexFeature::RedeemScripts, true);
+        let text = toml::to_string_pretty(&s).unwrap();
+        assert_eq!(toml::from_str::<IndexSettings>(&text).unwrap(), s);
+        // An empty file is all off.
+        assert_eq!(
+            toml::from_str::<IndexSettings>("").unwrap(),
+            IndexSettings::default()
+        );
+        assert!(IndexFeature::FullPayloads.off_reason().contains("Settings"));
+    }
 
     #[test]
     fn url_validation() {

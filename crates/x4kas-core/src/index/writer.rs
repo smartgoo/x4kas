@@ -21,15 +21,16 @@ use super::cluster::{self, CHANGE_THRESHOLD, Clusters, OutputTrait};
 use super::records::{
     AddrId, AddrStats, BlockKind, BlockRecord, Hash32, IndexedTx, PAYLOAD_HEAD, Payout, PeerDelta,
     SCRIPT_UNKNOWN, Subnetwork, TxInput, TxOutput, addr_key, addr_tx_key, block_tx_key, decode,
-    encode, encode_delta, peer_delta_key, protocol_tx_key, time_key,
+    encode, encode_delta, peer_delta_key, protocol_tx_key, redeem_key, time_key,
 };
 use super::{IndexStore, Manifest, Position, Slab, analytics};
 use crate::analytics::AnalyticsEngine;
+use crate::config::IndexSettings;
 use crate::format::now_ms;
 use crate::labels::LabelBook;
 use crate::tx_inspect::{
     OpcodeUsage, ScriptClass, detect_protocol, output_script_opcodes, parse_coinbase_payload,
-    redeem_script_opcodes, script_address, script_class,
+    redeem_script, redeem_script_opcodes, script_address, script_class,
 };
 
 /// Interned addresses kept in memory; the map is cleared when it grows past this.
@@ -77,6 +78,8 @@ pub struct IndexWriter {
     labels: Arc<LabelBook>,
     /// The Dashboard's metrics, persisted with every batch.
     analytics: AnalyticsEngine,
+    /// The opt-in data to keep (full payloads, redeem scripts).
+    features: IndexSettings,
 }
 
 /// A converted transaction with what clustering needs to know about it.
@@ -285,6 +288,7 @@ impl IndexWriter {
             intern_cache: HashMap::new(),
             labels,
             analytics,
+            features: IndexSettings::default(),
         })
     }
 
@@ -305,6 +309,11 @@ impl IndexWriter {
     /// when labels change, so the writer is handed the latest before each batch).
     pub fn set_labels(&mut self, labels: Arc<LabelBook>) {
         self.labels = labels;
+    }
+
+    /// Keep the opt-in data `features` turns on, from the next batch.
+    pub fn set_features(&mut self, features: IndexSettings) {
+        self.features = features;
     }
 
     /// Apply one VSPC v2 response: undo its removed chain blocks, index its added ones,
@@ -409,11 +418,7 @@ impl IndexWriter {
                     may_union,
                 } = converted;
                 self.put_tx(&mut batch, &mut overlay, &slab, &block, &txid, &tx)?;
-                if let Some(payload) = rpc_tx.payload.as_deref()
-                    && payload.len() > PAYLOAD_HEAD
-                {
-                    batch.insert(&slab.payloads, txid, payload);
-                }
+                self.put_opt_in(&mut batch, &slab, &txid, rpc_tx);
                 self.touch_block(
                     &mut batch,
                     &mut block_records,
@@ -447,6 +452,10 @@ impl IndexWriter {
             (manifest.txs_indexed + (report.txs - txs_before) as u64).saturating_sub(txs_undone);
         manifest.blocks_indexed = manifest.blocks_indexed.saturating_add_signed(blocks_delta);
         manifest.seq = seq;
+        if let Some(first_ms) = blocks.iter().find_map(|b| b.chain_block_header.timestamp) {
+            let fresh = self.manifest.position.is_none();
+            manifest.track_features(&self.features, first_ms, fresh);
+        }
         batch.insert(
             self.store.meta_keyspace(),
             "manifest",
@@ -636,8 +645,12 @@ impl IndexWriter {
         tx: &IndexedTx,
     ) -> Result<()> {
         batch.remove(&slab.tx, *txid);
+        // What the opt-in features kept, whether or not they are still on.
         if tx.payload_len as usize > PAYLOAD_HEAD {
             batch.remove(&slab.payloads, *txid);
+        }
+        for (input, _) in slab.redeem_scripts_of(txid)? {
+            batch.remove(&slab.redeem_scripts, redeem_key(txid, input));
         }
         batch.remove(&slab.block_tx, block_tx_key(block, txid));
         batch.remove(&slab.time_tx, time_key(tx.time_ms, txid));
@@ -663,6 +676,39 @@ impl IndexWriter {
                 .apply(amount, 0, true);
         }
         Ok(())
+    }
+
+    /// What the opt-in features keep of `rpc_tx` beyond its record: the whole payload when
+    /// longer than the record's head, the redeem script of every P2SH spend.
+    fn put_opt_in(
+        &self,
+        batch: &mut WriteBatch,
+        slab: &Slab,
+        txid: &Hash32,
+        rpc_tx: &RpcOptionalTransaction,
+    ) {
+        if self.features.full_payloads
+            && let Some(payload) = rpc_tx.payload.as_deref()
+            && payload.len() > PAYLOAD_HEAD
+        {
+            batch.insert(&slab.payloads, *txid, payload);
+        }
+        if self.features.redeem_scripts {
+            for (i, input) in rpc_tx.inputs.iter().enumerate() {
+                let p2sh = input
+                    .verbose_data
+                    .as_ref()
+                    .and_then(|vd| vd.utxo_entry.as_ref())
+                    .and_then(|u| u.verbose_data.as_ref())
+                    .and_then(|v| v.script_public_key_address.as_ref())
+                    .is_some_and(|a| a.version == Version::ScriptHash);
+                if p2sh
+                    && let Some(script) = input.signature_script.as_deref().and_then(redeem_script)
+                {
+                    batch.insert(&slab.redeem_scripts, redeem_key(txid, i as u32), script);
+                }
+            }
+        }
     }
 
     /// The id for `address`, assigning (and writing) a new one if it's unseen; the flag
@@ -1397,6 +1443,10 @@ mod tests {
     fn long_payloads_are_kept_whole_and_undone() {
         let mut tw = writer();
         let w = &mut tw.writer;
+        w.set_features(IndexSettings {
+            full_payloads: true,
+            ..IndexSettings::default()
+        });
         // The largest payload consensus allows in a block, give or take the 220 bytes of
         // the rest of the transaction.
         let long: Vec<u8> = (0..249_780u32).map(|i| (i % 251) as u8).collect();
@@ -1428,6 +1478,74 @@ mod tests {
 
         w.apply(&response(vec![chain_hash(1)], vec![])).unwrap();
         assert!(w.store().slabs()[0].payloads.is_empty().unwrap());
+    }
+
+    #[test]
+    fn redeem_scripts_are_opt_in_and_undone() {
+        let mut tw = writer();
+        let w = &mut tw.writer;
+        // A P2SH spend revealing a 2-of-2 multisig redeem script, then a plain spend.
+        let redeem = {
+            let mut r = vec![0x52, 0x20];
+            r.extend([0x11; 32]);
+            r.push(0x20);
+            r.extend([0x22; 32]);
+            r.extend([0x52, 0xae]);
+            r
+        };
+        let sig = |redeem: &[u8]| {
+            let mut s = vec![0x41];
+            s.extend([0x33; 65]);
+            s.push(0x4c);
+            s.push(redeem.len() as u8);
+            s.extend_from_slice(redeem);
+            s
+        };
+        let spend = |id: u64| {
+            let mut t = tx(id, &[(1, 100), (2, 50)], &[(3, 140)]);
+            spend_from_script(&mut t, 0, 9, sig(&redeem));
+            t
+        };
+
+        // Off (the default): nothing kept.
+        w.apply(&response(
+            vec![],
+            vec![chain_block(1, 1_000, vec![spend(1)])],
+        ))
+        .unwrap();
+        assert!(w.store().slabs()[0].redeem_scripts.is_empty().unwrap());
+        assert_eq!(w.manifest().redeem_scripts_from_ms, None);
+
+        // On: the P2SH input's redeem script is kept under its input, the plain one not.
+        w.set_features(IndexSettings {
+            redeem_scripts: true,
+            ..IndexSettings::default()
+        });
+        w.apply(&response(
+            vec![],
+            vec![chain_block(2, 2_000, vec![spend(2)])],
+        ))
+        .unwrap();
+        let slab = &w.store().slabs()[0];
+        assert_eq!(
+            slab.redeem_scripts_of(&hash(2).as_bytes()).unwrap(),
+            vec![(0, redeem.clone())]
+        );
+        assert!(
+            slab.redeem_scripts_of(&hash(1).as_bytes())
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(w.manifest().redeem_scripts_from_ms, Some(2_000));
+        assert_eq!(w.manifest().full_payloads_from_ms, None);
+
+        // A reorg takes it away; turning the feature off forgets when it started.
+        w.apply(&response(vec![chain_hash(2)], vec![])).unwrap();
+        assert!(w.store().slabs()[0].redeem_scripts.is_empty().unwrap());
+        w.set_features(IndexSettings::default());
+        w.apply(&response(vec![], vec![chain_block(3, 3_000, vec![])]))
+            .unwrap();
+        assert_eq!(w.manifest().redeem_scripts_from_ms, None);
     }
 
     #[test]
@@ -1790,7 +1908,8 @@ mod tests {
         );
         assert_eq!(d.subnetwork, "native");
         assert_eq!(d.payload_len, 300);
-        assert_eq!(d.payload, vec![0x61; 300]);
+        // Full payloads are opt-in: by default only the head is kept.
+        assert_eq!(d.payload, vec![0x61; PAYLOAD_HEAD]);
         assert_eq!(d.sig_ops, 3);
         assert_eq!((d.covenant_created, d.covenant_spent), (1, 1));
         assert_eq!(d.inputs[0].script_class, Some("P2PK"));

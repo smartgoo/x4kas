@@ -399,6 +399,7 @@ mod tests {
             primary: None,
             time_column: Some(0),
             balances_pending: false,
+            notes: Vec::new(),
         };
         let csv = result_csv(&result);
         let lines: Vec<&str> = csv.lines().collect();

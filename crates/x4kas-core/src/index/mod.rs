@@ -89,6 +89,49 @@ pub struct Manifest {
     /// (`records::peer_delta_key`), so no commit overwrites another's.
     #[serde(default)]
     pub seq: u64,
+    /// The time of the first chain block indexed with each opt-in feature on since it
+    /// was last turned on (`config::IndexFeature`); `None` while it is off. Queries over
+    /// earlier transactions say they can't see what wasn't kept.
+    #[serde(default)]
+    pub full_payloads_from_ms: Option<u64>,
+    #[serde(default)]
+    pub redeem_scripts_from_ms: Option<u64>,
+}
+
+impl Manifest {
+    /// Since when `feature` has been indexed, if it is.
+    pub fn feature_from_ms(&self, feature: crate::config::IndexFeature) -> Option<u64> {
+        match feature {
+            crate::config::IndexFeature::FullPayloads => self.full_payloads_from_ms,
+            crate::config::IndexFeature::RedeemScripts => self.redeem_scripts_from_ms,
+        }
+    }
+
+    fn feature_from_mut(&mut self, feature: crate::config::IndexFeature) -> &mut Option<u64> {
+        match feature {
+            crate::config::IndexFeature::FullPayloads => &mut self.full_payloads_from_ms,
+            crate::config::IndexFeature::RedeemScripts => &mut self.redeem_scripts_from_ms,
+        }
+    }
+
+    /// Record which features this commit indexed with: a feature turned on starts at
+    /// `first_ms` (the commit's first chain block), or at 0 (everything) when this is the
+    /// index's first commit (`fresh`); one turned off forgets its start.
+    pub fn track_features(
+        &mut self,
+        settings: &crate::config::IndexSettings,
+        first_ms: u64,
+        fresh: bool,
+    ) {
+        for feature in crate::config::IndexFeature::ALL {
+            let from = self.feature_from_mut(feature);
+            if !settings.enabled(feature) {
+                *from = None;
+            } else if from.is_none() {
+                *from = Some(if fresh { 0 } else { first_ms });
+            }
+        }
+    }
 }
 
 /// The keyspaces of one six-hour slab.
@@ -115,8 +158,11 @@ pub struct Slab {
     /// `time_ms ‖ block_hash → ()`, those blocks by time
     pub time_blocks: Keyspace,
     /// `txid → payload`, the whole payload of a transaction whose payload is longer than
-    /// the record's head (`records::PAYLOAD_HEAD`)
+    /// the record's head (`records::PAYLOAD_HEAD`), while `IndexFeature::FullPayloads` is on
     pub payloads: Keyspace,
+    /// `txid ‖ input → redeem script`, what each P2SH spend revealed, while
+    /// `IndexFeature::RedeemScripts` is on
+    pub redeem_scripts: Keyspace,
 }
 
 impl Slab {
@@ -129,7 +175,7 @@ impl Slab {
     }
 
     /// Every keyspace of the slab.
-    pub fn keyspaces(&self) -> [&Keyspace; 10] {
+    pub fn keyspaces(&self) -> [&Keyspace; 11] {
         [
             &self.tx,
             &self.addr_tx,
@@ -141,7 +187,21 @@ impl Slab {
             &self.blocks,
             &self.time_blocks,
             &self.payloads,
+            &self.redeem_scripts,
         ]
+    }
+
+    /// The redeem scripts `txid` revealed, by input, oldest input first.
+    pub fn redeem_scripts_of(&self, txid: &Hash32) -> Result<Vec<(u32, Vec<u8>)>> {
+        let mut out = Vec::new();
+        for guard in self.redeem_scripts.prefix(txid) {
+            let (key, value) = guard.into_inner()?;
+            if let Some(index) = key.get(32..36) {
+                let index = u32::from_be_bytes(index.try_into().expect("four bytes"));
+                out.push((index, value.to_vec()));
+            }
+        }
+        Ok(out)
     }
 
     /// The whole payload of `tx` (`txid`'s record in this slab): its head when that is
@@ -513,6 +573,7 @@ fn open_slab(db: &Database, no: u64) -> Result<Slab> {
         blocks: open("blk", point_read_keyspace)?,
         time_blocks: open("tbk", KeyspaceCreateOptions::default)?,
         payloads: open("pay", KeyspaceCreateOptions::default)?,
+        redeem_scripts: open("rds", KeyspaceCreateOptions::default)?,
     })
 }
 

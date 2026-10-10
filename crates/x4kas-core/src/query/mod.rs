@@ -185,6 +185,28 @@ impl Query {
             .unwrap_or_else(|| fields::default_columns(self.entity))
     }
 
+    /// Every field the query reads: its conditions, columns (or grouping) and ordering.
+    pub fn fields_used(&self) -> Vec<FieldId> {
+        let mut out: Vec<FieldId> = self.conditions().iter().map(|c| c.field).collect();
+        match &self.group {
+            Some(group) => {
+                out.extend(group.keys.iter().filter_map(|k| match k {
+                    GroupKey::Field(f) => Some(*f),
+                    GroupKey::TimeBucket(_) => None,
+                }));
+                out.extend(group.metrics.iter().filter_map(|m| m.field()));
+            }
+            None => out.extend(self.columns()),
+        }
+        out.extend(self.order.iter().filter_map(|(k, _)| match k {
+            OrderKey::Field(f) => Some(*f),
+            _ => None,
+        }));
+        out.sort_unstable_by_key(|f| *f as usize);
+        out.dedup();
+        out
+    }
+
     /// Every condition, in order.
     pub fn conditions(&self) -> Vec<&Condition> {
         let mut out = Vec::new();

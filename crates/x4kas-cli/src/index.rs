@@ -13,6 +13,7 @@ use tokio::sync::RwLock;
 
 use x4kas_core::app::{App, ChainPhase};
 use x4kas_core::chain_stream::{self, StreamStart};
+use x4kas_core::config::{IndexFeature, IndexSettings};
 use x4kas_core::format::{format_number, now_ms};
 use x4kas_core::index::{self, IndexStore};
 use x4kas_core::polling::{PollingHandles, create_and_start_rpc};
@@ -30,6 +31,55 @@ pub enum IndexCommand {
     },
     /// What the index on disk holds
     Status,
+    /// Show or change the opt-in data the index keeps (off by default; `index run` and
+    /// the GUI apply a change from their next launch, the GUI's Settings › Index at once)
+    Settings {
+        /// Keep every transaction's whole payload, not only its first 128 bytes: on|off
+        #[arg(long, value_parser = parse_on_off)]
+        full_payloads: Option<bool>,
+        /// Keep the redeem script every P2SH spend reveals: on|off
+        #[arg(long, value_parser = parse_on_off)]
+        redeem_scripts: Option<bool>,
+    },
+}
+
+fn parse_on_off(s: &str) -> Result<bool, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "on" | "true" | "yes" | "1" => Ok(true),
+        "off" | "false" | "no" | "0" => Ok(false),
+        _ => Err(format!("expected on or off, not \"{s}\"")),
+    }
+}
+
+/// Show the index settings, after applying any change.
+fn settings(full_payloads: Option<bool>, redeem_scripts: Option<bool>) -> Result<()> {
+    let mut s = IndexSettings::load()?;
+    let before = s;
+    if let Some(on) = full_payloads {
+        s.set(IndexFeature::FullPayloads, on);
+    }
+    if let Some(on) = redeem_scripts {
+        s.set(IndexFeature::RedeemScripts, on);
+    }
+    if s != before {
+        s.save()?;
+    }
+    let mut out = serde_json::Map::new();
+    for f in IndexFeature::ALL {
+        out.insert(
+            f.flag().trim_start_matches("--").replace('-', "_"),
+            serde_json::Value::Bool(s.enabled(f)),
+        );
+    }
+    println!("{}", serde_json::to_string_pretty(&out)?);
+    if s != before {
+        eprintln!(
+            "saved {}: applies to transactions indexed from the next launch of `index run` \
+             or the GUI on; Resync to cover the whole window",
+            IndexSettings::path().display()
+        );
+    }
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -49,6 +99,10 @@ struct Status {
 pub async fn run(url: Option<&str>, network: &str, cmd: IndexCommand) -> Result<()> {
     match cmd {
         IndexCommand::Status => status(network),
+        IndexCommand::Settings {
+            full_payloads,
+            redeem_scripts,
+        } => settings(full_payloads, redeem_scripts),
         IndexCommand::Run {
             backfill_hours,
             progress,
@@ -96,7 +150,10 @@ pub(crate) fn start_pipeline(
     network: &str,
     backfill: Option<Duration>,
 ) -> Result<Pipeline> {
-    let app = Arc::new(RwLock::new(App::default()));
+    let app = Arc::new(RwLock::new(App {
+        index_settings: IndexSettings::load()?,
+        ..App::default()
+    }));
     let mut handles = PollingHandles::default();
 
     let store = Arc::new(IndexStore::open(network)?);

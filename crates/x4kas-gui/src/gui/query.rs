@@ -21,6 +21,7 @@ use super::widgets::{
     transaction_id,
 };
 use x4kas_core::app::{App, ChainPhase, ExportOrigin};
+use x4kas_core::config::IndexSettings;
 use x4kas_core::controller::{CommandSender, ExportRequest, UiCommand};
 use x4kas_core::explorer::ExplorerPage;
 use x4kas_core::format::{
@@ -30,7 +31,7 @@ use x4kas_core::format::{
 use x4kas_core::index::export::ExportFormat;
 use x4kas_core::index::hex;
 use x4kas_core::query::exec::{Cell, ColumnSource, MAX_RESULT_ROWS, ResultSet};
-use x4kas_core::query::fields::{self, Cost};
+use x4kas_core::query::fields::{self, Cost, FieldSpec};
 use x4kas_core::query::saved::{QueryWatch, SavedQueries, SavedQuery, presets};
 use x4kas_core::query::text;
 use x4kas_core::query::watch::QueryEvent;
@@ -174,6 +175,19 @@ struct Draft {
 }
 
 /// The first field of `entity` a new condition starts with.
+/// A field in a picker, selected or not: greyed out, with why on hover, while the index
+/// doesn't keep the field's data (`FieldId::unavailable`). Returns whether it was picked.
+fn field_option(ui: &mut Ui, selected: bool, spec: &FieldSpec, features: &IndexSettings) -> bool {
+    let why = spec.id.unavailable(features);
+    let response = ui
+        .add_enabled(why.is_none(), Button::selectable(selected, spec.label))
+        .on_hover_text(spec.doc);
+    match why {
+        Some(why) => response.on_disabled_hover_text(why).clicked(),
+        None => response.clicked(),
+    }
+}
+
 fn first_field(entity: Entity) -> FieldId {
     fields::for_entity(entity)
         .find(|f| f.cost != Cost::Node)
@@ -651,6 +665,8 @@ pub struct QueryTab {
     modified: bool,
     /// The Alerts section is folded.
     alerts_folded: bool,
+    /// The index's opt-in features this frame: fields they gate are greyed out.
+    features: IndexSettings,
 }
 
 impl Default for QueryTab {
@@ -675,6 +691,7 @@ impl Default for QueryTab {
             builder_height: 0.0,
             modified: false,
             alerts_folded: false,
+            features: IndexSettings::default(),
         };
         tab.sync_text();
         tab
@@ -774,8 +791,21 @@ impl QueryTab {
         }
     }
 
+    /// Why the builder's query can't run with the index's features: a field it reads
+    /// whose data isn't kept (from a saved query or the text line; the pickers grey them).
+    fn feature_block(&mut self) -> Option<String> {
+        let q = self.draft.build(false).ok()?;
+        q.fields_used().into_iter().find_map(|f| {
+            f.unavailable(&self.features)
+                .map(|why| format!("{}: {why}", f.label()))
+        })
+    }
+
     fn run(&mut self, app: &App, cmd_tx: &CommandSender) {
-        if let Err(why) = Self::ready(app) {
+        if let Err(why) = Self::ready(app).and_then(|()| match self.feature_block() {
+            Some(why) => Err(why),
+            None => Ok(()),
+        }) {
             self.draft_error = Some(why);
             return;
         }
@@ -798,6 +828,7 @@ impl QueryTab {
         close: bool,
         modal: bool,
     ) {
+        self.features = app.index_settings;
         if let Some(q) = app.query.preload.take() {
             let id = app.query.preload_id.take();
             self.load(&q, id);
@@ -1204,10 +1235,12 @@ impl QueryTab {
                 let entity = tab.draft.entity;
                 let mut next_key = tab.next_key;
                 let mut unused = None;
+                let features = tab.features;
                 changed |= group_ui(
                     ui,
                     &mut tab.draft.root,
                     entity,
+                    &features,
                     &mut next_key,
                     true,
                     &mut unused,
@@ -1311,6 +1344,7 @@ impl QueryTab {
     fn group_ui(&mut self, ui: &mut Ui) -> bool {
         let mut changed = false;
         let entity = self.draft.entity;
+        let features = self.features;
         ui.horizontal(|ui| {
             field_label(ui, "Group");
             if ui
@@ -1364,11 +1398,12 @@ impl QueryTab {
                             }
                             for spec in fields::for_entity(entity).filter(|f| f.cost != Cost::Node)
                             {
-                                if ui
-                                    .selectable_label(!k.bucket && k.field == spec.id, spec.label)
-                                    .on_hover_text(spec.doc)
-                                    .clicked()
-                                {
+                                if field_option(
+                                    ui,
+                                    !k.bucket && k.field == spec.id,
+                                    spec,
+                                    &features,
+                                ) {
                                     k.bucket = false;
                                     k.field = spec.id;
                                     changed = true;
@@ -1422,10 +1457,12 @@ impl QueryTab {
                                                     | FieldKind::Float
                                             ))
                                 }) {
-                                    changed |= ui
-                                        .selectable_value(&mut m.field, spec.id, spec.label)
-                                        .on_hover_text(spec.doc)
-                                        .changed();
+                                    if field_option(ui, m.field == spec.id, spec, &features)
+                                        && m.field != spec.id
+                                    {
+                                        m.field = spec.id;
+                                        changed = true;
+                                    }
                                 }
                             });
                     }
@@ -1480,6 +1517,8 @@ impl QueryTab {
         let entity = self.draft.entity;
         // What can be ordered by: fields, or with a grouping its keys and metrics.
         let mut options: Vec<(OrderKey, String)> = Vec::new();
+        // Why an option can't be picked (a field whose index feature is off).
+        let mut off: Vec<(OrderKey, String)> = Vec::new();
         if self.draft.grouped {
             for k in &self.draft.keys {
                 if k.bucket {
@@ -1499,6 +1538,9 @@ impl QueryTab {
         } else {
             for spec in fields::for_entity(entity).filter(|f| f.cost != Cost::Node) {
                 options.push((OrderKey::Field(spec.id), spec.label.to_string()));
+                if let Some(why) = spec.id.unavailable(&self.features) {
+                    off.push((OrderKey::Field(spec.id), why));
+                }
             }
         }
         ui.horizontal(|ui| {
@@ -1514,7 +1556,17 @@ impl QueryTab {
                     .selected_text(current)
                     .show_ui(ui, |ui| {
                         for (key, label) in &options {
-                            changed |= ui.selectable_value(&mut o.target, *key, label).changed();
+                            let why = off.iter().find(|(k, _)| k == key).map(|(_, w)| w);
+                            let response = ui
+                                .add_enabled(
+                                    why.is_none(),
+                                    Button::selectable(o.target == *key, label.as_str()),
+                                )
+                                .on_disabled_hover_text(why.cloned().unwrap_or_default());
+                            if response.clicked() && o.target != *key {
+                                o.target = *key;
+                                changed = true;
+                            }
                         }
                     });
                 if ui
@@ -1562,6 +1614,7 @@ impl QueryTab {
     }
 
     fn columns_menu(&mut self, ui: &mut Ui) -> bool {
+        let features = self.features;
         let mut changed = false;
         let entity = self.draft.entity;
         let shown: Vec<FieldId> = self
@@ -1586,13 +1639,17 @@ impl QueryTab {
                                 {
                                     let mut on = columns.contains(&spec.id);
                                     let last = on && columns.len() == 1;
+                                    // A column already shown can always be taken away.
+                                    let off = spec.id.unavailable(&features).filter(|_| !on);
                                     if ui
                                         .add_enabled(
-                                            !last,
+                                            !last && off.is_none(),
                                             egui::Checkbox::new(&mut on, spec.label),
                                         )
                                         .on_hover_text(spec.doc)
-                                        .on_disabled_hover_text("At least one column")
+                                        .on_disabled_hover_text(
+                                            off.unwrap_or_else(|| "At least one column".into()),
+                                        )
                                         .changed()
                                     {
                                         if on {
@@ -1660,7 +1717,10 @@ impl QueryTab {
 
     fn buttons(&mut self, ui: &mut Ui, app: &App, cmd_tx: &CommandSender) {
         ui.horizontal(|ui| {
-            let ready = Self::ready(app);
+            let ready = Self::ready(app).and_then(|()| match self.feature_block() {
+                Some(why) => Err(why),
+                None => Ok(()),
+            });
             let running = app.query.is_running();
             if running {
                 if ui
@@ -2407,6 +2467,11 @@ fn status_line(ui: &mut Ui, app: &App, text: &str) {
         ui.label(RichText::new(format!("⚠ {}", partial.label())).color(theme::WARN))
             .on_hover_text(partial.advice());
     }
+    // An opt-in index feature turned on after the window starts.
+    if !result.notes.is_empty() {
+        ui.label(RichText::new("⚠ older rows incomplete").color(theme::WARN))
+            .on_hover_text(result.notes.join("\n\n"));
+    }
     // The index may not reach as far back as the query asked.
     if let Some((from, _)) = app.chain.coverage
         && result.window.0 < from
@@ -2678,6 +2743,7 @@ fn group_ui(
     ui: &mut Ui,
     node: &mut Node,
     entity: Entity,
+    features: &IndexSettings,
     next_key: &mut u64,
     root: bool,
     remove: &mut Option<u64>,
@@ -2731,10 +2797,18 @@ fn group_ui(
         for child in children.iter_mut() {
             match child {
                 Node::Group { .. } => {
-                    changed |= group_ui(ui, child, entity, next_key, false, &mut remove_child);
+                    changed |= group_ui(
+                        ui,
+                        child,
+                        entity,
+                        features,
+                        next_key,
+                        false,
+                        &mut remove_child,
+                    );
                 }
                 Node::Cond { .. } => {
-                    changed |= condition_ui(ui, child, entity, &mut remove_child);
+                    changed |= condition_ui(ui, child, entity, features, &mut remove_child);
                 }
             }
         }
@@ -2789,7 +2863,13 @@ fn group_ui(
 }
 
 /// One condition row: `[not] field operator value ×`.
-fn condition_ui(ui: &mut Ui, node: &mut Node, entity: Entity, remove: &mut Option<u64>) -> bool {
+fn condition_ui(
+    ui: &mut Ui,
+    node: &mut Node,
+    entity: Entity,
+    features: &IndexSettings,
+    remove: &mut Option<u64>,
+) -> bool {
     let Node::Cond {
         key,
         not,
@@ -2817,8 +2897,9 @@ fn condition_ui(ui: &mut Ui, node: &mut Node, entity: Entity, remove: &mut Optio
                     for spec in fields::for_entity(entity)
                         .filter(|f| f.category == category && f.cost != Cost::Node)
                     {
-                        ui.selectable_value(field, spec.id, spec.label)
-                            .on_hover_text(spec.doc);
+                        if field_option(ui, *field == spec.id, spec, features) {
+                            *field = spec.id;
+                        }
                     }
                 }
             });

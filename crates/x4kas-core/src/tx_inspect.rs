@@ -417,6 +417,11 @@ pub fn output_script_opcodes(script: &[u8]) -> OpcodeUsage {
 
 /// Opcodes in the redeem script revealed by a P2SH spend: the signature
 /// script's final push. Only meaningful when the spent output is P2SH.
+/// The redeem script a P2SH spend reveals: the signature script's last push.
+pub fn redeem_script(signature_script: &[u8]) -> Option<&[u8]> {
+    Pushes::new(signature_script).last().map(|push| push.data)
+}
+
 pub fn redeem_script_opcodes(signature_script: &[u8]) -> OpcodeUsage {
     let mut prev = None;
     let mut last = None;

@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use fjall::{Readable, Snapshot};
 use kaspa_addresses::{Address, Version};
 
@@ -24,6 +24,7 @@ use super::fields::{Cost, FieldKind};
 use super::{
     Condition, Dir, Entity, FieldId, Filter, GroupKey, Metric, Op, OrderKey, Query, Value,
 };
+use crate::config::{IndexFeature, IndexSettings};
 use crate::format::{format_duration_ms, format_sompi_exact, format_utc};
 use crate::index::records::{
     AddrId, AddrStats, BlockKind, BlockRecord, Hash32, IndexedTx, PeerDelta, SUMMARY_COINBASE,
@@ -63,6 +64,8 @@ pub struct Inputs<'a> {
     pub now_ms: u64,
     /// Slabs ending before this are being pruned: skip them.
     pub prune_floor_ms: Option<u64>,
+    /// The index's opt-in features: a field whose data isn't kept can't be queried.
+    pub features: IndexSettings,
 }
 
 /// A progress report callback.
@@ -332,6 +335,9 @@ pub struct ResultSet {
     pub time_column: Option<usize>,
     /// Address rows with a `balance` column: the node fills it in afterwards.
     pub balances_pending: bool,
+    /// What the rows can't show, in a sentence each: an opt-in feature turned on after
+    /// the window starts, so earlier transactions lack its data.
+    pub notes: Vec<String>,
 }
 
 impl ResultSet {
@@ -355,6 +361,7 @@ impl ResultSet {
             primary: None,
             time_column: None,
             balances_pending: false,
+            notes: Vec::new(),
         }
     }
 }
@@ -660,6 +667,18 @@ impl Ctx<'_> {
         Ok(row.record.as_ref().expect("just loaded"))
     }
 
+    /// The redeem scripts `row`'s transaction revealed, by input, read through the
+    /// snapshot.
+    fn redeem_scripts(&self, row: &TxRow) -> Result<Vec<Vec<u8>>> {
+        let slab = &self.slabs[row.slab];
+        let mut out = Vec::new();
+        for guard in self.snapshot.prefix(&slab.redeem_scripts, row.txid) {
+            let (_, value) = guard.into_inner()?;
+            out.push(value.to_vec());
+        }
+        Ok(out)
+    }
+
     /// The whole payload of `row`'s transaction, read through the snapshot.
     fn payload(&self, row: &mut TxRow) -> Result<Vec<u8>> {
         let slab = &self.slabs[row.slab];
@@ -797,6 +816,12 @@ impl Ctx<'_> {
                                     Cell::Text(String::from_utf8_lossy(&payload).into_owned())
                                 }
                             }
+                            TxRedeemScript => Cell::List(
+                                self.redeem_scripts(tx)?
+                                    .into_iter()
+                                    .map(|script| Cell::Text(hex_bytes(&script)))
+                                    .collect(),
+                            ),
                             TxCovenantCreated => Cell::Int(r.covenant_created as i64),
                             TxCovenantSpent => Cell::Int(r.covenant_spent as i64),
                             TxSigOps => Cell::Int(r.sig_ops as i64),
@@ -1389,6 +1414,12 @@ impl Meter<'_> {
 pub fn run(inputs: &Inputs<'_>, q: &Query, ctl: &mut RunControl) -> Result<ResultSet> {
     q.validate()?;
     let plan = plan(q, inputs.store, inputs.now_ms, inputs.prune_floor_ms)?;
+    // The oldest transaction the window can hold: its start, or the index's if later.
+    let oldest = plan
+        .window
+        .0
+        .max(inputs.store.coverage().map_or(0, |(from, _)| from));
+    let notes = feature_notes(inputs, q, oldest)?;
     let explain = plan.explain();
     let store = inputs.store;
     let all_slabs = store.slabs();
@@ -2046,7 +2077,63 @@ pub fn run(inputs: &Inputs<'_>, q: &Query, ctl: &mut RunControl) -> Result<Resul
         primary,
         time_column,
         balances_pending,
+        notes,
     })
+}
+
+/// Lowercase hex of any bytes.
+fn hex_bytes(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(DIGITS[(b >> 4) as usize] as char);
+        s.push(DIGITS[(b & 0xf) as usize] as char);
+    }
+    s
+}
+
+/// Refuse a query reading a field whose opt-in feature is off; for one that is on, say
+/// when the window starts before the feature was turned on.
+fn feature_notes(inputs: &Inputs<'_>, q: &Query, window_from: u64) -> Result<Vec<String>> {
+    let mut features: Vec<IndexFeature> = Vec::new();
+    for field in q.fields_used() {
+        if let Some(reason) = field.unavailable(&inputs.features) {
+            bail!(
+                "{} needs data the index doesn't keep. {reason}",
+                field.name()
+            );
+        }
+        if let Some(f) = field.feature()
+            && !features.contains(&f)
+        {
+            features.push(f);
+        }
+    }
+    let manifest = inputs.store.manifest()?;
+    Ok(features
+        .into_iter()
+        .filter_map(|f| {
+            let from = manifest.feature_from_ms(f);
+            let what = match f {
+                IndexFeature::FullPayloads => {
+                    "only their first 128 bytes of payload"
+                }
+                IndexFeature::RedeemScripts => "no redeem scripts",
+            };
+            match from {
+                Some(from) if from <= window_from => None,
+                Some(from) => Some(format!(
+                    "{} has been on since {}: transactions indexed before then have {what}. Resync to index the whole window with it.",
+                    f.label(),
+                    format_utc(from)
+                )),
+                None => Some(format!(
+                    "{} was just turned on: the index hasn't written a batch with it yet, so these transactions have {what}.",
+                    f.label()
+                )),
+            }
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -2071,6 +2158,8 @@ mod tests {
         store: TempStore,
         labels: LabelBook,
         watchlist: Watchlist,
+        /// Every opt-in feature on, unless a test turns one off.
+        features: IndexSettings,
     }
 
     impl Fixture {
@@ -2081,6 +2170,7 @@ mod tests {
                 watchlist: &self.watchlist,
                 now_ms: NOW,
                 prune_floor_ms: None,
+                features: self.features,
             }
         }
 
@@ -2107,6 +2197,7 @@ mod tests {
         let f = fixture();
         let mut writer =
             IndexWriter::new(f.store.store.clone(), Arc::new(f.labels.clone())).unwrap();
+        writer.set_features(f.features);
         let mut payload = vec![b'x'; 4_000];
         payload.extend_from_slice(b"the NEEDLE");
         let mut long = tx(40, &[(6, 300)], &[(1, 290)]);
@@ -2128,6 +2219,82 @@ mod tests {
         assert_eq!(txids(&r), vec![40]);
     }
 
+    /// A field whose data the index doesn't keep is refused, saying how to turn it on;
+    /// once on, a window older than the feature gets a note.
+    #[test]
+    fn opt_in_fields_are_refused_while_off_and_noted_when_late() {
+        let mut f = fixture();
+        f.features = IndexSettings::default();
+        let q = parse("tx all time where redeem_script contains \"52ae\"").unwrap();
+        let err = run(&f.inputs(), &q, &mut RunControl::default())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("redeem_script"), "{err}");
+        assert!(err.contains("Settings"), "{err}");
+        // A column counts too, not only a condition.
+        let q = parse("tx all time select txid, payload").unwrap();
+        assert!(run(&f.inputs(), &q, &mut RunControl::default()).is_err());
+
+        // On, and on since the fixture was indexed: no note.
+        f.features = IndexSettings {
+            full_payloads: true,
+            redeem_scripts: true,
+        };
+        assert!(
+            f.run("tx all time where payload is not null")
+                .notes
+                .is_empty()
+        );
+        // Turned on later than the window's start: the result says so.
+        let store = &f.store.store;
+        let mut manifest = store.manifest().unwrap();
+        manifest.full_payloads_from_ms = Some(8 * HOUR + 1);
+        store
+            .meta_keyspace()
+            .insert("manifest", IndexStore::encode_manifest(&manifest).unwrap())
+            .unwrap();
+        let r = f.run("tx all time where payload is not null");
+        assert_eq!(r.notes.len(), 1);
+        assert!(r.notes[0].contains("Index full payloads"), "{}", r.notes[0]);
+        // A field without a feature never gets one.
+        assert!(f.run("tx all time where fee > 0 sompi").notes.is_empty());
+    }
+
+    /// The redeem script of a P2SH spend, matched as hex.
+    #[test]
+    fn redeem_scripts_match_as_hex() {
+        let f = fixture();
+        let mut writer =
+            IndexWriter::new(f.store.store.clone(), Arc::new(f.labels.clone())).unwrap();
+        writer.set_features(f.features);
+        let mut t = tx(41, &[(6, 300)], &[(1, 290)]);
+        crate::index::writer::testing::spend_from_script(
+            &mut t,
+            0,
+            77,
+            vec![0x01, 0xaa, 0x04, 0x52, 0xb1, 0x75, 0xae],
+        );
+        writer
+            .apply(&crate::index::writer::testing::response(
+                vec![],
+                vec![chain_block(41, 9 * HOUR, vec![t])],
+            ))
+            .unwrap();
+        drop(writer);
+        let r =
+            f.run("tx all time where redeem_script contains \"B175\" select txid, redeem_script");
+        assert_eq!(txids(&r), vec![41]);
+        assert_eq!(
+            r.rows[0][col(&r, "redeem_script")],
+            Cell::List(vec![Cell::Text("52b175ae".into())])
+        );
+        assert!(
+            f.run("tx all time where redeem_script contains \"dead\"")
+                .rows
+                .is_empty()
+        );
+    }
+
     fn fixture() -> Fixture {
         let store = temp_store();
         let mut labels = LabelBook::base();
@@ -2136,6 +2303,10 @@ mod tests {
             .unwrap();
         labels.set_heuristic(&address(9).to_string(), "Pool X");
         let mut writer = IndexWriter::new(store.store.clone(), Arc::new(labels.clone())).unwrap();
+        writer.set_features(IndexSettings {
+            full_payloads: true,
+            redeem_scripts: true,
+        });
         let mut krc = tx(3, &[(4, 1_000)], &[(5, 990)]);
         krc.inputs[0].signature_script = Some(vec![7, b'k', b'a', b's', b'p', b'l', b'e', b'x']);
         let mut cb1 = coinbase(10, 9, "1.2.3", "pool-x", 11, 500, &[(7, 400), (8, 100)]);
@@ -2177,6 +2348,10 @@ mod tests {
             store,
             labels,
             watchlist,
+            features: IndexSettings {
+                full_payloads: true,
+                redeem_scripts: true,
+            },
         }
     }
 

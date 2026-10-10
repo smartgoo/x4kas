@@ -251,6 +251,7 @@ fn run_offline(network: &str, cmd: QueryCommand) -> Result<()> {
                 watchlist: &watchlist,
                 now_ms: now_ms(),
                 prune_floor_ms: None,
+                features: x4kas_core::config::IndexSettings::load()?,
             };
             if let Ok(plan) = exec::plan(&query, &store, inputs.now_ms, None)
                 && scans_everything(&query, &plan.source)
@@ -281,6 +282,9 @@ fn run_offline(network: &str, cmd: QueryCommand) -> Result<()> {
             let result = exec::run(&inputs, &query, &mut ctl)?;
             if shown && result.elapsed >= Duration::from_secs(1) {
                 eprintln!();
+            }
+            for note in &result.notes {
+                eprintln!("note: {note}");
             }
             let canonical = query.to_text();
             let mut notes: Vec<&str> = Vec::new();
@@ -796,6 +800,7 @@ mod tests {
             primary: None,
             time_column: None,
             balances_pending: false,
+            notes: Vec::new(),
         };
         assert_eq!(exit_code(&result), 0);
         result.partial = Some(x4kas_core::query::exec::Partial::ScanCap);
@@ -878,6 +883,7 @@ mod tests {
             primary: Some(0),
             time_column: None,
             balances_pending: false,
+            notes: Vec::new(),
         };
         let (t, shortened) = render_table(&result);
         assert!(shortened, "the ids were shortened");

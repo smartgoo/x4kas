@@ -252,12 +252,6 @@ pub fn presets() -> Vec<SavedQuery> {
             "tx last 1d where output_total >= 100000 KAS and not is_coinbase order by output_total desc limit 200",
         ),
         preset(
-            "krc-inscriptions",
-            "KRC inscriptions",
-            "KRC-20 inscription transactions of the last day.",
-            "tx last 1d where protocol = krc limit 500",
-        ),
-        preset(
             "fee-outliers",
             "Fee outliers",
             "Transactions paying more than 10 sompi per gram in the last 6 hours.",
@@ -274,12 +268,6 @@ pub fn presets() -> Vec<SavedQuery> {
             "Covenant and ZK scripts",
             "Transactions using introspection, the ZK precompile or covenants in the last week.",
             "tx last 7d where zk or introspection or covenant_created > 0 or covenant_spent > 0 limit 500",
-        ),
-        preset(
-            "dust-fanouts",
-            "Dust fan-outs",
-            "Transactions with 50 outputs or more, none over 1 KAS.",
-            "tx last 1d where output_count >= 50 and max_output < 1 KAS order by output_count desc limit 200",
         ),
         preset(
             "mining-share",
@@ -360,7 +348,7 @@ mod tests {
                 .iter()
                 .any(|p| p.query().unwrap().entity == Entity::Payouts)
         );
-        assert!(presets.iter().any(|p| p.id == "preset:krc-inscriptions"));
+        assert!(presets.iter().any(|p| p.id == "preset:large-transfers"));
         assert!(presets.iter().any(|p| p.id == "preset:busiest-addresses"));
     }
 
@@ -372,16 +360,16 @@ mod tests {
         assert_eq!(list.find("mine").unwrap().id, mine.id);
         assert_eq!(list.find(&mine.id).unwrap().name, "Mine");
         assert_eq!(
-            list.find("KRC inscriptions").unwrap().id,
-            "preset:krc-inscriptions"
+            list.find("Large transfers").unwrap().id,
+            "preset:large-transfers"
         );
         assert_eq!(
-            list.find("preset:krc-inscriptions").unwrap().name,
-            "KRC inscriptions"
+            list.find("preset:large-transfers").unwrap().name,
+            "Large transfers"
         );
         assert_eq!(
-            list.find("krc-inscriptions").unwrap().name,
-            "KRC inscriptions"
+            list.find("large-transfers").unwrap().name,
+            "Large transfers"
         );
         assert_eq!(
             list.find(" Hourly-Throughput ").unwrap().name,

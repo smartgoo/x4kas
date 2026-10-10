@@ -56,6 +56,16 @@ x4kas builds its own index of the chain locally. Most other app features (analyt
 - **Reorgs**: changes to the selected chain are undone and reapplied, committed atomically.
 - **Owned by**: the GUI while connected to a node, or `x4kas-cli index run` headless. **Only one of these processes at a time holds exclusive access to the index (this will be fixed in the future)**
 
+### Pruning
+
+The index prunes similar to a Kaspa node.
+
+- After every batch, any 6-hour slab that ends before the node's pruning point is deleted as a whole. This removes its transactions, blocks, per-address history and stats, counterparties, and opt-in payloads and redeem scripts. Because whole slabs are dropped, up to six extra hours past the pruning point can stay on disk until the next slab boundary passes.
+- Address totals, balance history and query results cover the retained slabs only, not the address's full lifetime. The Analyzer hover and `x4kas-cli index status` show how far back the index reaches.
+- Dashboard analytics keep their own 24-hour window and are pruned separately.
+- Not pruned yet: the address-to-id table and the ownership clusters. They grow for as long as the index runs.
+- If the index falls behind the node's pruning point, for example after being offline for a long time, it restarts from the pruning point. The time in between is never indexed.
+
 ## CLI Usage
 
 `x4kas-cli` runs headless (no display needed). Global options: `--url ws://host:17110` (default: public resolver), `--network mainnet|testnet-10|testnet-11`.

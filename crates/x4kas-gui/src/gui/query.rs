@@ -659,6 +659,8 @@ pub struct QueryTab {
     sorted_result: u64,
     /// Run on the next frame (Ctrl+Enter, a query handed in).
     run_requested: bool,
+    /// A query was loaded: the result of another one is cleared on the next frame.
+    loaded_text: Option<String>,
     /// The builder card's height last frame, so the Results card can fill the rest.
     builder_height: f32,
     /// The draft differs from the loaded saved query (computed once per frame).
@@ -688,6 +690,7 @@ impl Default for QueryTab {
             sort: None,
             sorted_result: 0,
             run_requested: false,
+            loaded_text: None,
             builder_height: 0.0,
             modified: false,
             alerts_folded: false,
@@ -711,6 +714,7 @@ impl QueryTab {
         self.text_dirty = false;
         self.text_error = None;
         self.draft_error = None;
+        self.loaded_text = Some(query.to_text());
         self.sync_text();
     }
 
@@ -833,6 +837,17 @@ impl QueryTab {
             let id = app.query.preload_id.take();
             self.load(&q, id);
             self.run_requested = true;
+        }
+        // Loading a query blanks the Results of another one (and drops its run).
+        if let Some(text) = self.loaded_text.take() {
+            let shows_other = |q: Option<&Query>| q.is_some_and(|q| q.to_text() != text);
+            if shows_other(app.query.result_query.as_ref())
+                || shows_other(app.query.run.as_ref().map(|r| &r.query))
+                || shows_other(app.query.cancelled.as_ref().map(|c| &c.query))
+                || app.query.error.is_some()
+            {
+                app.query.clear_result();
+            }
         }
         // Run with Cmd/Ctrl+Enter, even from a text field (it types nothing), unless a
         // window is open over the tab.

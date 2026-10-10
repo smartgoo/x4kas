@@ -1065,13 +1065,19 @@ impl QueryState {
 
     /// Forget the result and the run (a connection switch).
     pub fn clear(&mut self) {
+        self.clear_result();
+        self.watch_status.clear();
+    }
+
+    /// Forget the result, the error and any run in progress, whose answer is then
+    /// dropped (another query was loaded).
+    pub fn clear_result(&mut self) {
         self.cancel();
         self.cancelled = None;
         self.result = None;
         self.result_query = None;
         self.result_name = None;
         self.error = None;
-        self.watch_status.clear();
     }
 
     /// Forget the watched queries' events.
@@ -1299,6 +1305,20 @@ mod tests {
             q.result_seq, 1,
             "the superseded cancelled answer is dropped"
         );
+    }
+
+    #[test]
+    fn clearing_the_result_drops_the_run_in_progress() {
+        use crate::query::Entity;
+        let mut q = QueryState::default();
+        let (g1, _) = q.start(Query::default_for(Entity::Blocks), None);
+        q.finish(g1, Ok(ResultSet::empty(Entity::Blocks)));
+        let (g2, cancel) = q.start(Query::default_for(Entity::Transactions), None);
+        q.clear_result();
+        assert!(q.result.is_none() && q.result_query.is_none());
+        assert!(cancel.load(Ordering::Relaxed), "the run is cancelled");
+        q.finish(g2, Ok(ResultSet::empty(Entity::Transactions)));
+        assert!(q.result.is_none(), "its late answer is dropped");
     }
 
     #[test]

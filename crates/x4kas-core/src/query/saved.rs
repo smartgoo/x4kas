@@ -300,12 +300,6 @@ pub fn presets() -> Vec<SavedQuery> {
             "addresses where first_seen > 1d and received >= 10000 KAS and tx_count <= 3 order by received desc limit 100",
         ),
         preset(
-            "block-sizes",
-            "Fullest chain blocks",
-            "Chain blocks accepting the most transactions in the last hour.",
-            "blocks last 1h where is_chain order by accepted_txs desc limit 100",
-        ),
-        preset(
             "watchlist-activity",
             "Watchlist activity",
             "Transactions of the last day touching an address on the watchlist.",

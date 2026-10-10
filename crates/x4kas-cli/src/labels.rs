@@ -20,7 +20,7 @@ pub enum LabelsCommand {
     Set { address: String, name: String },
     /// Remove your own label for an address
     Rm { address: String },
-    /// Fetch the public api.kaspa.org list now (otherwise refreshed daily)
+    /// Fetch the public api.kaspa.org list now (the GUI otherwise refreshes it hourly)
     Refresh,
     /// Ask the enabled online sources (kas.fyi with a key, KNS) about an address
     Online { address: String },

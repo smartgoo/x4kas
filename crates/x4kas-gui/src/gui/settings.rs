@@ -15,7 +15,7 @@ use super::widgets::{
     CARD_GAP, address_bare, card, card_with_header, danger_button, edit_label_cell, kv_grid,
     kv_with, label_cell, modal_window, placeholder, primary_button, request_label, section_title,
 };
-use x4kas_core::app::App;
+use x4kas_core::app::{App, ChainPhase};
 use x4kas_core::config::{IndexFeature, data_dir};
 use x4kas_core::controller::{CommandSender, UiCommand};
 use x4kas_core::format::{format_duration, format_number};
@@ -41,7 +41,7 @@ impl Section {
     fn label(self) -> &'static str {
         match self {
             Section::AddressLabels => "Address Labels",
-            Section::Index => "Index",
+            Section::Index => "DAG Index",
             Section::Reset => "Reset",
         }
     }
@@ -134,7 +134,7 @@ impl SettingsPage {
                 egui::ScrollArea::vertical().show(ui, |ui| match self.section {
                     Section::AddressLabels => self.address_labels(ui, app, cmd_tx),
                     Section::Index => index(ui, app, cmd_tx),
-                    Section::Reset => self.reset(ui),
+                    Section::Reset => self.reset(ui, app, cmd_tx),
                 });
             });
     }
@@ -160,14 +160,17 @@ impl SettingsPage {
         );
     }
 
-    /// What a reset deletes, and the button that asks to confirm it.
-    fn reset(&mut self, ui: &mut Ui) {
+    /// Resyncing the index, then what a reset deletes and the button that asks to
+    /// confirm it.
+    fn reset(&mut self, ui: &mut Ui, app: &App, cmd_tx: &CommandSender) {
         if let Some(report) = &self.reset_report {
             card(ui, "Last Reset", |ui| {
                 ui.label(RichText::new(report).color(theme::ERROR));
             });
             ui.add_space(CARD_GAP);
         }
+        card(ui, "Resync DAG Index", |ui| resync(ui, app, cmd_tx));
+        ui.add_space(CARD_GAP);
         card(ui, "Reset App", |ui| {
             ui.label(format!(
                 "Reset app to initial state. Deletes ALL saved application data in {}. \
@@ -465,6 +468,30 @@ fn labels_table(ui: &mut Ui, rows: &[LabelRow], confirm_delete: &mut Option<(Str
     });
 }
 
+/// Rebuild the index from the node, as the Analyzer chip's Resync button does
+/// (`UiCommand::Resync`).
+fn resync(ui: &mut Ui, app: &App, cmd_tx: &CommandSender) {
+    ui.label(
+        "Deletes the local DAG index and rebuilds from scratch. While index is rebuilding, \
+         many app services are unavailable or show partial data. Rebuild progress can be \
+         tracked in lower left corner.",
+    );
+    ui.add_space(8.0);
+    let direct = app.connection.is_direct();
+    let opening = matches!(app.chain.phase, ChainPhase::Opening);
+    let button = ui
+        .add_enabled(direct && !opening, primary_button("Resync DAG index"))
+        .on_hover_text("Delete the index and the analytics and rebuild them from the node")
+        .on_disabled_hover_text(if !direct {
+            "Needs a direct node connection: the index isn't built from the public resolver"
+        } else {
+            "The index is opening"
+        });
+    if button.clicked() {
+        let _ = cmd_tx.send(UiCommand::Resync);
+    }
+}
+
 /// The opt-in data the address index keeps, each a switch with what it costs. A change
 /// applies from the writer's next batch.
 fn index(ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
@@ -486,7 +513,7 @@ fn index(ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
         ui.label(
             RichText::new(
                 "A change applies to transactions indexed from that moment on. To index the whole \
-                 window, Resync from the Analyzer chip in the status bar.",
+                 window, Resync DAG index under Reset (or Resync on the Analyzer chip).",
             )
             .weak(),
         );

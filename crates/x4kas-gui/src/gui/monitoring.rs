@@ -125,7 +125,7 @@ impl MonitoringTab {
         let mut field: Option<egui::Response> = None;
         ui.horizontal(|ui| {
             let edit = TextEdit::singleline(&mut self.input)
-                .hint_text("kaspa:… address, or a label such as \"Bybit\"")
+                .hint_text("Address, label (e.g. \"Bybit\")…")
                 .desired_width(ui.available_width() - 190.0);
             let response = ui.add(edit);
             field = Some(response.clone());
@@ -228,15 +228,15 @@ impl MonitoringTab {
             "watchlist",
             ["Address", "Balance (KAS)", "24h change", "Last activity"],
             rows,
-            "No addresses on this list yet. Paste one above and press Watch.",
+            "No addresses in this list yet.",
             address,
             Some(request_address),
             |_, _| {},
             height,
         );
         ui.add_space(2.0);
-        // The notice (added, already on the list, invalid) takes the hint's line for a
-        // few seconds, so nothing above it moves.
+        // The notice (added, already on the list, invalid) shows on the line under the
+        // table for a few seconds.
         let now = ui.input(|i| i.time);
         if self
             .notice
@@ -253,14 +253,8 @@ impl MonitoringTab {
                     .request_repaint_after(std::time::Duration::from_secs_f64(NOTICE_SECS));
             }
             None => {
-                ui.label(
-                    RichText::new(
-                        "Click an address for its info, history and alert settings. \
-                         24h change counts only what x4kas saw while running.",
-                    )
-                    .weak()
-                    .small(),
-                );
+                // Kept empty, so a notice doesn't move anything.
+                ui.label(RichText::new(" ").small());
             }
         }
     }
@@ -438,7 +432,7 @@ fn signed_kas(sompi: i128) -> String {
     }
 }
 
-/// A pane's table height: the rest of the pane above its one-line hint when the panes
+/// A pane's table height: the rest of the pane above its notice line when the panes
 /// fill the tab, else the default.
 fn table_height(ui: &Ui, fill: bool) -> f32 {
     if !fill {
@@ -566,19 +560,14 @@ fn activity(ui: &mut Ui, app: &mut App, filter: Option<ListId>, fill: bool) {
         app.watch.set_read(index, !read);
     }
     ui.add_space(2.0);
-    // A history that couldn't be loaded or saved takes the hint's line until it can.
+    // A history that couldn't be loaded or saved shows on the line under the table.
     match &app.watch.history_error {
         Some(err) => {
             ui.label(RichText::new(err).color(theme::ERROR).small());
         }
         None => {
-            ui.label(
-                RichText::new(
-                    "● marks an alert the address's rules raised; click it to mark it read.",
-                )
-                .weak()
-                .small(),
-            );
+            // Kept empty, so an error doesn't move anything.
+            ui.label(RichText::new(" ").small());
         }
     }
 }

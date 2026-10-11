@@ -2,18 +2,21 @@
 //! navigation of sections with the chosen one's content on the right, in place of the
 //! active tab. Address Labels: the public list (its sources and refresh) and the user's
 //! every known label (label, address, source; add, edit in place, remove). Index: the
-//! opt-in data the address index keeps (full payloads, redeem scripts).
+//! opt-in data the address index keeps (full payloads, redeem scripts). Reset: wipe
+//! everything the app keeps under `~/.x4kas` (but exports) and relaunch it; the GUI
+//! closes through its usual shutdown first (`SettingsPage::reset_requested`), and
+//! `main` deletes and relaunches once the window and runtime are gone.
 
 use eframe::egui::{self, RichText, TextEdit, Ui};
 use egui_extras::{Column, TableBuilder};
 
 use super::theme;
 use super::widgets::{
-    CARD_GAP, address_bare, card, card_with_header, edit_label_cell, kv_grid, kv_with, label_cell,
-    placeholder, primary_button, request_label, section_title,
+    CARD_GAP, address_bare, card, card_with_header, danger_button, edit_label_cell, kv_grid,
+    kv_with, label_cell, modal_window, placeholder, primary_button, request_label, section_title,
 };
 use x4kas_core::app::App;
-use x4kas_core::config::IndexFeature;
+use x4kas_core::config::{IndexFeature, data_dir};
 use x4kas_core::controller::{CommandSender, UiCommand};
 use x4kas_core::format::{format_duration, format_number};
 use x4kas_core::labels::LabelSource;
@@ -29,15 +32,17 @@ enum Section {
     #[default]
     AddressLabels,
     Index,
+    Reset,
 }
 
 impl Section {
-    const ALL: [Self; 2] = [Self::AddressLabels, Self::Index];
+    const ALL: [Self; 3] = [Self::AddressLabels, Self::Index, Self::Reset];
 
     fn label(self) -> &'static str {
         match self {
             Section::AddressLabels => "Address Labels",
             Section::Index => "Index",
+            Section::Reset => "Reset",
         }
     }
 }
@@ -55,17 +60,43 @@ pub struct SettingsPage {
     /// The address whose 🗑 was clicked once, and when: a second click within
     /// `CONFIRM_SECS` deletes.
     confirm_delete: Option<(String, f64)>,
+    /// The window confirming a reset is open.
+    confirm_reset: bool,
+    /// What went wrong with the reset this launch followed (`--reset-report`).
+    reset_report: Option<String>,
+    /// The user confirmed a reset; the frame loop takes it and closes the app.
+    pub reset_requested: bool,
 }
 
 /// How long a first click on 🗑 waits for the confirming second one.
 const CONFIRM_SECS: f64 = 3.0;
 
 impl SettingsPage {
+    /// Open on the Reset section with what went wrong with the reset that relaunched
+    /// the app.
+    pub fn show_reset_report(&mut self, report: String) {
+        self.open = true;
+        self.section = Section::Reset;
+        self.reset_report = Some(report);
+    }
+
+    /// A window of the page (the reset confirmation) is on show.
+    pub fn modal_open(&self) -> bool {
+        self.open && self.confirm_reset
+    }
+
+    /// Forget an unanswered reset confirmation, so it doesn't come back with the page.
+    pub fn cancel_reset(&mut self) {
+        self.confirm_reset = false;
+    }
+
     pub fn toggle(&mut self) {
         self.open = !self.open;
     }
 
-    pub fn show(&mut self, ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
+    /// `close_dialog`: the frame loop hands the page's window this frame's Esc.
+    pub fn show(&mut self, ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender, close_dialog: bool) {
+        self.reset_dialog(ui.ctx(), close_dialog);
         egui::SidePanel::left("settings_nav")
             .resizable(false)
             .exact_width(NAV_WIDTH)
@@ -103,6 +134,7 @@ impl SettingsPage {
                 egui::ScrollArea::vertical().show(ui, |ui| match self.section {
                     Section::AddressLabels => self.address_labels(ui, app, cmd_tx),
                     Section::Index => index(ui, app, cmd_tx),
+                    Section::Reset => self.reset(ui),
                 });
             });
     }
@@ -126,6 +158,79 @@ impl SettingsPage {
             },
             |ui, app| self.known_labels(ui, app, cmd_tx),
         );
+    }
+
+    /// What a reset deletes, and the button that asks to confirm it.
+    fn reset(&mut self, ui: &mut Ui) {
+        if let Some(report) = &self.reset_report {
+            card(ui, "Last Reset", |ui| {
+                ui.label(RichText::new(report).color(theme::ERROR));
+            });
+            ui.add_space(CARD_GAP);
+        }
+        card(ui, "Reset App", |ui| {
+            ui.label(format!(
+                "Reset app to initial state. Deletes ALL saved application data in {}. \
+                 Including (but not limited to):",
+                data_dir().display()
+            ));
+            ui.add_space(4.0);
+            for item in [
+                "the connection choice and the window's layout and preferences",
+                "watchlists and their alert rules",
+                "your address labels, the cached public list and online lookups",
+                "saved queries and their alerts",
+                "the index settings and the whole index (it rebuilds from the node)",
+            ] {
+                ui.label(format!("  • {item}"));
+            }
+            ui.add_space(8.0);
+            if ui
+                .add(danger_button("Reset and restart"))
+                .on_hover_text(
+                    "Asks to confirm, then shuts down, deletes the app's data and relaunches",
+                )
+                .clicked()
+            {
+                self.confirm_reset = true;
+            }
+        });
+    }
+
+    /// The window confirming a reset, while `confirm_reset`. Nothing in it answers
+    /// Enter: a reset takes a click on its button. `close`: the frame loop's Esc.
+    fn reset_dialog(&mut self, ctx: &egui::Context, close: bool) {
+        if !self.confirm_reset {
+            return;
+        }
+        let window = egui::Window::new("Reset x4kas?")
+            .id(egui::Id::new("reset_dialog"))
+            .resizable(false)
+            .default_width(380.0);
+        let mut done = false;
+        let open = modal_window(ctx, window, close, |ui| {
+            ui.label(
+                "All settings, watchlists, labels, saved queries and the index are deleted \
+                 and the app restarts. Exported files are kept.",
+            );
+            ui.add_space(4.0);
+            ui.label(RichText::new("This can't be undone.").color(theme::ERROR));
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.add(danger_button("Reset and restart")).clicked() {
+                    self.reset_report = None;
+                    self.reset_requested = true;
+                    ui.ctx().request_repaint();
+                    done = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    done = true;
+                }
+            });
+        });
+        if done || !open {
+            self.confirm_reset = false;
+        }
     }
 
     /// The public list: its count, where it comes from and how its fetch is going.

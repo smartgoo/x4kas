@@ -51,6 +51,26 @@ const SMALL_MEMTABLE_BYTES: u64 = 8 * 1024 * 1024;
 /// is still shutting down) holds the directory lock.
 const LOCK_RETRY: Duration = Duration::from_secs(5);
 
+/// The first index on disk (of any network) another process holds open, if any: the
+/// lock is tried by opening each and closing it again at once. Call it with this
+/// process's own store closed, or it finds that one.
+pub fn locked_index() -> Option<PathBuf> {
+    locked_index_in(&config::data_dir().join("index"))
+}
+
+fn locked_index_in(root: &std::path::Path) -> Option<PathBuf> {
+    let dirs = std::fs::read_dir(root).ok()?;
+    dirs.flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .find(|path| {
+            matches!(
+                Database::builder(path).cache_size(1024 * 1024).open(),
+                Err(fjall::Error::Locked)
+            )
+        })
+}
+
 /// Where the index for `network` lives.
 pub fn index_dir(network: &str) -> PathBuf {
     config::data_dir().join("index").join(network)
@@ -622,6 +642,17 @@ mod tests {
         let h = [0xabu8; 32];
         assert_eq!(parse_hex(&hex(&h)), Some(h));
         assert_eq!(parse_hex("abc"), None);
+    }
+
+    #[test]
+    fn locked_index_finds_an_open_store() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(locked_index_in(root.path()), None);
+        let path = root.path().join("mainnet");
+        let store = IndexStore::open_at(path.clone(), "mainnet").unwrap();
+        assert_eq!(locked_index_in(root.path()), Some(path));
+        drop(store);
+        assert_eq!(locked_index_in(root.path()), None);
     }
 
     #[test]

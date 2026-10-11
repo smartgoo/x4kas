@@ -21,6 +21,11 @@ pub struct Args {
     /// Auto-refresh interval in milliseconds
     #[arg(short = 'r', long, default_value = "1000")]
     pub refresh_interval_ms: u64,
+
+    /// Set by a reset from Settings when it relaunches the app: what went wrong, shown
+    /// on the Settings page's Reset section.
+    #[arg(long, hide = true)]
+    pub reset_report: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -32,7 +37,39 @@ fn main() -> Result<()> {
         .enable_all()
         .build()?;
 
-    gui::run(&rt, args)
+    match gui::run(&rt, args.clone())? {
+        gui::Exit::Quit => Ok(()),
+        gui::Exit::Reset => {
+            // Stop what still runs in the background (the label and market refreshes)
+            // so nothing writes into the data directory while it is deleted. The index
+            // writer and query runs are already done: a reset only gets here after the
+            // controller's shutdown finished.
+            rt.shutdown_timeout(std::time::Duration::from_secs(2));
+            // Relaunch whatever happened: a failure is reported by the new window (a
+            // Windows release build has no console to print it on).
+            let report = x4kas_core::config::reset_data_dir().err();
+            relaunch(&args, report)
+        }
+    }
+}
+
+/// Start the app again as a new process, with the arguments it was given (but an
+/// earlier reset's report) and `report`, what went wrong with this reset.
+fn relaunch(args: &Args, report: Option<String>) -> Result<()> {
+    let mut cmd = std::process::Command::new(std::env::current_exe()?);
+    if let Some(url) = &args.url {
+        cmd.args(["--url", url]);
+    }
+    cmd.args(["--network", &args.network]);
+    cmd.args([
+        "--refresh-interval-ms".to_string(),
+        args.refresh_interval_ms.to_string(),
+    ]);
+    if let Some(report) = report {
+        cmd.args(["--reset-report", &report]);
+    }
+    cmd.spawn()?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -45,6 +82,7 @@ mod tests {
         assert_eq!(args.url, None);
         assert_eq!(args.network, "mainnet");
         assert_eq!(args.refresh_interval_ms, 1000);
+        assert_eq!(args.reset_report, None);
     }
 
     #[test]

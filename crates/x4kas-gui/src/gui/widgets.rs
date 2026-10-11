@@ -1444,6 +1444,11 @@ pub fn primary_button(text: &str) -> Button<'static> {
     Button::new(RichText::new(text).color(theme::BG_DEEP)).fill(theme::ACCENT)
 }
 
+/// A button for an action that destroys data: red, as `primary_button` is accent.
+pub fn danger_button(text: &str) -> Button<'static> {
+    Button::new(RichText::new(text).color(theme::BG_DEEP)).fill(theme::ERROR)
+}
+
 /// A thin vertical divider between status bar segments.
 pub fn divider(ui: &mut Ui) {
     ui.label(RichText::new("│").color(theme::BORDER_HI));

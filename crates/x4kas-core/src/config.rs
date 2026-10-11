@@ -10,6 +10,70 @@ pub fn data_dir() -> PathBuf {
         .join(".x4kas")
 }
 
+/// The folder of the data directory the user's exports go into (`index::export`): the
+/// one thing a reset keeps.
+pub const EXPORTS_DIR: &str = "exports";
+
+/// Reset the app: delete everything in the data directory (settings, connection,
+/// watchlists, labels, saved queries, the index, the GUI's window state) but the
+/// exports. Run it with nothing open on the directory: the GUI does after its window
+/// closed and its runtime stopped. Refuses, deleting nothing, while another x4kas
+/// process has an index open; otherwise deletes all it can and says what it couldn't.
+pub fn reset_data_dir() -> std::result::Result<(), String> {
+    if let Some(path) = crate::index::locked_index() {
+        return Err(format!(
+            "Nothing was reset: the index at {} is in use by another x4kas process (a \
+             second window or x4kas-cli). Quit it and reset again.",
+            path.display()
+        ));
+    }
+    let failed = clear_dir(&data_dir(), &[EXPORTS_DIR]);
+    if failed.is_empty() {
+        return Ok(());
+    }
+    let list: Vec<String> = failed
+        .iter()
+        .map(|(path, e)| format!("{}: {e}", path.display()))
+        .collect();
+    Err(format!(
+        "The reset couldn't delete everything; delete these by hand:\n{}",
+        list.join("\n")
+    ))
+}
+
+/// Remove every entry of `dir` whose name isn't in `keep`, going on past the ones that
+/// fail, which it returns. A missing `dir` is fine.
+fn clear_dir(dir: &std::path::Path, keep: &[&str]) -> Vec<(PathBuf, std::io::Error)> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => return vec![(dir.to_path_buf(), e)],
+    };
+    let mut failed = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                failed.push((dir.to_path_buf(), e));
+                continue;
+            }
+        };
+        if keep.iter().any(|k| entry.file_name() == *k) {
+            continue;
+        }
+        let path = entry.path();
+        let removed = match entry.file_type() {
+            Ok(t) if t.is_dir() => std::fs::remove_dir_all(&path),
+            Ok(_) => std::fs::remove_file(&path),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = removed {
+            failed.push((path, e));
+        }
+    }
+    failed
+}
+
 pub fn valid_networks() -> &'static [&'static str] {
     &["mainnet", "testnet-10", "testnet-11"]
 }
@@ -201,6 +265,26 @@ impl IndexSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clear_dir_keeps_only_the_exports() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join("watchlist.toml"), "x").unwrap();
+        std::fs::create_dir_all(dir.join("index/mainnet")).unwrap();
+        std::fs::write(dir.join("index/mainnet/data"), "x").unwrap();
+        std::fs::create_dir(dir.join(EXPORTS_DIR)).unwrap();
+        std::fs::write(dir.join(EXPORTS_DIR).join("a.csv"), "x").unwrap();
+        assert!(clear_dir(dir, &[EXPORTS_DIR]).is_empty());
+        let left: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, [EXPORTS_DIR]);
+        assert!(dir.join(EXPORTS_DIR).join("a.csv").exists());
+        // Nothing to clear is not an error.
+        assert!(clear_dir(&dir.join("missing"), &[EXPORTS_DIR]).is_empty());
+    }
 
     #[test]
     fn index_settings_default_off_and_round_trip() {

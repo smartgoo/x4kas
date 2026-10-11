@@ -23,6 +23,7 @@ mod toasts;
 mod widgets;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -50,8 +51,16 @@ use x4kas_core::format::{format_duration, format_number, now_ms};
 use x4kas_core::labels;
 use x4kas_core::rpc::market;
 
+/// How the GUI ended.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Exit {
+    Quit,
+    /// The user reset the app from Settings: delete its data and launch it again.
+    Reset,
+}
+
 /// Start background tasks on `rt` and run the GUI on the current (main) thread.
-pub fn run(rt: &tokio::runtime::Runtime, args: Args) -> Result<()> {
+pub fn run(rt: &tokio::runtime::Runtime, args: Args) -> Result<Exit> {
     let app = Arc::new(RwLock::new(App::default()));
 
     // `--url` overrides the saved connection choice; without it, open the connection
@@ -111,6 +120,9 @@ pub fn run(rt: &tokio::runtime::Runtime, args: Args) -> Result<()> {
         ..Default::default()
     };
 
+    let reset = Arc::new(AtomicBool::new(false));
+    let reset_report = args.reset_report.clone();
+    let gui_reset = reset.clone();
     eframe::run_native(
         "x4kas",
         options,
@@ -118,10 +130,19 @@ pub fn run(rt: &tokio::runtime::Runtime, args: Args) -> Result<()> {
             theme::apply(&cc.egui_ctx);
             let ctx = cc.egui_ctx.clone();
             app.blocking_write().repaint = Some(Arc::new(move || ctx.request_repaint()));
-            Ok(Box::new(GuiApp::new(app, cmd_tx, connection, cc.storage)))
+            let mut gui = GuiApp::new(app, cmd_tx, connection, gui_reset, cc.storage);
+            if let Some(report) = reset_report {
+                gui.settings.show_reset_report(report);
+            }
+            Ok(Box::new(gui))
         }),
     )
-    .map_err(|e| anyhow::anyhow!("GUI error: {e}"))
+    .map_err(|e| anyhow::anyhow!("GUI error: {e}"))?;
+    Ok(if reset.load(Ordering::SeqCst) {
+        Exit::Reset
+    } else {
+        Exit::Quit
+    })
 }
 
 /// What this frame's Esc closes: one thing, the topmost. Windows first (in the order
@@ -135,6 +156,8 @@ enum EscTarget {
     Flows,
     /// The Query tab's save dialog.
     QueryDialog,
+    /// The Settings page's reset confirmation.
+    SettingsDialog,
     Pane,
     Settings,
 }
@@ -179,6 +202,8 @@ struct GuiApp {
     shutdown_rx: Option<oneshot::Receiver<()>>,
     shutdown_since: Option<Instant>,
     shutdown_complete: bool,
+    /// The close under way is a reset (Settings): `run` reports `Exit::Reset`.
+    reset: Arc<AtomicBool>,
     /// A text field had focus or a popup (a menu) was open at the end of the last
     /// frame: egui gives this frame's Esc to them (it clears the focus before the frame
     /// runs, so this is the only way to know), and nothing else should take it.
@@ -202,6 +227,7 @@ impl GuiApp {
         app: Arc<RwLock<App>>,
         cmd_tx: CommandSender,
         connection: ConnectionWindow,
+        reset: Arc<AtomicBool>,
         storage: Option<&dyn eframe::Storage>,
     ) -> Self {
         let mut explorer = ExplorerUi::default();
@@ -228,6 +254,7 @@ impl GuiApp {
             shutdown_rx: None,
             shutdown_since: None,
             shutdown_complete: false,
+            reset,
             esc_taken: false,
             show_help: false,
             connection,
@@ -260,6 +287,13 @@ impl GuiApp {
             }
         }
 
+        // A reset from Settings closes the app the same way; `main` wipes its data and
+        // relaunches it once the window is gone.
+        if std::mem::take(&mut self.settings.reset_requested) && !self.is_shutting_down() {
+            self.reset.store(true, Ordering::SeqCst);
+            ctx.send_viewport_cmd(ViewportCommand::Close);
+        }
+
         if let Some(rx) = &mut self.shutdown_rx {
             match rx.try_recv() {
                 Err(oneshot::error::TryRecvError::Empty) => {
@@ -284,6 +318,7 @@ impl GuiApp {
             || app.sankey.open
             || app.address.flows.open
             || self.query.modal_open()
+            || self.settings.modal_open()
     }
 
     /// What this frame's Esc closes, if anything.
@@ -303,6 +338,8 @@ impl GuiApp {
             Some(EscTarget::Flows)
         } else if self.query.modal_open() {
             Some(EscTarget::QueryDialog)
+        } else if self.settings.modal_open() {
+            Some(EscTarget::SettingsDialog)
         } else if app.explorer.pane.is_some() {
             Some(EscTarget::Pane)
         } else if self.settings.open {
@@ -404,7 +441,12 @@ impl eframe::App for GuiApp {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.settings.open {
-                self.settings.show(ui, &mut app, &self.cmd_tx);
+                self.settings.show(
+                    ui,
+                    &mut app,
+                    &self.cmd_tx,
+                    esc == Some(EscTarget::SettingsDialog),
+                );
                 return;
             }
             match app.active_tab {
@@ -489,29 +531,49 @@ impl eframe::App for GuiApp {
             egui::Modal::new(egui::Id::new("shutdown_modal")).show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label("Shutting down…");
+                    ui.label(if self.reset.load(Ordering::SeqCst) {
+                        "Resetting: shutting down…"
+                    } else {
+                        "Shutting down…"
+                    });
                 });
                 // The controller is finishing the index writer's last batch and
                 // disconnecting; if that takes too long, let the user leave anyway.
                 if waited > SHUTDOWN_PATIENCE {
+                    let resetting = self.reset.load(Ordering::SeqCst);
                     ui.add_space(6.0);
                     ui.label(
-                        RichText::new("Still finishing the last index batch and disconnecting.")
-                            .weak(),
+                        RichText::new(if resetting {
+                            "Still finishing the last index batch and disconnecting. Quitting \
+                             now cancels the reset."
+                        } else {
+                            "Still finishing the last index batch and disconnecting."
+                        })
+                        .weak(),
                     );
                     if ui
                         .button("Quit now")
-                        .on_hover_text(
-                            "Close without waiting; the index is written in atomic batches",
-                        )
+                        .on_hover_text(if resetting {
+                            "Close without waiting and without resetting: the index may \
+                             still be in use"
+                        } else {
+                            "Close without waiting; the index is written in atomic batches"
+                        })
                         .clicked()
                     {
+                        // The writer may still have the index open: deleting it under
+                        // the writer isn't a reset, so quitting now cancels it.
+                        self.reset.store(false, Ordering::SeqCst);
                         self.shutdown_rx = None;
                         self.shutdown_complete = true;
                         ctx.send_viewport_cmd(ViewportCommand::Close);
                     }
                 }
             });
+        }
+        // The page went away under its reset confirmation (a tab, the ⚙ button).
+        if !self.settings.open {
+            self.settings.cancel_reset();
         }
         // For the next frame's Esc (see `esc_taken`).
         self.esc_taken = ctx.memory(|m| m.focused().is_some()) || egui::Popup::is_any_open(ctx);

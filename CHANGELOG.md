@@ -7,6 +7,7 @@ Notable changes to x4kas. The format follows [Keep a Changelog](https://keepacha
 ### Added
 
 - Multiple named watchlists, each with its own alert rules, in the GUI and the CLI.
+- Reset App in Settings, which wipes the app's data and restarts it from scratch.
 
 ## [0.1.0]
 

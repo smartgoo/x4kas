@@ -296,7 +296,7 @@ fn csv_field(s: &str) -> String {
 
 /// Where exports are written: `~/.x4kas/exports/`.
 pub fn export_dir() -> PathBuf {
-    config::data_dir().join("exports")
+    config::data_dir().join(config::EXPORTS_DIR)
 }
 
 /// A fresh file name in `export_dir()`: `<stem>-<utc time>.<ext>`.

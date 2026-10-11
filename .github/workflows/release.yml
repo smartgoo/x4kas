@@ -71,7 +71,6 @@ jobs:
           bin="target/${{ matrix.target }}/release"
           mkdir "$name"
           cp "${bin}/x4kas-cli${ext}" README.md LICENSE "$name/"
-          # macOS gets the GUI as an app bundle: Finder opens a bare binary in Terminal.
           if [ "${{ runner.os }}" = "macOS" ]; then
             scripts/macos-app.sh "${bin}/x4kas" "${version#v}" "$name"
           else
@@ -104,13 +103,10 @@ jobs:
           path: dist
           merge-multiple: true
 
-      # One checksum file for every archive (`sha256sum -c --ignore-missing SHA256SUMS`).
       - name: Checksums
         working-directory: dist
         run: sha256sum * > SHA256SUMS
 
-      # A draft, so the notes can be edited before publishing; 0.x and `-suffix`
-      # versions are marked as pre-releases.
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}

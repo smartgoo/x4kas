@@ -1,4 +1,4 @@
-# Rust build output (any crate's, incl. the vendored ones built on their own)
+# Rust build output
 debug/
 target/
 

@@ -1017,12 +1017,63 @@ fn monitor_icon(
     painter.add(egui::Shape::line(points, Stroke::new(1.3_f32, pulse)));
 }
 
-/// `x4kas`, with the 4 accented.
+/// `x4kas` in the app icon's style: a heavy x, an italic glowing teal 4, then a bold
+/// kas. egui has one weight of its monospace font, so bold is overstruck.
 fn brand(ui: &mut egui::Ui) {
-    ui.spacing_mut().item_spacing.x = 0.0;
-    ui.label(RichText::new("x").color(theme::TEXT_BRIGHT).size(15.0));
-    ui.label(RichText::new("4").color(theme::ACCENT_BRIGHT).size(15.0));
-    ui.label(RichText::new("kas").color(theme::TEXT_BRIGHT).size(15.0));
+    const SIZE: f32 = 16.0;
+    /// Overstrike offsets that thicken the strokes: heavy for the x and 4, a little
+    /// lighter for kas.
+    const HEAVY: &[f32] = &[0.0, 0.5, 1.0];
+    const SEMIBOLD: &[f32] = &[0.0, 0.6];
+    /// Room after the 4 for its slant.
+    const SLANT: f32 = 3.0;
+    let galley = |text: &str, italics: bool| {
+        let format = egui::TextFormat {
+            font_id: egui::FontId::monospace(SIZE),
+            color: theme::TEXT_BRIGHT,
+            italics,
+            ..Default::default()
+        };
+        ui.painter()
+            .layout_job(egui::text::LayoutJob::single_section(
+                text.to_owned(),
+                format,
+            ))
+    };
+    let (x, four, kas) = (galley("x", false), galley("4", true), galley("kas", false));
+    let bold = HEAVY[HEAVY.len() - 1];
+    let width = x.size().x + four.size().x + SLANT + kas.size().x + bold + SEMIBOLD[1];
+    let height = x.size().y.max(four.size().y);
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, "x4kas"));
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let painter = ui.painter();
+    let overstrike = |pos: egui::Pos2, galley: &Arc<egui::Galley>, color, offsets: &[f32]| {
+        for &dx in offsets {
+            painter.galley_with_override_text_color(
+                pos + egui::vec2(dx, 0.0),
+                galley.clone(),
+                color,
+            );
+        }
+    };
+    let mut pos = rect.left_top();
+    overstrike(pos, &x, theme::TEXT_BRIGHT, HEAVY);
+    pos.x += x.size().x + bold;
+    // The glow: faint copies of the 4 in a ring around it.
+    let glow = theme::ACCENT_BRIGHT.gamma_multiply(0.04);
+    for (radius, steps) in [(1.0_f32, 12), (2.0, 16)] {
+        for i in 0..steps {
+            let angle = i as f32 / steps as f32 * std::f32::consts::TAU;
+            let offset = egui::vec2(angle.cos(), angle.sin()) * radius;
+            painter.galley_with_override_text_color(pos + offset, four.clone(), glow);
+        }
+    }
+    overstrike(pos, &four, theme::ACCENT_BRIGHT, HEAVY);
+    pos.x += four.size().x + SLANT;
+    overstrike(pos, &kas, theme::TEXT_BRIGHT, SEMIBOLD);
 }
 
 /// A tab in the strip (also the Explorer's sub tabs). The active tab is inverted; a

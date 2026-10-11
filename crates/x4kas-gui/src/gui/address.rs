@@ -121,7 +121,7 @@ pub(super) fn watch_card(ui: &mut Ui, app: &App, addr: &str) {
                         let text = if entry.enabled {
                             RichText::new(rules)
                         } else {
-                            RichText::new(format!("alerts off · {rules}")).color(theme::TEXT_DIM)
+                            RichText::new(format!("alerts off | {rules}")).color(theme::TEXT_DIM)
                         };
                         ui.add(egui::Label::new(text).truncate());
                     });
@@ -486,7 +486,7 @@ fn peel_chain(ui: &mut Ui, view: &AddressView) {
         );
         ui.label(
             RichText::new(format!(
-                "{} spends · {} KAS peeled off · {} KAS carried at the end",
+                "{} spends | {} KAS peeled off | {} KAS carried at the end",
                 chain.len(),
                 format_kas(chain.peeled_total as f64, 2),
                 format_kas(carried as f64, 2)

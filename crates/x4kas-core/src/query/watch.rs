@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 use tokio::sync::{Notify, RwLock};
+use tracing::Instrument;
 
 use super::exec::{self, Cell, Column, Inputs, ResultSet, RunControl};
 use super::saved::SavedQuery;
@@ -19,6 +20,7 @@ use super::{Entity, Query, TimeRange};
 use crate::app::{App, QueryWatchStatus};
 use crate::format::now_ms;
 use crate::index::IndexStore;
+use crate::logging::{error_change, log_error_change};
 use crate::polling::PollingHandles;
 
 /// How often the task looks for new data.
@@ -83,7 +85,7 @@ impl QueryEvent {
             .zip(&self.row)
             .map(|(c, cell)| format!("{}: {}", c.name, cell.text()))
             .collect::<Vec<_>>()
-            .join(" · ")
+            .join(" | ")
     }
 }
 
@@ -194,7 +196,10 @@ pub fn start_query_watch(
 ) {
     let stop = Arc::new(Notify::new());
     let cancel = Arc::new(AtomicBool::new(false));
-    let task = tokio::spawn(run(store, app, stop.clone(), cancel.clone()));
+    let task = tokio::spawn(
+        run(store, app, stop.clone(), cancel.clone())
+            .instrument(tracing::info_span!("query_watch")),
+    );
     handles.query_watch = Some(QueryWatchHandle { task, stop, cancel });
 }
 
@@ -275,7 +280,8 @@ async fn run(
                 Ok(q) => q,
                 Err(e) => {
                     entry.last_run_ms = now;
-                    report(&app, &saved.id, now, Err(format!("doesn't parse: {e}")), 0).await;
+                    let error = format!("doesn't parse: {e}");
+                    record_run(&mut *app.write().await, &saved, now, Err(error), 0);
                     continue;
                 }
             };
@@ -305,11 +311,18 @@ async fn run(
             let result = match result {
                 Ok(Ok(result)) => result,
                 Ok(Err(e)) => {
-                    report(&app, &saved.id, now, Err(format!("{e:#}")), 0).await;
+                    record_run(
+                        &mut *app.write().await,
+                        &saved,
+                        now,
+                        Err(format!("{e:#}")),
+                        0,
+                    );
                     continue;
                 }
                 Err(e) => {
-                    report(&app, &saved.id, now, Err(format!("query task: {e}")), 0).await;
+                    let error = format!("query task: {e}");
+                    record_run(&mut *app.write().await, &saved, now, Err(error), 0);
                     continue;
                 }
             };
@@ -325,29 +338,41 @@ async fn run(
                 app.query
                     .set_known(&saved.id, entry.seen.keys().cloned().collect());
             }
+            if notify && !events.is_empty() {
+                tracing::info!(query = %saved.name, rows = events.len(), "query alert");
+            }
             if notify {
                 for event in events {
                     app.query.push_event(event);
                 }
             }
-            app.query.watch_status.insert(
-                saved.id.clone(),
-                QueryWatchStatus {
-                    last_run_ms: Some(now),
-                    last_error: None,
-                    last_rows: result.rows.len(),
-                },
-            );
-            app.mark_dirty();
+            record_run(&mut app, &saved, now, Ok(()), result.rows.len());
         }
     }
 }
 
-/// Record what the watched query `id` just did.
-async fn report(app: &RwLock<App>, id: &str, now: u64, outcome: Result<(), String>, rows: usize) {
-    let mut app = app.write().await;
+/// Record what the watched query `saved` just did, logging a failure when it isn't the
+/// one it had already (it is re-run every few seconds) and the recovery from one.
+fn record_run(
+    app: &mut App,
+    saved: &SavedQuery,
+    now: u64,
+    outcome: Result<(), String>,
+    rows: usize,
+) {
+    let before = app
+        .query
+        .watch_status
+        .get(&saved.id)
+        .and_then(|s| s.last_error.as_deref());
+    log_error_change!(
+        tracing::Level::WARN,
+        error_change(before, outcome.as_ref().err().map(String::as_str)),
+        "watched query",
+        query = %saved.name
+    );
     app.query.watch_status.insert(
-        id.to_string(),
+        saved.id.clone(),
         QueryWatchStatus {
             last_run_ms: Some(now),
             last_error: outcome.err(),

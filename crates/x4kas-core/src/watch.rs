@@ -14,10 +14,12 @@ use kaspa_rpc_core::{RpcAddress, UtxosChangedNotification};
 use kaspa_wrpc_client::prelude::NetworkId;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{RwLock, mpsc};
+use tracing::Instrument;
 
 use crate::app::{App, ConnectionStatus, WatchPhase};
 use crate::config;
 use crate::format::{format_kas, now_ms};
+use crate::logging::{ErrorLog, log_error_change};
 use crate::polling::PollingHandles;
 use crate::rpc::client::RpcManager;
 
@@ -633,9 +635,12 @@ pub fn start_watch(
     let rpc = rpc.clone();
     let app = app.clone();
     let network = network.to_string();
-    handles.watch = Some(tokio::spawn(async move {
-        run(rpc, app, network, persist).await;
-    }));
+    handles.watch = Some(tokio::spawn(
+        async move {
+            run(rpc, app, network, persist).await;
+        }
+        .instrument(tracing::info_span!("watchlist")),
+    ));
 }
 
 async fn run(rpc: Arc<RpcManager>, app: Arc<RwLock<App>>, network: String, persist: bool) {
@@ -656,6 +661,12 @@ async fn run(rpc: Arc<RpcManager>, app: Arc<RwLock<App>>, network: String, persi
         .iter()
         .filter_map(|a| RpcAddress::try_from(a.as_str()).ok())
         .collect();
+    if parsed.len() < addresses.len() {
+        tracing::warn!(
+            skipped = addresses.len() - parsed.len(),
+            "watchlist addresses that don't parse are not followed"
+        );
+    }
 
     // Wait for a synced node that can answer address queries.
     loop {
@@ -683,43 +694,72 @@ async fn run(rpc: Arc<RpcManager>, app: Arc<RwLock<App>>, network: String, persi
     let (sender, mut receiver) = mpsc::channel::<UtxosChangedNotification>(64);
     let subscription = rpc.watch_utxos(parsed.clone(), sender);
     let events = async {
-        refresh(&rpc, &app, &parsed).await;
+        let mut errors = RefreshErrors::default();
+        refresh(&rpc, &app, &parsed, &mut errors).await;
         set_phase(&app, WatchPhase::Active(parsed.len())).await;
         let mut ticker = tokio::time::interval(REFRESH_INTERVAL);
         ticker.tick().await;
         loop {
             tokio::select! {
                 Some(n) = receiver.recv() => handle_notification(&app, &n, &network, persist).await,
-                _ = ticker.tick() => refresh(&rpc, &app, &parsed).await,
+                _ = ticker.tick() => refresh(&rpc, &app, &parsed, &mut errors).await,
             }
         }
     };
     tokio::join!(subscription, events);
 }
 
+/// The last outcome of each of `refresh`'s requests, so a failure is logged when it
+/// changes and once when it clears, not every refresh.
+#[derive(Default)]
+struct RefreshErrors {
+    balances: ErrorLog,
+    mempool: ErrorLog,
+}
+
 /// Re-read balances and pending mempool activity from the node.
-async fn refresh(rpc: &RpcManager, app: &RwLock<App>, addresses: &[RpcAddress]) {
+async fn refresh(
+    rpc: &RpcManager,
+    app: &RwLock<App>,
+    addresses: &[RpcAddress],
+    errors: &mut RefreshErrors,
+) {
     let balances = rpc.balances(addresses.to_vec()).await;
     let pending = rpc.pending_by_addresses(addresses.to_vec()).await;
+    let balances_error = balances.as_ref().err().map(|e| format!("balances: {e}"));
+    let pending_error = pending.as_ref().err().map(|e| format!("mempool: {e}"));
+    log_error_change!(
+        tracing::Level::WARN,
+        errors.balances.update(balances_error.as_deref()),
+        "watchlist balances"
+    );
+    log_error_change!(
+        tracing::Level::WARN,
+        errors.mempool.update(pending_error.as_deref()),
+        "watchlist mempool"
+    );
     let mut app = app.write().await;
-    match balances {
-        Ok(list) => {
-            for (address, balance) in list {
-                app.watch.balances.insert(address, balance);
-            }
+    if let Ok(list) = balances {
+        for (address, balance) in list {
+            app.watch.balances.insert(address, balance);
         }
-        Err(e) => app.watch.status.last_error = Some(format!("balances: {e}")),
     }
-    match pending {
-        Ok(list) => {
-            app.watch.pending.clear();
-            for (address, incoming, outgoing) in list {
-                if incoming > 0 || outgoing > 0 {
-                    app.watch.pending.insert(address, (incoming, outgoing));
-                }
+    if let Ok(list) = pending {
+        app.watch.pending.clear();
+        for (address, incoming, outgoing) in list {
+            if incoming > 0 || outgoing > 0 {
+                app.watch.pending.insert(address, (incoming, outgoing));
             }
         }
-        Err(e) => app.watch.status.last_error = Some(format!("mempool: {e}")),
+    }
+    let status = &mut app.watch.status;
+    // Shown: this refresh's failure, else none, but an error of another kind (a
+    // subscription or a save) stays until its own outcome changes it.
+    let ours = |e: &String| e.starts_with("balances: ") || e.starts_with("mempool: ");
+    match balances_error.or(pending_error) {
+        Some(error) => status.last_error = Some(error),
+        None if status.last_error.as_ref().is_some_and(ours) => status.last_error = None,
+        None => {}
     }
     app.mark_dirty();
 }
@@ -793,6 +833,16 @@ async fn handle_notification(
             event.alerts = alerts;
             touched.push(touch);
         }
+        tracing::debug!(
+            address = %event.address,
+            kind = ?event.kind,
+            amount = event.amount,
+            alerts = ?event.alerts,
+            "watchlist event"
+        );
+        if !event.alerts.is_empty() {
+            tracing::info!(rules = event.alerts.len(), "watchlist alert");
+        }
         guard.watch.push_event(event);
     }
     guard.watch.status.last_event_at = Some(std::time::Instant::now());
@@ -809,6 +859,7 @@ async fn handle_notification(
     })
     .await;
     if let Err(e) = saved.unwrap_or_else(|e| Err(e.into())) {
+        tracing::warn!("couldn't save the watchlist activity: {e:#}");
         let mut guard = app.write().await;
         guard.watch.status.last_error = Some(format!("watchlist: {e}"));
         guard.mark_dirty();
@@ -818,6 +869,11 @@ async fn handle_notification(
 async fn set_phase(app: &RwLock<App>, phase: WatchPhase) {
     let mut app = app.write().await;
     if app.watch.status.phase != phase {
+        match &phase {
+            WatchPhase::Unavailable(why) => tracing::warn!("watchlist unavailable: {why}"),
+            WatchPhase::Active(n) => tracing::info!(addresses = n, "watchlist active"),
+            other => tracing::debug!(phase = ?other, "watchlist phase"),
+        }
         app.watch.status.phase = phase;
         app.mark_dirty();
     }

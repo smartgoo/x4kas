@@ -30,6 +30,8 @@ pub struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    // Kept to the end of `main`: dropping it flushes and stops the log file's writer.
+    let _logs = init_logging();
 
     // Built manually (not #[tokio::main]) so the GUI can own the main thread, which
     // must stay outside the runtime context for `RwLock::blocking_*` to work.
@@ -37,7 +39,7 @@ fn main() -> Result<()> {
         .enable_all()
         .build()?;
 
-    match gui::run(&rt, args.clone())? {
+    match gui::run(&rt, args.clone(), _logs.as_ref())? {
         gui::Exit::Quit => Ok(()),
         gui::Exit::Reset => {
             // Stop what still runs in the background (the label and market refreshes)
@@ -48,7 +50,43 @@ fn main() -> Result<()> {
             // Relaunch whatever happened: a failure is reported by the new window (a
             // Windows release build has no console to print it on).
             let report = x4kas_core::config::reset_data_dir().err();
+            match &report {
+                None => tracing::info!("reset the data directory, relaunching"),
+                Some(e) => tracing::error!("reset failed, relaunching: {e}"),
+            }
             relaunch(&args, report)
+        }
+    }
+}
+
+/// Log as `~/.x4kas/logging.toml` says: to `~/.x4kas/logs/` (and stderr in debug
+/// builds). A failure only means no logs: the app runs anyway.
+fn init_logging() -> Option<x4kas_core::logging::LogRuntime> {
+    use x4kas_core::logging::{self, LogConfig, LogSettings};
+    let (settings, warnings) = match LogSettings::load_with_warnings() {
+        Ok(loaded) => loaded,
+        Err(e) => (
+            LogSettings::default(),
+            vec![("", format!("{e:#}: using defaults"))],
+        ),
+    };
+    match logging::init(&LogConfig::gui(&settings)) {
+        Ok(logs) => {
+            tracing::info!(
+                version = env!("CARGO_PKG_VERSION"),
+                os = std::env::consts::OS,
+                arch = std::env::consts::ARCH,
+                filter = ?logs.source(),
+                "x4kas starting"
+            );
+            for (_, warning) in warnings {
+                tracing::warn!("{}: {warning}", LogSettings::path().display());
+            }
+            Some(logs)
+        }
+        Err(e) => {
+            eprintln!("logging disabled: {e:#}");
+            None
         }
     }
 }

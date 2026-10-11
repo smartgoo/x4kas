@@ -376,13 +376,33 @@ pub struct NodeState {
     pub pruning_point_timestamp_ms: Option<u64>,
     pub node_url: Option<String>,
     pub node_uid: Option<String>,
+    /// Changed through [`NodeState::set_status`], which keeps `connecting_since`.
     pub connection_status: ConnectionStatus,
+    /// When the status became `Connecting` (and still is).
+    pub connecting_since: Option<Instant>,
     pub last_refresh: Option<Instant>,
     pub last_poll_duration_ms: Option<f64>,
     pub last_error: Option<String>,
 }
 
+/// How long connecting may take before it counts as a problem (`App::health`, and a
+/// warning in the log): the GUI's client retries forever, so a node that isn't there
+/// shows as connecting, never as failed.
+pub const CONNECT_PATIENCE: std::time::Duration = std::time::Duration::from_secs(15);
+
 impl NodeState {
+    /// Change the connection status, noting when connecting started.
+    pub fn set_status(&mut self, status: ConnectionStatus) {
+        self.connecting_since = match status {
+            ConnectionStatus::Connecting => self
+                .connecting_since
+                .filter(|_| matches!(self.connection_status, ConnectionStatus::Connecting))
+                .or_else(|| Some(Instant::now())),
+            _ => None,
+        };
+        self.connection_status = status;
+    }
+
     /// The current block reward and next reduction, from the network and DAA score.
     /// `None` until both are known, or on a network with an unknown schedule.
     pub fn block_reward(&self) -> Option<BlockReward> {
@@ -440,11 +460,74 @@ pub enum StartPoint {
     LastDay,
 }
 
+/// The logging settings as the GUI applies them (`~/.x4kas/logging.toml`): the level
+/// and extra filter at once, the rest from the next launch.
+#[derive(Debug, Clone, Default)]
+pub struct LogState {
+    pub settings: crate::logging::LogSettings,
+    /// A save that failed, or the keys of the file that didn't load.
+    pub error: Option<String>,
+    /// The environment variable that decides the filter instead of the settings.
+    pub env_override: Option<&'static str>,
+    /// Whether the filter can change while running (logging started); false also
+    /// while `env_override` decides.
+    pub live: bool,
+    /// The log files on disk, newest first (`UiCommand::LogFilesRefresh`); `None`
+    /// until listed.
+    pub files: Option<Vec<crate::log_files::LogFileInfo>>,
+    /// The file the Logs page shows (`UiCommand::LogFileOpen`).
+    pub open: Option<OpenLogFile>,
+    /// The search across files (`UiCommand::LogSearch`).
+    pub search: LogSearch,
+}
+
+/// A log file being opened or open in the Logs page.
+#[derive(Debug, Clone, Default)]
+pub struct OpenLogFile {
+    pub path: std::path::PathBuf,
+    /// Its line index, once built; the GUI reads lines through it, the controller adds
+    /// appended ones (`UiCommand::LogFileTail`).
+    pub file: Option<std::sync::Arc<std::sync::RwLock<crate::log_files::LogFile>>>,
+    /// How far indexing has come, `0.0..=1.0`, while opening.
+    pub progress: f32,
+    pub error: Option<String>,
+    /// The lines matching a text in it (`UiCommand::LogFileFind`).
+    pub find: Option<FileFind>,
+    /// Bumped by each open, so a late answer for an earlier one is dropped.
+    pub generation: u64,
+}
+
+/// A text looked for in the open log file.
+#[derive(Debug, Clone, Default)]
+pub struct FileFind {
+    pub text: crate::log_files::SearchText,
+    pub min: Option<crate::logging::LogLevel>,
+    /// The matching lines, once read through; shared, since the GUI takes them every
+    /// frame and there can be millions.
+    pub lines: Option<std::sync::Arc<Vec<u32>>>,
+    pub progress: f32,
+    pub error: Option<String>,
+    pub generation: u64,
+}
+
+/// A search across log files.
+#[derive(Debug, Clone, Default)]
+pub struct LogSearch {
+    pub running: bool,
+    pub progress: f32,
+    pub result: Option<crate::log_files::SearchResult>,
+    pub error: Option<String>,
+    pub generation: u64,
+}
+
 /// Progress of the chain pipeline (the VSPC stream, the index writer and the analytics
 /// it carries), shown in the status bar and on the Dashboard tab.
 #[derive(Debug, Clone, Default)]
 pub struct ChainStatus {
+    /// Changed through [`ChainStatus::set_phase`], which logs it.
     pub phase: ChainPhase,
+    /// The last error logged, so a retry failing the same way isn't logged again.
+    error_log: crate::logging::ErrorLog,
 
     // --- The stream ---
     pub started_from: Option<StartPoint>,
@@ -494,6 +577,50 @@ pub struct ChainStatus {
 }
 
 impl ChainStatus {
+    /// Move to `phase`, logging the change; false when it is the phase already. An
+    /// error is logged when it starts or changes, not as the stream retries it (error,
+    /// seeking or waiting, error again every few seconds); the recovery once the stream
+    /// gets going again.
+    pub fn set_phase(&mut self, phase: ChainPhase) -> bool {
+        use crate::logging::log_error_change;
+        if self.phase == phase {
+            return false;
+        }
+        match &phase {
+            ChainPhase::Error(e) => log_error_change!(
+                tracing::Level::WARN,
+                self.error_log.update(Some(e)),
+                "chain pipeline"
+            ),
+            // Retrying: not a recovery yet.
+            ChainPhase::Seeking | ChainPhase::WaitingForNode if self.error_log.failing() => {
+                tracing::debug!(phase = ?phase, "chain pipeline retrying")
+            }
+            ChainPhase::Seeking | ChainPhase::WaitingForNode => {
+                tracing::info!(phase = ?phase, "chain pipeline phase")
+            }
+            ChainPhase::CatchingUp | ChainPhase::Live => {
+                log_error_change!(
+                    tracing::Level::WARN,
+                    self.error_log.update(None),
+                    "chain pipeline"
+                );
+                if phase == ChainPhase::Live {
+                    tracing::info!("chain pipeline live: synced to the tip");
+                } else {
+                    tracing::info!(phase = ?phase, "chain pipeline phase");
+                }
+            }
+            // Stopped or starting over: what failed before no longer counts.
+            ChainPhase::Idle | ChainPhase::Opening => {
+                self.error_log = Default::default();
+                tracing::info!(phase = ?phase, "chain pipeline phase");
+            }
+        }
+        self.phase = phase;
+        true
+    }
+
     /// Catch-up progress between the start point and `tip_daa`, in `0.0..=1.0`.
     pub fn fraction(&self, tip_daa: u64) -> Option<f32> {
         let (start, current) = (self.start_daa?, self.current_daa?);
@@ -1200,6 +1327,8 @@ pub struct App {
     pub index_settings: crate::config::IndexSettings,
     /// Why the last change to `index_settings` couldn't be saved.
     pub index_settings_error: Option<String>,
+    /// The logging settings and what the Settings page shows about the logs.
+    pub logs: LogState,
     pub market_data: Option<MarketData>,
     /// Why the last market fetch failed; cleared by the next success.
     pub market_error: Option<String>,
@@ -1220,7 +1349,112 @@ pub struct LabelRefresh {
     pub last_error: Option<String>,
 }
 
+/// How bad a [`HealthIssue`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Severity {
+    /// Something is off, but the app keeps working around it.
+    Warn,
+    /// Data isn't coming in or being stored.
+    Error,
+}
+
+/// A problem happening now, as the health icon lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealthIssue {
+    pub severity: Severity,
+    /// What is affected, e.g. "Node connection".
+    pub what: String,
+    pub detail: String,
+}
+
 impl App {
+    /// What is failing right now, worst first: each part's current error state (a
+    /// failure that recovered isn't listed). Not being connected isn't a problem.
+    pub fn health(&self) -> Vec<HealthIssue> {
+        let mut issues = Vec::new();
+        let mut add = |severity, what: &str, detail: &str| {
+            issues.push(HealthIssue {
+                severity,
+                what: what.to_string(),
+                detail: detail.to_string(),
+            })
+        };
+        match &self.node.connection_status {
+            ConnectionStatus::Error(e) => add(Severity::Error, "Node connection", e),
+            ConnectionStatus::Connecting => {
+                // A lost connection while the client reconnects, or a connect taking
+                // too long; a first connect isn't a problem.
+                let waited = self.node.connecting_since.map(|t| t.elapsed());
+                if let Some(e) = &self.node.last_error {
+                    add(Severity::Error, "Node connection", e);
+                } else if let Some(waited) = waited.filter(|w| *w >= CONNECT_PATIENCE) {
+                    let target = match &self.connection {
+                        ActiveConnection::Url(url) => url.as_str(),
+                        _ => "the public resolver",
+                    };
+                    add(
+                        Severity::Warn,
+                        "Node connection",
+                        &format!("Still connecting to {target} after {}s", waited.as_secs()),
+                    );
+                }
+            }
+            ConnectionStatus::Connected => {
+                if let Some(e) = &self.node.last_error {
+                    add(Severity::Warn, "Node requests", e);
+                }
+            }
+            ConnectionStatus::Disconnected => {}
+        }
+        if let ChainPhase::Error(e) = &self.chain.phase {
+            add(Severity::Error, "Chain pipeline", e);
+        }
+        if let Some(e) = &self.chain.write_error {
+            add(Severity::Error, "Index writes", e);
+        }
+        if let WatchPhase::Unavailable(why) = &self.watch.status.phase {
+            add(Severity::Warn, "Watchlist", why);
+        }
+        if let Some(e) = &self.watch.status.last_error {
+            add(Severity::Warn, "Watchlist", e);
+        }
+        if let Some(e) = &self.watch.history_error {
+            add(Severity::Warn, "Alert history", e);
+        }
+        let mut failing: Vec<_> = self
+            .query
+            .watch_status
+            .iter()
+            .filter_map(|(id, status)| Some((id, status.last_error.as_ref()?)))
+            .collect();
+        failing.sort();
+        for (id, e) in failing {
+            let name = self
+                .query
+                .saved
+                .get(id)
+                .map_or(id.as_str(), |q| q.name.as_str());
+            add(Severity::Warn, &format!("Watched query \"{name}\""), e);
+        }
+        if let Some(e) = &self.query.save_error {
+            add(Severity::Warn, "Saved queries", e);
+        }
+        if let Some(e) = &self.index_settings_error {
+            add(Severity::Warn, "Index settings", e);
+        }
+        if let Some(e) = &self.logs.error {
+            add(Severity::Warn, "Log settings", e);
+        }
+        if let Some(e) = &self.label_refresh.last_error {
+            add(Severity::Warn, "Label list", e);
+        }
+        if let Some(e) = &self.market_error {
+            add(Severity::Warn, "Market data", e);
+        }
+        issues.sort_by_key(|issue| std::cmp::Reverse(issue.severity));
+        issues
+    }
+
     /// Ask the frontend to redraw after a state change.
     pub fn mark_dirty(&mut self) {
         if let Some(ref repaint) = self.repaint {
@@ -1516,6 +1750,91 @@ mod tests {
         assert_eq!(app.chain.phase, ChainPhase::Idle);
         assert_eq!(app.chain.blocks_processed, 0);
         assert_eq!(app.chain.txs_indexed, 0);
+    }
+
+    #[test]
+    fn connecting_since_follows_the_status() {
+        let mut node = NodeState::default();
+        node.set_status(ConnectionStatus::Connecting);
+        let since = node.connecting_since.expect("connecting");
+        // Still connecting: the same start.
+        node.set_status(ConnectionStatus::Connecting);
+        assert_eq!(node.connecting_since, Some(since));
+        node.set_status(ConnectionStatus::Connected);
+        assert_eq!(node.connecting_since, None);
+        node.set_status(ConnectionStatus::Connecting);
+        assert!(node.connecting_since.is_some_and(|t| t >= since));
+    }
+
+    #[test]
+    fn health_lists_current_problems_worst_first() {
+        let mut app = App::default();
+        assert!(app.health().is_empty());
+        // Connecting for the first time, or not connected, is fine.
+        app.node.connection_status = ConnectionStatus::Connecting;
+        assert!(app.health().is_empty());
+        app.market_error = Some("timeout".into());
+        app.node.last_error = Some("Connection lost, reconnecting…".into());
+        app.chain.write_error = Some("disk full".into());
+        let issues = app.health();
+        let shown: Vec<_> = issues
+            .iter()
+            .map(|i| (i.severity, i.what.as_str()))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                (Severity::Error, "Node connection"),
+                (Severity::Error, "Index writes"),
+                (Severity::Warn, "Market data"),
+            ]
+        );
+        // A connect taking too long is a warning.
+        app.node.last_error = None;
+        app.node.connecting_since = Some(Instant::now() - CONNECT_PATIENCE);
+        assert_eq!(app.health()[0].severity, Severity::Error);
+        assert_eq!(
+            app.health()[1],
+            HealthIssue {
+                severity: Severity::Warn,
+                what: "Node connection".into(),
+                detail: "Still connecting to the public resolver after 15s".into(),
+            }
+        );
+        app.node.last_error = Some("Connection lost, reconnecting…".into());
+        // Connected, a failing poll is a warning.
+        app.node.connection_status = ConnectionStatus::Connected;
+        assert_eq!(app.health()[1].severity, Severity::Warn);
+        assert_eq!(app.health()[1].what, "Node requests");
+    }
+
+    #[test]
+    fn chain_errors_count_once_through_retries() {
+        let mut chain = ChainStatus::default();
+        let error = || ChainPhase::Error("boom".into());
+        assert!(chain.set_phase(ChainPhase::Seeking));
+        assert!(!chain.set_phase(ChainPhase::Seeking));
+        assert!(chain.set_phase(error()));
+        assert!(chain.error_log.failing());
+        // The retry cycle keeps the error: the next identical one isn't new.
+        for _ in 0..3 {
+            chain.set_phase(ChainPhase::Seeking);
+            chain.set_phase(ChainPhase::WaitingForNode);
+            assert!(chain.error_log.failing());
+            assert_eq!(
+                chain.error_log.clone().update(Some("boom")),
+                crate::logging::ErrorChange::Same
+            );
+            chain.set_phase(error());
+        }
+        // Getting going again is the recovery.
+        chain.set_phase(ChainPhase::CatchingUp);
+        assert!(!chain.error_log.failing());
+        chain.set_phase(error());
+        assert!(chain.error_log.failing());
+        // A restart forgets it.
+        chain.set_phase(ChainPhase::Opening);
+        assert!(!chain.error_log.failing());
     }
 
     #[test]

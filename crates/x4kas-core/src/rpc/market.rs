@@ -1,3 +1,4 @@
+use crate::logging::{error_change, log_error_change};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,19 +37,19 @@ pub fn start_market_polling(app_state: Arc<RwLock<App>>, interval: Duration) {
             if app_state.read().await.paused {
                 continue;
             }
-            match fetch_market_data(&client).await {
-                Ok(data) => {
-                    let mut app = app_state.write().await;
-                    app.market_data = Some(data);
-                    app.market_error = None;
-                    app.mark_dirty();
-                }
-                Err(e) => {
-                    let mut app = app_state.write().await;
-                    app.market_error = Some(e.to_string());
-                    app.mark_dirty();
-                }
+            let fetched = fetch_market_data(&client).await;
+            let mut app = app_state.write().await;
+            let error = fetched.as_ref().err().map(|e| e.to_string());
+            log_error_change!(
+                tracing::Level::WARN,
+                error_change(app.market_error.as_deref(), error.as_deref()),
+                "market data fetch"
+            );
+            if let Ok(data) = fetched {
+                app.market_data = Some(data);
             }
+            app.market_error = error;
+            app.mark_dirty();
         }
     });
 }

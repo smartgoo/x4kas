@@ -2417,14 +2417,14 @@ fn status_line(ui: &mut Ui, app: &App, text: &str) {
             "fetching balances from the node".to_string()
         } else {
             format!(
-                "scanned {} · matched {}",
+                "scanned {} | matched {}",
                 format_number(run.scanned),
                 format_number(run.matched)
             )
         };
         ui.label(
             RichText::new(format!(
-                "{what} · {:.1}s",
+                "{what} | {:.1}s",
                 run.started.elapsed().as_secs_f64()
             ))
             .weak(),
@@ -2470,7 +2470,7 @@ fn status_line(ui: &mut Ui, app: &App, text: &str) {
             .and_then(|q| q.limit)
             .unwrap_or(MAX_RESULT_ROWS)
             .min(MAX_RESULT_ROWS);
-        ui.label(RichText::new(format!("· limit {limit}")).weak())
+        ui.label(RichText::new(format!("| limit {limit}")).weak())
             .on_hover_text(format!(
                 "Only {} rows were kept: raise the limit (up to {}), or add \"order by\" so \
                  the ones kept are the ones that matter",

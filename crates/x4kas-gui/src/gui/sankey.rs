@@ -323,7 +323,7 @@ impl SankeyWindowUi {
                 format!("{} minted", format_kas(view.output_total() as f64, 2))
             } else {
                 format!(
-                    "{} in · {} out",
+                    "{} in | {} out",
                     view.input_total()
                         .map_or("?".to_string(), |t| format_kas(t as f64, 2)),
                     format_kas(view.output_total() as f64, 2)
@@ -402,7 +402,7 @@ impl SankeyWindowUi {
                     painter.text(
                         anchor,
                         align,
-                        format!("{} · {}", node.name, amount),
+                        format!("{} | {}", node.name, amount),
                         font,
                         color,
                     );
@@ -426,13 +426,13 @@ impl SankeyWindowUi {
                     (NodeKind::Coinbase, _) => "Newly minted by this block".to_string(),
                     (NodeKind::Fee, _) => "Paid to the miner".to_string(),
                     (NodeKind::Input, Some(txid)) => {
-                        format!("Created by {} · click to follow", shorten_middle(txid, 20))
+                        format!("Created by {} | click to follow", shorten_middle(txid, 20))
                     }
                     (NodeKind::Output | NodeKind::Change, Some(txid)) => {
-                        format!("Spent by {} · click to follow", shorten_middle(txid, 20))
+                        format!("Spent by {} | click to follow", shorten_middle(txid, 20))
                     }
                     (NodeKind::Change, None) => {
-                        "Likely change · unspent in the indexed window".to_string()
+                        "Likely change | unspent in the indexed window".to_string()
                     }
                     (_, None) => "Unspent in the indexed window".to_string(),
                 };

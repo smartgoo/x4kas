@@ -10,13 +10,26 @@ pub fn data_dir() -> PathBuf {
         .join(".x4kas")
 }
 
-/// The folder of the data directory the user's exports go into (`index::export`): the
-/// one thing a reset keeps.
+/// The folder of the data directory the user's exports go into (`index::export`), which
+/// a reset keeps, as it keeps the logs (`logging::LOGS_DIR`).
 pub const EXPORTS_DIR: &str = "exports";
+
+/// Show `path` in the system's file manager (Finder, Explorer, the desktop's).
+pub fn open_folder(path: &Path) -> std::io::Result<()> {
+    let program = if cfg!(target_os = "macos") {
+        "open"
+    } else if cfg!(windows) {
+        "explorer"
+    } else {
+        "xdg-open"
+    };
+    std::process::Command::new(program).arg(path).spawn()?;
+    Ok(())
+}
 
 /// Reset the app: delete everything in the data directory (settings, connection,
 /// watchlists, labels, saved queries, the index, the GUI's window state) but the
-/// exports. Run it with nothing open on the directory: the GUI does after its window
+/// exports and the logs. Run it with nothing open on the directory: the GUI does after its window
 /// closed and its runtime stopped. Refuses, deleting nothing, while another x4kas
 /// process has an index open; otherwise deletes all it can and says what it couldn't.
 pub fn reset_data_dir() -> std::result::Result<(), String> {
@@ -27,7 +40,7 @@ pub fn reset_data_dir() -> std::result::Result<(), String> {
             path.display()
         ));
     }
-    let failed = clear_dir(&data_dir(), &[EXPORTS_DIR]);
+    let failed = clear_dir(&data_dir(), &[EXPORTS_DIR, crate::logging::LOGS_DIR]);
     if failed.is_empty() {
         return Ok(());
     }
@@ -396,6 +409,29 @@ fn write_replacing(path: &Path, text: &str) -> Result<()> {
     Ok(())
 }
 
+/// Rewrite the settings file at `path`: `edit` gets its text (empty when there is none)
+/// and returns a result and the text to save, which replaces the file by a rename. Under
+/// an exclusive lock on a file beside it (`<name>.toml.lock`), so two processes editing
+/// it at once each apply their change to the other's.
+pub(crate) fn update_toml_file<T>(
+    path: &Path,
+    edit: impl FnOnce(&str) -> Result<(T, String)>,
+) -> Result<T> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let lock = std::fs::File::create(path.with_extension("toml.lock"))?;
+    lock.lock()?;
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e.into()),
+    };
+    let (result, out) = edit(&text).map_err(|e| anyhow::anyhow!("{}: {e:#}", path.display()))?;
+    write_replacing(path, &out)?;
+    Ok(result)
+}
+
 pub fn join_warnings(warnings: &[SettingsWarning]) -> Option<String> {
     (!warnings.is_empty()).then(|| {
         warnings
@@ -441,21 +477,10 @@ impl IndexSettings {
     /// text in the file unless an edit sets it, so a hand edit isn't lost to the
     /// fallback. Under an exclusive lock on a file beside it, as `Watchlists::update_file`.
     pub fn update_file(edits: &[IndexSettingsEdit]) -> Result<(Self, Vec<SettingsWarning>)> {
-        let path = Self::path();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let lock = std::fs::File::create(path.with_extension("toml.lock"))?;
-        lock.lock()?;
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(e) => return Err(e.into()),
-        };
-        let (settings, warnings, out) = Self::edit_text(&text, edits)
-            .map_err(|e| anyhow::anyhow!("{}: {e:#}", path.display()))?;
-        write_replacing(&path, &out)?;
-        Ok((settings, warnings))
+        update_toml_file(&Self::path(), |text| {
+            let (settings, warnings, out) = Self::edit_text(text, edits)?;
+            Ok(((settings, warnings), out))
+        })
     }
 
     /// [`IndexSettings::update_file`] on the file's `text`: the settings, the warnings

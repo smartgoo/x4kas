@@ -10,6 +10,9 @@ mod dialogs;
 mod explorer;
 mod flows;
 mod help;
+mod log_table;
+mod log_view;
+mod logs_page;
 mod mempool;
 mod monitoring;
 mod pane;
@@ -34,6 +37,7 @@ use crate::Args;
 use connection::ConnectionWindow;
 use explorer::ExplorerUi;
 use flows::FlowWindowUi;
+use logs_page::LogsPage;
 use monitoring::MonitoringTab;
 use pane::InfoPane;
 use query::QueryTab;
@@ -42,13 +46,16 @@ use settings::SettingsPage;
 use terminal::TerminalPane;
 use toasts::Toasts;
 use widgets::kv;
-use x4kas_core::app::{ActiveConnection, App, ChainPhase, ConnectionStatus, StartPoint, Tab};
+use x4kas_core::app::{
+    ActiveConnection, App, ChainPhase, ConnectionStatus, HealthIssue, Severity, StartPoint, Tab,
+};
 use x4kas_core::chain_stream;
 use x4kas_core::chain_stream::StreamStart;
 use x4kas_core::config::{ConnectionKind, ConnectionSettings};
 use x4kas_core::controller::{self, CommandSender, ControllerArgs, RemoteTarget, UiCommand};
 use x4kas_core::format::{format_duration, format_duration_ms, format_number, format_utc, now_ms};
 use x4kas_core::labels;
+use x4kas_core::logging::{LogBuffer, Unseen};
 use x4kas_core::rpc::market;
 
 /// How the GUI ended.
@@ -60,12 +67,19 @@ pub enum Exit {
 }
 
 /// Start background tasks on `rt` and run the GUI on the current (main) thread.
-pub fn run(rt: &tokio::runtime::Runtime, args: Args) -> Result<Exit> {
+pub fn run(
+    rt: &tokio::runtime::Runtime,
+    args: Args,
+    logs: Option<&x4kas_core::logging::LogRuntime>,
+) -> Result<Exit> {
     let app = Arc::new(RwLock::new(App::default()));
 
     // `--url` overrides the saved connection choice; without it, open the connection
     // window so the user can pick one.
-    let mut settings = ConnectionSettings::load().unwrap_or_default();
+    let mut settings = ConnectionSettings::load().unwrap_or_else(|e| {
+        tracing::warn!("couldn't load the connection settings: {e:#}");
+        ConnectionSettings::default()
+    });
     let remote = args.url.clone().map(|url| {
         settings.kind = ConnectionKind::Url;
         settings.url = url.clone();
@@ -91,9 +105,13 @@ pub fn run(rt: &tokio::runtime::Runtime, args: Args) -> Result<Exit> {
                 remote,
                 refresh_interval_ms: args.refresh_interval_ms,
                 backfill: Some(StreamStart::default_backfill()),
+                log: logs.map(|l| l.control()),
             },
         )
     };
+
+    // The latest log records, for Settings › Logs.
+    let log_buffer = logs.and_then(|l| l.buffer());
 
     let options = eframe::NativeOptions {
         // Window geometry and egui's own memory (panel sizes) persist here, next to the
@@ -131,8 +149,11 @@ pub fn run(rt: &tokio::runtime::Runtime, args: Args) -> Result<Exit> {
             let ctx = cc.egui_ctx.clone();
             app.blocking_write().repaint = Some(Arc::new(move || ctx.request_repaint()));
             let mut gui = GuiApp::new(app, cmd_tx, connection, gui_reset, cc.storage);
+            gui.logs = LogsPage::new(log_buffer.clone());
+            gui.log_buffer = log_buffer;
             if let Some(report) = reset_report {
                 gui.settings.show_reset_report(report);
+                gui.page = Some(Page::Settings);
             }
             Ok(Box::new(gui))
         }),
@@ -159,11 +180,15 @@ enum EscTarget {
     /// The Settings page's reset confirmation.
     SettingsDialog,
     Pane,
-    Settings,
+    /// Settings or Logs.
+    Page,
 }
 
 /// How long the shutdown waits before offering to quit without finishing.
 const SHUTDOWN_PATIENCE: Duration = Duration::from_secs(5);
+/// How long a quit by the system (macOS's Quit) waits for the shutdown before the
+/// process ends regardless: the window may already be gone, so there is no one to ask.
+const QUIT_PATIENCE: Duration = Duration::from_secs(10);
 
 /// What the GUI remembers between launches, beyond what eframe keeps by itself (the
 /// window's size and position, panel sizes). Saved through `eframe::App::save`.
@@ -195,6 +220,13 @@ fn yes() -> bool {
 
 const PREFS_KEY: &str = "prefs";
 
+/// A page drawn in place of the active tab, opened from the top bar.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Page {
+    Settings,
+    Logs,
+}
+
 struct GuiApp {
     app: Arc<RwLock<App>>,
     cmd_tx: CommandSender,
@@ -213,7 +245,12 @@ struct GuiApp {
     terminal: TerminalPane,
     monitoring: MonitoringTab,
     explorer: ExplorerUi,
+    /// The page shown in place of the active tab, if any.
+    page: Option<Page>,
     settings: SettingsPage,
+    logs: LogsPage,
+    /// The latest log records (the Logs page's Live view, the health icon's count).
+    log_buffer: Option<Arc<LogBuffer>>,
     pane: InfoPane,
     flow_window: FlowWindowUi,
     sankey_window: SankeyWindowUi,
@@ -261,7 +298,10 @@ impl GuiApp {
             terminal: TerminalPane::new(),
             monitoring,
             explorer,
+            page: None,
             settings: SettingsPage::default(),
+            logs: LogsPage::default(),
+            log_buffer: None,
             pane: InfoPane::default(),
             flow_window,
             sankey_window: SankeyWindowUi::default(),
@@ -272,7 +312,8 @@ impl GuiApp {
     }
 
     /// Defer window close until the controller has disconnected and saved state.
-    /// Cmd+Q (Ctrl+Q elsewhere) asks for the same close, so it takes the same path.
+    /// Ctrl+Q off macOS asks for the same close, so it takes the same path. On macOS the
+    /// app menu takes Cmd+Q before egui sees it: that quit ends in `on_exit`.
     fn handle_close(&mut self, ctx: &egui::Context) {
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Q)) {
             ctx.send_viewport_cmd(ViewportCommand::Close);
@@ -280,6 +321,7 @@ impl GuiApp {
         if ctx.input(|i| i.viewport().close_requested()) && !self.shutdown_complete {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
             if self.shutdown_rx.is_none() {
+                tracing::info!("window close requested: shutting down");
                 let (tx, rx) = oneshot::channel();
                 let _ = self.cmd_tx.send(UiCommand::Shutdown(tx));
                 self.shutdown_rx = Some(rx);
@@ -290,6 +332,7 @@ impl GuiApp {
         // A reset from Settings closes the app the same way; `main` wipes its data and
         // relaunches it once the window is gone.
         if std::mem::take(&mut self.settings.reset_requested) && !self.is_shutting_down() {
+            tracing::info!("reset requested: closing to wipe the data directory");
             self.reset.store(true, Ordering::SeqCst);
             ctx.send_viewport_cmd(ViewportCommand::Close);
         }
@@ -338,12 +381,12 @@ impl GuiApp {
             Some(EscTarget::Flows)
         } else if self.query.modal_open() {
             Some(EscTarget::QueryDialog)
-        } else if self.settings.modal_open() {
+        } else if self.page == Some(Page::Settings) && self.settings.modal_open() {
             Some(EscTarget::SettingsDialog)
         } else if app.explorer.pane.is_some() {
             Some(EscTarget::Pane)
-        } else if self.settings.open {
-            Some(EscTarget::Settings)
+        } else if self.page.is_some() {
+            Some(EscTarget::Page)
         } else {
             None
         }
@@ -358,6 +401,43 @@ impl eframe::App for GuiApp {
     /// Opaque: the window is transparent only to lose macOS's frame highlight.
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         theme::BG.to_normalized_gamma_f32()
+    }
+
+    /// The last call before the app ends, after `save`. Our own close (the window's
+    /// close button, Cmd+Q off macOS, a reset) has finished its shutdown by then. macOS's
+    /// Quit (Cmd+Q, which the app menu takes before egui sees it, the menu, the Dock,
+    /// logging out) comes straight here instead, and the process exits as soon as this
+    /// returns (`main` never gets control back): so shut down here, waiting at most
+    /// `QUIT_PATIENCE`, and write out the log file's last lines.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if self.shutdown_complete {
+            return;
+        }
+        tracing::info!("quit by the system (app menu, Dock or Cmd+Q): shutting down");
+        let started = Instant::now();
+        let mut rx = self.shutdown_rx.take().unwrap_or_else(|| {
+            let (tx, rx) = oneshot::channel();
+            let _ = self.cmd_tx.send(UiCommand::Shutdown(tx));
+            rx
+        });
+        // The main thread, outside the runtime: poll rather than block on it.
+        loop {
+            match rx.try_recv() {
+                Err(oneshot::error::TryRecvError::Empty) if started.elapsed() < QUIT_PATIENCE => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(oneshot::error::TryRecvError::Empty) => {
+                    tracing::warn!(
+                        "the shutdown didn't finish within {}s: exiting anyway",
+                        QUIT_PATIENCE.as_secs()
+                    );
+                    break;
+                }
+                // Done, or the controller is gone.
+                _ => break,
+            }
+        }
+        x4kas_core::logging::flush();
     }
 
     /// Called by eframe every `auto_save_interval` and on exit.
@@ -391,7 +471,7 @@ impl eframe::App for GuiApp {
             ctx,
             &mut app,
             &mut self.show_help,
-            &mut self.settings.open,
+            &mut self.page,
             &mut self.terminal,
             &mut self.explorer,
             modal_open,
@@ -405,6 +485,15 @@ impl eframe::App for GuiApp {
         widgets::set_direct(ctx, app.connection.is_direct());
         widgets::set_labels(ctx, app.labels.clone());
 
+        // The Logs page on show is someone looking: nothing logged so far is new.
+        let unseen = match &self.log_buffer {
+            Some(buffer) if self.page == Some(Page::Logs) => {
+                buffer.mark_seen();
+                Unseen::default()
+            }
+            Some(buffer) => buffer.unseen(),
+            None => Unseen::default(),
+        };
         egui::TopBottomPanel::top("top_bar")
             .frame(bar_frame())
             .exact_height(TITLE_BAR_HEIGHT)
@@ -413,8 +502,9 @@ impl eframe::App for GuiApp {
                     ui,
                     &mut app,
                     &mut self.show_help,
-                    &mut self.settings,
+                    &mut self.page,
                     &mut self.terminal,
+                    &unseen,
                 )
             });
         // Added before the terminal so it stays at the very bottom, below it.
@@ -432,22 +522,29 @@ impl eframe::App for GuiApp {
         let esc = self.esc_target(ctx, &app);
         if esc == Some(EscTarget::Pane) {
             app.explorer.close_pane();
-        } else if esc == Some(EscTarget::Settings) {
-            self.settings.open = false;
+        } else if esc == Some(EscTarget::Page) {
+            self.page = None;
         }
         // The info pane slides in over the right of the tab, between the bars and above
         // the terminal, without moving what is behind it.
         self.pane.show(ctx, &mut app, &self.cmd_tx);
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            if self.settings.open {
-                self.settings.show(
-                    ui,
-                    &mut app,
-                    &self.cmd_tx,
-                    esc == Some(EscTarget::SettingsDialog),
-                );
-                return;
+            match self.page {
+                Some(Page::Settings) => {
+                    self.settings.show(
+                        ui,
+                        &mut app,
+                        &self.cmd_tx,
+                        esc == Some(EscTarget::SettingsDialog),
+                    );
+                    return;
+                }
+                Some(Page::Logs) => {
+                    self.logs.show(ui, &mut app, &self.cmd_tx);
+                    return;
+                }
+                None => {}
             }
             match app.active_tab {
                 Tab::Dashboard => dashboard::show(ui, &mut app),
@@ -476,7 +573,7 @@ impl eframe::App for GuiApp {
         let requests = widgets::take_explorer_requests(ctx);
         if !requests.is_empty() {
             app.active_tab = Tab::Explorer;
-            self.settings.open = false;
+            self.page = None;
             app.explorer.close_pane();
         }
         for (page, new_tab) in requests {
@@ -499,7 +596,7 @@ impl eframe::App for GuiApp {
             app.query.preload = Some(query);
             app.query.preload_id = id;
             app.active_tab = Tab::Query;
-            self.settings.open = false;
+            self.page = None;
             app.explorer.close_pane();
             ctx.request_repaint();
         }
@@ -563,6 +660,11 @@ impl eframe::App for GuiApp {
                     {
                         // The writer may still have the index open: deleting it under
                         // the writer isn't a reset, so quitting now cancels it.
+                        tracing::warn!(
+                            waited_s = self.shutdown_since.map(|t| t.elapsed().as_secs()),
+                            resetting,
+                            "quit before the shutdown finished"
+                        );
                         self.reset.store(false, Ordering::SeqCst);
                         self.shutdown_rx = None;
                         self.shutdown_complete = true;
@@ -572,7 +674,7 @@ impl eframe::App for GuiApp {
             });
         }
         // The page went away under its reset confirmation (a tab, the ⚙ button).
-        if !self.settings.open {
+        if self.page != Some(Page::Settings) {
             self.settings.cancel_reset();
         }
         // For the next frame's Esc (see `esc_taken`).
@@ -592,7 +694,7 @@ fn handle_shortcuts(
     ctx: &egui::Context,
     app: &mut App,
     show_help: &mut bool,
-    settings_open: &mut bool,
+    page: &mut Option<Page>,
     terminal: &mut TerminalPane,
     explorer: &mut ExplorerUi,
     modal_open: bool,
@@ -624,7 +726,7 @@ fn handle_shortcuts(
     }
     history_navigation(ctx, app);
     // Modifier combinations type nothing, so they work from the search field too.
-    if app.active_tab == Tab::Explorer && !*settings_open {
+    if app.active_tab == Tab::Explorer && page.is_none() {
         explorer.handle_shortcuts(ctx, app);
     }
     if ctx.wants_keyboard_input() {
@@ -635,7 +737,7 @@ fn handle_shortcuts(
         for (key, tab) in TAB_KEYS.iter().zip(Tab::all()) {
             if i.key_pressed(*key) {
                 app.active_tab = *tab;
-                *settings_open = false;
+                *page = None;
             }
         }
         if i.modifiers.ctrl && i.key_pressed(Key::Tab) {
@@ -644,7 +746,7 @@ fn handle_shortcuts(
             } else {
                 app.next_tab();
             }
-            *settings_open = false;
+            *page = None;
         }
         if i.key_pressed(Key::P) {
             app.paused = !app.paused;
@@ -727,8 +829,9 @@ fn top_bar(
     ui: &mut egui::Ui,
     app: &mut App,
     show_help: &mut bool,
-    settings: &mut SettingsPage,
+    page: &mut Option<Page>,
     terminal: &mut TerminalPane,
+    unseen: &Unseen,
 ) {
     title_bar_drag(ui);
     ui.horizontal_centered(|ui| {
@@ -743,30 +846,34 @@ fn top_bar(
             if i > 0 {
                 ui.label(RichText::new("|").color(theme::BORDER_HI));
             }
-            let selected = app.active_tab == *tab && !settings.open;
+            let selected = app.active_tab == *tab && page.is_none();
             if tab_button(ui, tab.label(), selected)
                 .on_hover_text(format!("Shortcut: {}", i + 1))
                 .clicked()
             {
                 app.active_tab = *tab;
-                settings.open = false;
+                *page = None;
             }
         }
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
+            if health_button(ui, &app.health(), unseen, *page == Some(Page::Logs)).clicked() {
+                toggle_page(page, Page::Logs);
+            }
+            // Framed buttons, like Help's; a page or pane on show is selected.
             if ui
-                .selectable_label(settings.open, "⚙")
+                .add(egui::Button::new("⚙").selected(*page == Some(Page::Settings)))
                 .on_hover_text("Settings")
                 .clicked()
             {
-                settings.toggle();
+                toggle_page(page, Page::Settings);
             }
             if ui.button("?").on_hover_text("Help (? / F1)").clicked() {
                 *show_help = !*show_help;
             }
             if ui
-                .selectable_label(terminal.open, ">_")
+                .add(egui::Button::new(">_").selected(terminal.open))
                 .on_hover_text("Terminal (Ctrl+`)")
                 .clicked()
             {
@@ -774,6 +881,126 @@ fn top_bar(
             }
         });
     });
+}
+
+/// Open `which`, or close it if it is the page on show.
+fn toggle_page(page: &mut Option<Page>, which: Page) {
+    *page = if *page == Some(which) {
+        None
+    } else {
+        Some(which)
+    };
+}
+
+/// The app's health at a glance, opening the Logs page: green while all is well,
+/// amber or red by the worst of what is failing now (`App::health`) and what was
+/// logged since the page was last open; the hover lists both.
+fn health_button(
+    ui: &mut egui::Ui,
+    issues: &[HealthIssue],
+    unseen: &Unseen,
+    open: bool,
+) -> egui::Response {
+    // The pulse on the screen shows trouble; all well, the icon is plain.
+    let worst = issues.first().map(|i| i.severity);
+    let alert = if worst == Some(Severity::Error) || unseen.errors > 0 {
+        Some(theme::ERROR)
+    } else if worst.is_some() || unseen.warnings > 0 {
+        Some(theme::WARN)
+    } else {
+        None
+    };
+    // Sized like the ⚙ button beside it: its glyph's box plus the padding.
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let glyph = ui
+        .painter()
+        .layout_no_wrap("⚙".to_string(), font, theme::TEXT)
+        .size();
+    let size = glyph + 2.0 * ui.spacing().button_padding;
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    response
+        .widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, open, "Health"));
+    if ui.is_rect_visible(rect) {
+        // Framed like the buttons beside it (`Button::selected`).
+        let visuals = ui.style().interact_selectable(&response, open);
+        ui.painter().rect(
+            rect.expand(visuals.expansion),
+            visuals.corner_radius,
+            visuals.weak_bg_fill,
+            visuals.bg_stroke,
+            egui::StrokeKind::Inside,
+        );
+        let color = visuals.text_color();
+        // A glyph's ink is about three quarters of its row.
+        let height = glyph.y * 0.74;
+        monitor_icon(
+            ui.painter(),
+            rect.center(),
+            height,
+            color,
+            alert.unwrap_or(color),
+        );
+    }
+    response.on_hover_ui(|ui| {
+        ui.set_max_width(460.0);
+        if issues.is_empty() && unseen.errors == 0 && unseen.warnings == 0 {
+            ui.label("All good");
+        }
+        for issue in issues {
+            let color = match issue.severity {
+                Severity::Error => theme::ERROR,
+                Severity::Warn => theme::WARN,
+            };
+            ui.label(RichText::new(&issue.what).color(color));
+            ui.label(RichText::new(&issue.detail).weak());
+        }
+        if unseen.errors > 0 || unseen.warnings > 0 {
+            if !issues.is_empty() {
+                ui.separator();
+            }
+            ui.label(format!(
+                "Logged since you last looked: {} error{}, {} warning{}",
+                unseen.errors,
+                if unseen.errors == 1 { "" } else { "s" },
+                unseen.warnings,
+                if unseen.warnings == 1 { "" } else { "s" },
+            ));
+            if let Some(latest) = &unseen.latest {
+                ui.label(RichText::new(&latest.message).weak());
+            }
+        }
+        ui.add_space(4.0);
+        ui.label(RichText::new("Click for the logs").weak());
+    })
+}
+
+/// A screen with a heartbeat on it, `height` tall (the ink of a glyph beside it): the
+/// screen's outline in `color`, the pulse in `pulse`.
+fn monitor_icon(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    height: f32,
+    color: egui::Color32,
+    pulse: egui::Color32,
+) {
+    let stroke = Stroke::new(1.3_f32, color);
+    let screen = egui::Rect::from_center_size(center, egui::vec2(height * 1.15, height * 0.85));
+    painter.rect_stroke(screen, 1.5, stroke, egui::StrokeKind::Middle);
+    // The pulse across the screen: flat, a spike up, a deeper one down, flat.
+    let (left, span) = (screen.left() + screen.width() * 0.12, screen.width() * 0.76);
+    let amp = screen.height() * 0.30;
+    let points = [
+        (0.0, 0.0),
+        (0.30, 0.0),
+        (0.42, -1.0),
+        (0.58, 1.0),
+        (0.70, 0.0),
+        (1.0, 0.0),
+    ]
+    .iter()
+    .map(|(x, y)| egui::pos2(left + x * span, center.y + y * amp))
+    .collect();
+    painter.add(egui::Shape::line(points, Stroke::new(1.3_f32, pulse)));
 }
 
 /// `x4kas`, with the 4 accented.

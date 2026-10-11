@@ -89,6 +89,35 @@ pub fn format_when(ms: u64) -> String {
     format!("{} ({} ago)", format_utc(ms), format_duration(ago))
 }
 
+/// A size on disk in the largest unit that keeps it at 1 or more: `512 B`, `3.4 KB`,
+/// `12.0 MB`, `1.2 GB` (units of 1024).
+pub fn format_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// The UTC time of day of `ms` to the millisecond, `HH:MM:SS.mmm`: a log line's time.
+pub fn format_clock_ms(ms: u64) -> String {
+    let secs = ms / 1000;
+    format!(
+        "{:02}:{:02}:{:02}.{:03}",
+        secs / 3600 % 24,
+        secs / 60 % 60,
+        secs % 60,
+        ms % 1000
+    )
+}
+
 /// A unix-millisecond timestamp as UTC, `2026-10-08T12:34:56Z`.
 pub fn format_utc(ms: u64) -> String {
     let secs = ms / 1000;
@@ -330,6 +359,23 @@ pub fn kaspa_stream_tx_url(txid: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sizes() {
+        assert_eq!(format_size(0), "0 B");
+        assert_eq!(format_size(1023), "1023 B");
+        assert_eq!(format_size(1536), "1.5 KB");
+        assert_eq!(format_size(12 * 1024 * 1024), "12.0 MB");
+        assert_eq!(format_size(3 * 1024 * 1024 * 1024), "3.0 GB");
+        assert_eq!(format_size(5 * 1024u64.pow(4)), "5120.0 GB");
+    }
+
+    #[test]
+    fn clock_ms() {
+        assert_eq!(format_clock_ms(0), "00:00:00.000");
+        // 2026-10-11 19:21:02.345 UTC
+        assert_eq!(format_clock_ms(1_791_746_462_345), "19:21:02.345");
+    }
 
     #[test]
     fn explorer_urls_by_network() {

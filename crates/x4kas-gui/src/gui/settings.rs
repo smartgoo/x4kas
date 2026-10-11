@@ -5,7 +5,7 @@
 //! opt-in data the address index keeps (full payloads, redeem scripts), how long it
 //! keeps data (shortening it asks first) and the width of its time slabs (applied by a
 //! Resync). Reset: wipe
-//! everything the app keeps under `~/.x4kas` (but exports) and relaunch it; the GUI
+//! everything the app keeps under `~/.x4kas` (but exports and logs) and relaunch it; the GUI
 //! closes through its usual shutdown first (`SettingsPage::reset_requested`), and
 //! `main` deletes and relaunches once the window and runtime are gone.
 
@@ -14,17 +14,22 @@ use egui_extras::{Column, TableBuilder};
 
 use super::theme;
 use super::widgets::{
-    CARD_GAP, address_bare, card, card_with_header, danger_button, edit_label_cell, kv_grid,
-    kv_with, label_cell, modal_window, placeholder, primary_button, request_label, section_title,
+    CARD_GAP, address_bare, card, card_with_header, copy_value, danger_button, edit_label_cell,
+    kv_grid, kv_with, label_cell, modal_window, or_dash, placeholder, primary_button,
+    request_label, section_title,
 };
 use x4kas_core::app::{App, ChainPhase};
 use x4kas_core::config::{
     DEFAULT_SLAB_HOURS, IndexFeature, IndexSettingsEdit, RETENTION_DAYS_CHOICES, Retention,
-    SLAB_HOURS_CHOICES, data_dir,
+    SLAB_HOURS_CHOICES, data_dir, open_folder,
 };
 use x4kas_core::controller::{CommandSender, UiCommand};
-use x4kas_core::format::{format_duration, format_number, format_utc, now_ms};
+use x4kas_core::format::{format_duration, format_number, format_size, format_utc, now_ms};
 use x4kas_core::labels::LabelSource;
+use x4kas_core::logging::{
+    DEFAULT_KEEP_DAYS, KEEP_DAYS_CHOICES, LogFormat, LogLevel, LogSettingsEdit, logs_dir,
+    validate_filter,
+};
 use x4kas_core::watch::validate_address;
 
 /// Width of the section navigation.
@@ -39,25 +44,27 @@ enum Section {
     #[default]
     AddressLabels,
     Index,
+    Logs,
     Reset,
 }
 
 impl Section {
-    const ALL: [Self; 3] = [Self::AddressLabels, Self::Index, Self::Reset];
+    const ALL: [Self; 4] = [Self::AddressLabels, Self::Index, Self::Logs, Self::Reset];
 
     fn label(self) -> &'static str {
         match self {
             Section::AddressLabels => "Address Labels",
             Section::Index => "DAG Index",
+            Section::Logs => "Logs",
             Section::Reset => "Reset",
         }
     }
 }
 
-/// The page's own state: whether it is on show, the chosen section and its forms.
+/// The page's own state: the chosen section and its forms (whether it is on show is
+/// `GuiApp::page`).
 #[derive(Default)]
 pub struct SettingsPage {
-    pub open: bool,
     section: Section,
     /// The "add a label" form.
     new_address: String,
@@ -75,6 +82,11 @@ pub struct SettingsPage {
     reset_report: Option<String>,
     /// The user confirmed a reset; the frame loop takes it and closes the app.
     pub reset_requested: bool,
+    /// The extra log filter being typed, until applied (`None`: the saved one).
+    log_filter: Option<String>,
+    /// The log file settings as the app launched with them (taken when the section is
+    /// first drawn, before anything here can change them).
+    log_files_launch: Option<LogFilesAtLaunch>,
 }
 
 /// How long a first click on 🗑 waits for the confirming second one.
@@ -84,23 +96,18 @@ impl SettingsPage {
     /// Open on the Reset section with what went wrong with the reset that relaunched
     /// the app.
     pub fn show_reset_report(&mut self, report: String) {
-        self.open = true;
         self.section = Section::Reset;
         self.reset_report = Some(report);
     }
 
     /// A window of the page (the reset confirmation) is on show.
     pub fn modal_open(&self) -> bool {
-        self.open && self.confirm_reset
+        self.confirm_reset
     }
 
     /// Forget an unanswered reset confirmation, so it doesn't come back with the page.
     pub fn cancel_reset(&mut self) {
         self.confirm_reset = false;
-    }
-
-    pub fn toggle(&mut self) {
-        self.open = !self.open;
     }
 
     /// `close_dialog`: the frame loop hands the page's window this frame's Esc.
@@ -128,6 +135,9 @@ impl SettingsPage {
                             .clicked()
                         {
                             self.section = section;
+                            if section == Section::Logs {
+                                let _ = cmd_tx.send(UiCommand::LogFilesRefresh);
+                            }
                         }
                     }
                 });
@@ -143,9 +153,101 @@ impl SettingsPage {
                 egui::ScrollArea::vertical().show(ui, |ui| match self.section {
                     Section::AddressLabels => self.address_labels(ui, app, cmd_tx),
                     Section::Index => index(ui, app, cmd_tx, &mut self.confirm_retention),
+                    Section::Logs => self.logs(ui, app, cmd_tx),
                     Section::Reset => self.reset(ui, app, cmd_tx),
                 });
             });
+    }
+
+    /// The log level and extra filter (applied at once) and the files (from the next
+    /// launch).
+    fn logs(&mut self, ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
+        if let Some(err) = &app.logs.error {
+            ui.label(RichText::new(err).color(theme::ERROR));
+            ui.add_space(CARD_GAP);
+        }
+        card(ui, "Log Level", |ui| self.log_level(ui, app, cmd_tx));
+        ui.add_space(CARD_GAP);
+        let launch = self
+            .log_files_launch
+            .get_or_insert_with(|| LogFilesAtLaunch::of(&app.logs.settings))
+            .clone();
+        card(ui, "Log Files", |ui| log_files(ui, app, cmd_tx, &launch));
+    }
+
+    fn log_level(&mut self, ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
+        if let Some(var) = app.logs.env_override {
+            ui.label(
+                RichText::new(format!(
+                    "{var} is set, so it decides what is logged. These settings apply when \
+                     the app is launched without it."
+                ))
+                .color(theme::WARN),
+            );
+            ui.add_space(6.0);
+        }
+        let send = |edit: LogSettingsEdit| {
+            let _ = cmd_tx.send(UiCommand::LogSettingsEdit(edit));
+        };
+        ui.add_enabled_ui(app.logs.env_override.is_none(), |ui| {
+            let mut level = app.logs.settings.level;
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Level:").color(theme::LABEL));
+                egui::ComboBox::from_id_salt("log_level")
+                    .selected_text(level_text(level))
+                    .show_ui(ui, |ui| {
+                        for l in LogLevel::ALL {
+                            ui.selectable_value(&mut level, l, level_text(l))
+                                .on_hover_text(level_doc(l));
+                        }
+                    });
+            });
+            if level != app.logs.settings.level {
+                // Shown at once; the controller saves it and changes the filter.
+                app.logs.settings.level = level;
+                send(LogSettingsEdit::Level(level));
+            }
+            ui.add_space(8.0);
+
+            let saved = app.logs.settings.filter.clone();
+            let draft = self.log_filter.get_or_insert_with(|| saved.clone());
+            let valid = validate_filter(draft);
+            let changed = draft.trim() != saved;
+            let mut apply = false;
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Extra filter:").color(theme::LABEL));
+                let field = ui.add(
+                    TextEdit::singleline(draft)
+                        .hint_text("e.g. fjall=info,x4kas_core::index=trace")
+                        .desired_width(380.0),
+                );
+                if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    apply = true;
+                }
+                if field.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    *draft = saved.clone();
+                }
+                apply |= ui
+                    .add_enabled(changed && valid.is_ok(), egui::Button::new("Apply"))
+                    .clicked();
+            });
+            if let Err(e) = &valid {
+                ui.label(RichText::new(e).color(theme::ERROR));
+            }
+            if apply && changed && valid.is_ok() {
+                let filter = draft.trim().to_string();
+                *draft = filter.clone();
+                app.logs.settings.filter = filter.clone();
+                send(LogSettingsEdit::Filter(filter));
+            }
+        });
+        if !app.logs.live && app.logs.env_override.is_none() {
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("Logging didn't start: a change applies from the next launch.")
+                    .color(theme::WARN),
+            );
+        }
     }
 
     fn address_labels(&mut self, ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
@@ -196,6 +298,8 @@ impl SettingsPage {
             ] {
                 ui.label(format!("  • {item}"));
             }
+            ui.add_space(4.0);
+            ui.label(RichText::new("Exported files and logs are kept.").weak());
             ui.add_space(8.0);
             if ui
                 .add(danger_button("Reset and restart"))
@@ -223,7 +327,7 @@ impl SettingsPage {
         let open = modal_window(ctx, window, close, |ui| {
             ui.label(
                 "All settings, watchlists, labels, saved queries and the index are deleted \
-                 and the app restarts. Exported files are kept.",
+                 and the app restarts. Exported files and logs are kept.",
             );
             ui.add_space(4.0);
             ui.label(RichText::new("This can't be undone.").color(theme::ERROR));
@@ -260,12 +364,12 @@ impl SettingsPage {
                     let _ = cmd_tx.send(UiCommand::RefreshLabels);
                 }
                 ui.label(RichText::new("fetched on launch and hourly").weak());
-                dot(ui);
+                separator(ui);
                 ui.label(format!(
                     "{} addresses",
                     format_number(book.public_len() as u64)
                 ));
-                dot(ui);
+                separator(ui);
                 if app.label_refresh.fetching {
                     ui.label(RichText::new("fetching…").weak());
                     ui.spinner();
@@ -384,8 +488,8 @@ struct LabelRow {
 
 /// How a label's source reads in the table: "manual" for the user's own.
 /// A dim separator between the items of a row.
-fn dot(ui: &mut Ui) {
-    ui.label(RichText::new("·").weak());
+fn separator(ui: &mut Ui) {
+    ui.label(RichText::new("|").weak());
 }
 
 fn source_name(source: LabelSource) -> &'static str {
@@ -754,5 +858,146 @@ fn slab_size(ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
                 .weak(),
             );
         }
+    }
+}
+
+fn level_text(level: LogLevel) -> String {
+    let name = match level {
+        LogLevel::Error => "Error",
+        LogLevel::Warn => "Warn",
+        LogLevel::Info => "Info",
+        LogLevel::Debug => "Debug",
+        LogLevel::Trace => "Trace",
+    };
+    if level == LogLevel::default() {
+        format!("{name} (default)")
+    } else {
+        name.to_string()
+    }
+}
+
+fn level_doc(level: LogLevel) -> &'static str {
+    match level {
+        LogLevel::Error => "Only failures.",
+        LogLevel::Warn => {
+            "Failures, and problems worth a look: a lost connection, a gap in the index."
+        }
+        LogLevel::Info => {
+            "Also what the app does: connections, the index's progress, alerts, exports."
+        }
+        LogLevel::Debug => {
+            "Also every batch, query, RPC call and UI command, with the addresses and \
+             transactions they name."
+        }
+        LogLevel::Trace => "Also every node poll. Very verbose.",
+    }
+}
+
+/// The file settings the log was opened with: a change to them applies from the next
+/// launch, which the Log Files card says while they differ.
+#[derive(Clone, PartialEq, Eq)]
+struct LogFilesAtLaunch {
+    file: bool,
+    format: LogFormat,
+    keep_days: u32,
+}
+
+impl LogFilesAtLaunch {
+    fn of(settings: &x4kas_core::logging::LogSettings) -> Self {
+        Self {
+            file: settings.file,
+            format: settings.format,
+            keep_days: settings.keep_days,
+        }
+    }
+}
+
+/// The files the GUI writes: on or off, their format and how long they are kept (from
+/// the next launch), where they are and their size.
+fn log_files(ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender, launch: &LogFilesAtLaunch) {
+    let mut settings = app.logs.settings.clone();
+    ui.checkbox(&mut settings.file, "Write log files");
+    ui.add_enabled_ui(settings.file, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Format:").color(theme::LABEL));
+            egui::ComboBox::from_id_salt("log_format")
+                .selected_text(format_text(settings.format))
+                .show_ui(ui, |ui| {
+                    for f in LogFormat::ALL {
+                        ui.selectable_value(&mut settings.format, f, format_text(f));
+                    }
+                });
+            ui.add_space(12.0);
+            ui.label(RichText::new("Keep:").color(theme::LABEL));
+            let days_text = |d: u32| {
+                let unit = if d == 1 { "day" } else { "days" };
+                if d == DEFAULT_KEEP_DAYS {
+                    format!("{d} {unit} (default)")
+                } else {
+                    format!("{d} {unit}")
+                }
+            };
+            egui::ComboBox::from_id_salt("log_keep_days")
+                .selected_text(days_text(settings.keep_days))
+                .show_ui(ui, |ui| {
+                    let current = settings.keep_days;
+                    // A period set with the CLI that isn't offered stays pickable.
+                    let extra = (!KEEP_DAYS_CHOICES.contains(&current)).then_some(current);
+                    for d in KEEP_DAYS_CHOICES.into_iter().chain(extra) {
+                        ui.selectable_value(&mut settings.keep_days, d, days_text(d));
+                    }
+                });
+        });
+    });
+    let saved = &app.logs.settings;
+    let edits = [
+        (settings.file != saved.file).then_some(LogSettingsEdit::File(settings.file)),
+        (settings.format != saved.format).then_some(LogSettingsEdit::Format(settings.format)),
+        (settings.keep_days != saved.keep_days)
+            .then_some(LogSettingsEdit::KeepDays(settings.keep_days)),
+    ];
+    for edit in edits.into_iter().flatten() {
+        let _ = cmd_tx.send(UiCommand::LogSettingsEdit(edit));
+    }
+    if LogFilesAtLaunch::of(&settings) != *launch {
+        ui.label(RichText::new("Restart app to apply").color(theme::WARN));
+    }
+    app.logs.settings = settings;
+    ui.add_space(6.0);
+
+    let dir = logs_dir();
+    kv_grid(ui, "log_files", |ui| {
+        kv_with(ui, "Folder", |ui| {
+            if ui
+                .button("Open folder")
+                .on_hover_text("Show the folder in the file manager")
+                .clicked()
+                && let Err(e) = open_folder(&dir)
+            {
+                tracing::warn!("couldn't open {}: {e}", dir.display());
+            }
+            copy_value(ui, &dir.display().to_string(), "Copy the path");
+        });
+        kv_with(ui, "On disk", |ui| {
+            if ui
+                .small_button("⟳")
+                .on_hover_text("Measure again")
+                .clicked()
+            {
+                let _ = cmd_tx.send(UiCommand::LogFilesRefresh);
+            }
+            ui.label(or_dash(app.logs.files.as_ref(), |files| {
+                let unit = if files.len() == 1 { "file" } else { "files" };
+                let bytes = files.iter().map(|f| f.bytes).sum();
+                format!("{} {unit}, {}", files.len(), format_size(bytes))
+            }));
+        });
+    });
+}
+
+fn format_text(format: LogFormat) -> &'static str {
+    match format {
+        LogFormat::Text => "Text (default)",
+        LogFormat::Json => "JSON lines",
     }
 }

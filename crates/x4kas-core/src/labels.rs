@@ -19,6 +19,7 @@ use tokio::sync::RwLock;
 use crate::app::App;
 use crate::config;
 use crate::emission;
+use crate::logging::{error_change, log_error_change};
 
 const KASPA_ORG_NAMES_URL: &str = "https://api.kaspa.org/addresses/names";
 /// How often the running app fetches the kaspa.org list again.
@@ -71,13 +72,26 @@ impl LabelSource {
 
 /// Opt-in online lookups, `~/.x4kas/labels/settings.toml`. Each sends the address being
 /// looked at to a third party, so they are off until the user turns them on.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LabelSettings {
     /// kas.fyi developer API key (developer.kas.fyi); lookups are on when set.
     pub kas_fyi_api_key: Option<String>,
     /// Resolve `.kas` names through the KNS indexer.
     pub kns: bool,
+}
+
+/// Without the API key, so it never reaches a log.
+impl std::fmt::Debug for LabelSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LabelSettings")
+            .field(
+                "kas_fyi_api_key",
+                &self.kas_fyi_api_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("kns", &self.kns)
+            .finish()
+    }
 }
 
 impl LabelSettings {
@@ -281,7 +295,10 @@ impl LabelBook {
     /// labels.
     pub fn load() -> Self {
         let mut book = Self::base();
-        book.user = UserLabels::load().unwrap_or_default();
+        book.user = UserLabels::load().unwrap_or_else(|e| {
+            tracing::warn!("couldn't load your address labels: {e:#}");
+            UserLabels::default()
+        });
         book.rebuild();
         book
     }
@@ -623,7 +640,9 @@ pub async fn lookup_online(settings: &LabelSettings, address: &str) -> Result<Ve
         }
     }
 
-    let _ = cache.save();
+    if let Err(e) = cache.save() {
+        tracing::warn!("couldn't save the online label cache: {e:#}");
+    }
     Ok(learned)
 }
 
@@ -692,16 +711,24 @@ pub async fn refresh_kaspa_org(app: &RwLock<App>) -> bool {
     let result = fetch_kaspa_org_names().await;
     let mut app = app.write().await;
     app.label_refresh.fetching = false;
+    // Retried every `RETRY_AFTER` while it fails: logged when the failure changes.
+    let error = result.as_ref().err().map(|e| format!("{e:#}"));
+    log_error_change!(
+        tracing::Level::WARN,
+        error_change(app.label_refresh.last_error.as_deref(), error.as_deref()),
+        "fetching the api.kaspa.org label list"
+    );
     let ok = match result {
         Ok(list) => {
+            tracing::info!(labels = list.len(), "fetched the api.kaspa.org label list");
             let mut book = (*app.labels).clone();
             book.apply_kaspa_org(&list, SystemTime::now());
             app.labels = Arc::new(book);
             app.label_refresh.last_error = None;
             true
         }
-        Err(e) => {
-            app.label_refresh.last_error = Some(format!("{e:#}"));
+        Err(_) => {
+            app.label_refresh.last_error = error;
             false
         }
     };
@@ -727,6 +754,19 @@ mod tests {
             SystemTime::now(),
         );
         book
+    }
+
+    #[test]
+    fn settings_debug_hides_the_api_key() {
+        let settings = LabelSettings {
+            kas_fyi_api_key: Some("secret-key".into()),
+            kns: true,
+        };
+        let shown = format!("{settings:?}");
+        assert!(
+            !shown.contains("secret-key") && shown.contains("redacted"),
+            "{shown}"
+        );
     }
 
     #[test]

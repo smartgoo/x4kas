@@ -430,7 +430,7 @@ impl FlowWindowUi {
                     ui.label(&node.address);
                     ui.label(
                         RichText::new(format!(
-                            "{} KAS over {} flows · hop {}",
+                            "{} KAS over {} flows | hop {}",
                             format_kas(node.volume as f64, 2),
                             graph
                                 .edges
@@ -443,9 +443,9 @@ impl FlowWindowUi {
                     );
                     ui.label(
                         RichText::new(if expanded {
-                            "Expanded · right-click for menu · drag to move"
+                            "Expanded | right-click for menu | drag to move"
                         } else {
-                            "Click to expand · right-click for menu · drag to move"
+                            "Click to expand | right-click for menu | drag to move"
                         })
                         .weak(),
                     );

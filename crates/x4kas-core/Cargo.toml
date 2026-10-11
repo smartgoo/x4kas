@@ -24,6 +24,13 @@ async-channel.workspace = true
 indexmap.workspace = true
 fjall.workspace = true
 kaspa-addresses.workspace = true
+log.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+tracing-log.workspace = true
+regex.workspace = true
+workflow-log.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -1433,8 +1433,39 @@ impl Meter<'_> {
     }
 }
 
+/// A query that takes longer than this is logged at info, the rest at debug.
+const SLOW_QUERY: Duration = Duration::from_secs(2);
+
 /// Answer `q`. The query must validate.
 pub fn run(inputs: &Inputs<'_>, q: &Query, ctl: &mut RunControl) -> Result<ResultSet> {
+    let result = run_query(inputs, q, ctl);
+    // The text may name addresses: the query itself only at debug.
+    match &result {
+        Ok(r) if r.elapsed >= SLOW_QUERY => tracing::info!(
+            ms = r.elapsed.as_millis() as u64,
+            scanned = r.scanned,
+            matched = r.matched,
+            rows = r.rows.len(),
+            partial = ?r.partial,
+            plan = %r.plan,
+            "slow query"
+        ),
+        Ok(r) => tracing::debug!(
+            ms = r.elapsed.as_millis() as u64,
+            scanned = r.scanned,
+            matched = r.matched,
+            rows = r.rows.len(),
+            partial = ?r.partial,
+            plan = %r.plan,
+            "query"
+        ),
+        Err(e) => tracing::debug!("query failed: {e:#}"),
+    }
+    tracing::debug!(text = %crate::query::text::print(q), "query text");
+    result
+}
+
+fn run_query(inputs: &Inputs<'_>, q: &Query, ctl: &mut RunControl) -> Result<ResultSet> {
     q.validate()?;
     let plan = plan(q, inputs.store, inputs.now_ms, inputs.prune_floor_ms)?;
     // The oldest transaction the window can hold: its start, or the index's oldest

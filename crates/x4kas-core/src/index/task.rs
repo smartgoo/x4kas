@@ -16,6 +16,7 @@ use crate::app::App;
 use crate::chain_stream::{BatchSender, ChainBatch, SINK_QUEUE};
 use crate::format::now_ms;
 use crate::labels::{LabelBook, MinerTally};
+use crate::logging::{ErrorLog, log_error_change};
 use crate::polling::PollingHandles;
 
 /// Refresh disk usage in the status every this many batches (it walks the directory).
@@ -51,7 +52,9 @@ pub fn start_writer(
     let writer = IndexWriter::new(store, labels)?;
     let position = writer.manifest().position;
     let (sender, receiver) = mpsc::channel::<Arc<ChainBatch>>(SINK_QUEUE);
+    let span = tracing::info_span!("index_writer");
     handles.index = Some(tokio::task::spawn_blocking(move || {
+        let _span = span.enter();
         run(writer, receiver, app);
     }));
     Ok(IndexSink { sender, position })
@@ -78,12 +81,31 @@ fn run(
         status.oldest_ms = store.oldest_ms();
         status.gaps = store.gaps().unwrap_or_default();
         status.disk_bytes = store.disk_space();
+        tracing::info!(
+            txs = manifest.txs_indexed,
+            blocks = manifest.blocks_indexed,
+            addresses = status.addresses,
+            slabs = status.slabs,
+            slab_hours = store.slab_hours(),
+            gaps = status.gaps.len(),
+            disk_mb = status.disk_bytes / 1_000_000,
+            "index writer started"
+        );
+        if let Some(from) = status.rebuilt_from {
+            tracing::warn!(
+                from_format = from,
+                "the index was rebuilt from scratch: its format changed"
+            );
+        }
         app.mark_dirty();
     }
 
     // Pools reveal themselves by mining many blocks; label them as they do.
     let mut miners = MinerTally::default();
     let mut batches = 0u64;
+    // The same failure tends to repeat with every batch: logged when it changes.
+    let mut write_errors = ErrorLog::default();
+    let mut prune_errors = ErrorLog::default();
     while let Some(batch) = receiver.blocking_recv() {
         // The latest labels for the clustering guard, and the retention floor (the
         // node's pruning point, which polling keeps in the app state, by default) to
@@ -104,17 +126,52 @@ fn run(
         }
         let result = writer.apply(&batch.response);
         batches += 1;
+        // Logged here, before pruning and the app lock, so the time is the batch's own
+        // and the GUI doesn't wait on the logging.
+        let write_error = result.as_ref().err().map(|e| format!("{e:#}"));
+        log_error_change!(
+            tracing::Level::ERROR,
+            write_errors.update(write_error.as_deref()),
+            "index write"
+        );
+        if let Ok(report) = &result {
+            log_report(report, started.elapsed());
+        }
 
-        let pruned = match floor {
-            Some(floor) => store.prune_before(floor).unwrap_or(0),
+        let pruned = match floor.map(|floor| (floor, store.prune_before(floor))) {
+            Some((floor, Ok(pruned))) => {
+                log_error_change!(
+                    tracing::Level::WARN,
+                    prune_errors.update(None),
+                    "index prune"
+                );
+                if pruned > 0 {
+                    tracing::info!(slabs = pruned, floor_ms = floor, "pruned the index");
+                }
+                pruned
+            }
+            Some((_, Err(e))) => {
+                let error = format!("{e:#}");
+                log_error_change!(
+                    tracing::Level::WARN,
+                    prune_errors.update(Some(&error)),
+                    "index prune"
+                );
+                0
+            }
             None => 0,
         };
         // A gap with no data left before it is just where the index starts now.
-        let gaps_changed = pruned > 0 && store.forget_gaps().unwrap_or(false);
+        let gaps_changed = pruned > 0
+            && store.forget_gaps().unwrap_or_else(|e| {
+                tracing::warn!("couldn't forget pruned gaps: {e:#}");
+                false
+            });
         let pool_labels: Vec<(String, String)> = coinbase_miners(&batch.response)
             .into_iter()
             .filter_map(|(address, tag)| {
                 let name = miners.observe(&address, tag.as_deref())?;
+                tracing::debug!(%address, %name, "mining pool recognized");
                 Some((address, name))
             })
             .collect();
@@ -142,7 +199,7 @@ fn run(
                 }
                 publish_views(&mut app, writer.analytics());
             }
-            Err(e) => app.chain.write_error = Some(format!("{e:#}")),
+            Err(_) => app.chain.write_error = write_error,
         }
         app.chain.backlog = receiver.len();
         if pruned > 0 || batches % DISK_EVERY == 1 {
@@ -167,7 +224,52 @@ fn run(
         app.mark_dirty();
     }
 
-    let _ = store.persist();
+    match store.persist() {
+        Ok(()) => tracing::info!(batches, "index writer stopped"),
+        Err(e) => tracing::warn!("index writer stopped; the final flush failed: {e:#}"),
+    }
+}
+
+/// What a batch did: the counts at debug, what deserves attention above it.
+fn log_report(report: &super::writer::BatchReport, took: Duration) {
+    tracing::debug!(
+        chain_blocks = report.chain_blocks,
+        txs = report.txs,
+        blocks = report.blocks,
+        skipped = report.skipped_blocks,
+        reorged = report.reorged_blocks,
+        ms = took.as_millis() as u64,
+        "indexed batch"
+    );
+    if report.reorged_blocks > 0 {
+        tracing::info!(
+            chain_blocks = report.reorged_blocks,
+            "index undid reorged chain blocks"
+        );
+    }
+    if !report.unresolved_reorgs.is_empty() {
+        tracing::warn!(
+            count = report.unresolved_reorgs.len(),
+            first = %report.unresolved_reorgs[0],
+            "reorg removed chain blocks the index doesn't have"
+        );
+    }
+    if let Some(gap) = &report.gap {
+        tracing::warn!(
+            from_ms = gap.from_ms,
+            to_ms = gap.to_ms,
+            "index gap recorded"
+        );
+    }
+    if let Some(hash) = report.analytics_reorgs.first() {
+        tracing::warn!(%hash, "reorg of a block analytics already finalized: its counts may be slightly off");
+    }
+    if report.cluster_cap_hits > 0 {
+        tracing::debug!(
+            hits = report.cluster_cap_hits,
+            "cluster size cap refused unions"
+        );
+    }
 }
 
 /// Recompute the Dashboard's views from `engine`.

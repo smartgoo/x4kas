@@ -7,6 +7,7 @@ use std::time::Duration;
 use anyhow::Result;
 use tokio::sync::RwLock;
 use tokio::task::{JoinHandle, JoinSet};
+use tracing::Instrument;
 
 use crate::app::App;
 use crate::rpc::client::RpcManager;
@@ -62,8 +63,10 @@ impl PollingHandles {
     /// stream that feeds it.
     pub async fn stop_index(&mut self) {
         self.stop_query_watch().await;
-        if let Some(h) = self.index.take() {
-            let _ = h.await;
+        if let Some(h) = self.index.take()
+            && let Err(e) = h.await
+        {
+            tracing::error!("the index writer thread failed: {e}");
         }
     }
 
@@ -85,22 +88,31 @@ pub fn start_hashrate_polling(
 ) {
     let rpc = rpc.clone();
     let app = app.clone();
-    handles.hashrate = Some(tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        let mut ticker = tokio::time::interval(Duration::from_secs(30));
-        loop {
-            ticker.tick().await;
-            let ready = {
-                let app = app.read().await;
-                !app.paused && app.node.server_info.as_ref().is_some_and(|s| s.is_synced)
-            };
-            if ready && let Ok(hashrate) = rpc.estimate_hashrate().await {
-                let mut app = app.write().await;
-                app.node.hashrate = Some(hashrate as f64);
-                app.mark_dirty();
+    handles.hashrate = Some(tokio::spawn(
+        async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let mut ticker = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                ticker.tick().await;
+                let ready = {
+                    let app = app.read().await;
+                    !app.paused && app.node.server_info.as_ref().is_some_and(|s| s.is_synced)
+                };
+                if !ready {
+                    continue;
+                }
+                match rpc.estimate_hashrate().await {
+                    Ok(hashrate) => {
+                        let mut app = app.write().await;
+                        app.node.hashrate = Some(hashrate as f64);
+                        app.mark_dirty();
+                    }
+                    Err(e) => tracing::debug!("hashrate estimate failed: {e:#}"),
+                }
             }
         }
-    }));
+        .instrument(tracing::info_span!("hashrate")),
+    ));
 }
 
 /// Create an RPC manager, then connect, poll and stream blocks in a task tracked by
@@ -116,16 +128,23 @@ pub fn create_and_start_rpc(
     let rpc = Arc::new(RpcManager::new(url, network, app.clone())?);
 
     let task_rpc = rpc.clone();
-    handles.node = Some(tokio::spawn(async move {
-        // The block stream goes first so it is listening before the first connect.
-        let poll = async {
-            let _ = task_rpc.connect().await;
-            task_rpc
-                .poll_forever(Duration::from_millis(refresh_interval_ms))
-                .await;
-        };
-        tokio::join!(task_rpc.stream_blocks(), poll);
-    }));
+    handles.node = Some(tokio::spawn(
+        async move {
+            // The block stream goes first so it is listening before the first connect.
+            let poll = async {
+                // A failure is recorded in the status (and logged): polling retries anyway.
+                let _ = task_rpc.connect().await;
+                task_rpc
+                    .poll_forever(Duration::from_millis(refresh_interval_ms))
+                    .await;
+            };
+            tokio::join!(task_rpc.stream_blocks(), poll);
+        }
+        .instrument(tracing::info_span!(
+            "node",
+            node = url.unwrap_or("public resolver")
+        )),
+    ));
 
     Ok(rpc)
 }

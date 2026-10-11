@@ -12,6 +12,8 @@ pub mod explorer;
 pub mod format;
 pub mod index;
 pub mod labels;
+pub mod log_files;
+pub mod logging;
 pub mod polling;
 pub mod query;
 pub mod rpc;

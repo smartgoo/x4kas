@@ -74,7 +74,7 @@ fn parse_retention(s: &str) -> Result<Retention, String> {
     s.parse()
 }
 
-fn parse_on_off(s: &str) -> Result<bool, String> {
+pub(crate) fn parse_on_off(s: &str) -> Result<bool, String> {
     match s.to_ascii_lowercase().as_str() {
         "on" | "true" | "yes" | "1" => Ok(true),
         "off" | "false" | "no" | "0" => Ok(false),

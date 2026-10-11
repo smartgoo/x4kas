@@ -12,10 +12,14 @@ Notable changes to x4kas. The format follows [Keep a Changelog](https://keepacha
 - Configurable index slab size.
 - Configurable index retention period, mirroring the node by default.
 - The index records the stretches it skipped, and queries over them say so.
+- Logging with configurable levels, to rolling files for the GUI and stderr for the CLI.
+- A Logs page to follow, open and search the log files, and a health icon in the top bar.
 
 ### Fixed
 
 - Watchlist activity and query alerts, with their read marks, are kept across restarts and connection switches.
+- The Kaspa client's warnings and errors no longer print into the CLI's stdout output.
+- Quitting on macOS with Cmd+Q, the app menu or the Dock now shuts down cleanly.
 
 ## [0.1.0]
 

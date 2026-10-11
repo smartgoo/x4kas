@@ -358,8 +358,8 @@ impl WatchDialog {
             .map(|l| l.name.clone());
         let short = shorten_middle(&self.address, 20);
         let title = match &editing_name {
-            Some(name) => format!("Watch settings on {name} · {short}"),
-            None => format!("Add to watchlist · {short}"),
+            Some(name) => format!("Watch settings on {name} | {short}"),
+            None => format!("Add to watchlist | {short}"),
         };
         let window = egui::Window::new(title)
             .id(egui::Id::new("watch_dialog"))

@@ -98,7 +98,10 @@ fn discard_at(path: &std::path::Path) -> Result<()> {
         ));
     }
     match std::fs::remove_dir_all(path) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            tracing::info!(path = %path.display(), "deleted the index");
+            Ok(())
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e).with_context(|| format!("discard {}", path.display())),
     }
@@ -335,6 +338,7 @@ impl IndexStore {
         let format: Option<u32> = store.meta_get("format")?;
         let stored_network: Option<String> = store.meta_get("network")?;
         if format.is_none() {
+            tracing::info!(path = %path.display(), network, slab_hours, "creating a new index");
             store.meta_put("format", &FORMAT_VERSION)?;
             store.meta_put("network", &network.to_string())?;
             store.init_slab_hours(slab_hours)?;
@@ -344,6 +348,14 @@ impl IndexStore {
             return Ok(store);
         }
         // Outdated or foreign: start over. Release the lock before removing the files.
+        tracing::warn!(
+            path = %path.display(),
+            format = ?format,
+            expected = FORMAT_VERSION,
+            stored_network = ?stored_network,
+            network,
+            "the index on disk is outdated or of another network: rebuilding it"
+        );
         drop(store);
         std::fs::remove_dir_all(&path).with_context(|| format!("reset {}", path.display()))?;
         let mut store = Self::open_dir(&path, network)?;
@@ -649,6 +661,7 @@ impl IndexStore {
             .cloned()
             .collect();
         for slab in &old {
+            tracing::debug!(slab = slab.no, end_ms = slab.end_ms(), "pruning index slab");
             for ks in slab.keyspaces() {
                 self.db.delete_keyspace(ks.clone())?;
             }

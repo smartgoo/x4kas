@@ -32,6 +32,17 @@ async-channel = "2"
 indexmap = { version = "2", features = ["serde"] }
 fjall = "3"
 tempfile = "3"
+# Logging: `tracing` everywhere, with the `log` crate's events bridged in (`x4kas_core::logging`).
+log = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+# `NormalizeEvent`: the real target of an event bridged from the `log` crate.
+tracing-log = "0.2"
+# Regular expressions in the Logs page's search.
+regex = "1"
+# The Kaspa client logs through workflow-log, which prints to stdout unless piped.
+workflow-log = "0.18"
 eframe = { version = "0.33", features = ["persistence"] }
 egui_extras = "0.33"
 # Integrated terminal widget, vendored with patches (see vendor/egui_term/Cargo.toml).

@@ -147,11 +147,10 @@ impl ConnectionWindow {
 
     fn connect(&mut self, cmd_tx: &CommandSender) {
         self.form.url = self.form.url.trim().to_string();
-        self.error = self
-            .form
-            .save()
-            .err()
-            .map(|e| format!("Could not save connection settings: {e}"));
+        self.error = self.form.save().err().map(|e| {
+            tracing::warn!("couldn't save the connection settings: {e:#}");
+            format!("Could not save connection settings: {e}")
+        });
 
         let target = RemoteTarget {
             url: (self.form.kind == ConnectionKind::Url).then(|| self.form.url.clone()),

@@ -13,9 +13,10 @@ use serde_json::json;
 use std::str::FromStr;
 use tokio::sync::RwLock;
 
-use crate::app::{App, ConnectionStatus, DagBlock, Tab};
+use crate::app::{App, CONNECT_PATIENCE, ConnectionStatus, DagBlock, Tab};
 use crate::emission;
 use crate::format::sompi_to_kas;
+use crate::logging::{ErrorLog, log_error_change};
 use crate::rpc::methods::{
     self, parse_address, parse_addresses, parse_bool, parse_hash, parse_opt_u64,
     parse_subnetwork_id, parse_u64, parse_u64_list, parse_verbosity,
@@ -24,6 +25,10 @@ use crate::rpc::methods::{
 pub struct RpcManager {
     client: KaspaRpcClient,
     app_state: Arc<RwLock<App>>,
+    /// What it connects to, for the log: the URL or the public resolver.
+    node: String,
+    /// The last poll's outcome, so a failure is logged when it changes.
+    poll_errors: std::sync::Mutex<ErrorLog>,
 }
 
 impl RpcManager {
@@ -36,13 +41,30 @@ impl RpcManager {
             Some(NetworkId::from_str(network)?),
             None,
         )?;
-        Ok(Self { client, app_state })
+        let node = url.unwrap_or("public resolver").to_string();
+        Ok(Self {
+            client,
+            app_state,
+            node,
+            poll_errors: Default::default(),
+        })
     }
 
     /// Connect, recording the outcome in `connection_status` (the controller has already
     /// set it to `Connecting`).
     pub async fn connect(&self) -> Result<()> {
-        self.connect_with(None).await
+        // It retries until the node answers: say so when that takes a while.
+        let connect = self.connect_with(None);
+        tokio::pin!(connect);
+        tokio::select! {
+            result = &mut connect => return result,
+            _ = tokio::time::sleep(CONNECT_PATIENCE) => tracing::warn!(
+                node = %self.node,
+                "still connecting to the node after {}s",
+                CONNECT_PATIENCE.as_secs()
+            ),
+        }
+        connect.await
     }
 
     /// Connect once, failing after `timeout` instead of retrying (for one-shot CLI calls).
@@ -56,15 +78,22 @@ impl RpcManager {
     }
 
     async fn connect_with(&self, options: Option<ConnectOptions>) -> Result<()> {
+        let node = &self.node;
+        tracing::info!(%node, "connecting to node");
         match self.client.connect(options).await {
             Ok(_) => {
+                tracing::info!(
+                    url = self.client.url().unwrap_or_default(),
+                    "connected to node"
+                );
                 let mut app = self.app_state.write().await;
-                app.node.connection_status = ConnectionStatus::Connected;
+                app.node.set_status(ConnectionStatus::Connected);
                 Ok(())
             }
             Err(e) => {
+                tracing::warn!(%node, "couldn't connect to node: {e}");
                 let mut app = self.app_state.write().await;
-                app.node.connection_status = ConnectionStatus::Error(e.to_string());
+                app.node.set_status(ConnectionStatus::Error(e.to_string()));
                 Err(e.into())
             }
         }
@@ -72,8 +101,9 @@ impl RpcManager {
 
     pub async fn disconnect(&self) -> Result<()> {
         self.client.disconnect().await?;
+        tracing::info!("disconnected from node");
         let mut app = self.app_state.write().await;
-        app.node.connection_status = ConnectionStatus::Disconnected;
+        app.node.set_status(ConnectionStatus::Disconnected);
         Ok(())
     }
 
@@ -189,11 +219,17 @@ impl RpcManager {
             app.node.last_refresh = Some(std::time::Instant::now());
             app.node.last_poll_duration_ms = Some(poll_duration_ms);
         }
-        app.node.last_error = if errors.is_empty() {
-            None
-        } else {
-            Some(errors.join("; "))
-        };
+        let error = (!errors.is_empty()).then(|| errors.join("; "));
+        // Polled every second: log a change, not every repeat. Against the poll's own
+        // last outcome: `last_error` also takes the connection's and subscription's.
+        let change = self
+            .poll_errors
+            .lock()
+            .expect("poll error log poisoned")
+            .update(error.as_deref());
+        log_error_change!(tracing::Level::WARN, change, "node poll");
+        tracing::trace!(ms = poll_duration_ms, "node poll");
+        app.node.last_error = error;
         app.mark_dirty();
     }
 
@@ -208,14 +244,21 @@ impl RpcManager {
         if self.client.is_connected() {
             self.subscribe_blocks(&sender).await;
         }
+        // Whether the connection was lost: the first connect is logged by `connect`.
+        let mut lost = false;
         loop {
             tokio::select! {
                 state = ctl.receiver.recv() => match state {
                     Ok(RpcState::Connected) => {
+                        if std::mem::take(&mut lost) {
+                            tracing::info!(url = self.client.url().unwrap_or_default(), "reconnected to node");
+                        }
                         self.set_status(ConnectionStatus::Connected, None).await;
                         self.subscribe_blocks(&sender).await;
                     }
                     Ok(RpcState::Disconnected) => {
+                        lost = true;
+                        tracing::warn!("connection to node lost, reconnecting");
                         self.set_status(
                             ConnectionStatus::Connecting,
                             Some("Connection lost, reconnecting…".to_string()),
@@ -236,7 +279,7 @@ impl RpcManager {
     /// Record a change of the connection's state (and the reason, if any) for the GUI.
     async fn set_status(&self, status: ConnectionStatus, error: Option<String>) {
         let mut app = self.app_state.write().await;
-        app.node.connection_status = status;
+        app.node.set_status(status);
         app.node.last_error = error;
         app.mark_dirty();
     }
@@ -252,6 +295,7 @@ impl RpcManager {
             .start_notify(id, Scope::BlockAdded(BlockAddedScope {}))
             .await
         {
+            tracing::warn!("couldn't subscribe to BlockAdded: {e}");
             self.app_state.write().await.node.last_error = Some(format!("block_added: {e}"));
         }
     }
@@ -297,9 +341,11 @@ impl RpcManager {
             let scope = Scope::UtxosChanged(UtxosChangedScope::new(addresses.clone()));
             async move { self.client.start_notify(id, scope).await }
         };
+        tracing::debug!(addresses = addresses.len(), "subscribing to UtxosChanged");
         if self.client.is_connected()
             && let Err(e) = subscribe(&tx).await
         {
+            tracing::warn!("couldn't subscribe to UtxosChanged: {e}");
             self.app_state.write().await.watch.status.last_error = Some(format!("subscribe: {e}"));
         }
         loop {
@@ -307,6 +353,7 @@ impl RpcManager {
                 state = ctl.receiver.recv() => match state {
                     Ok(RpcState::Connected) => {
                         if let Err(e) = subscribe(&tx).await {
+                            tracing::warn!("couldn't subscribe to UtxosChanged: {e}");
                             self.app_state.write().await.watch.status.last_error =
                                 Some(format!("subscribe: {e}"));
                         }
@@ -395,6 +442,17 @@ impl RpcManager {
     /// Run a read-only RPC method and return its full pretty-printed JSON response.
     /// Missing or empty arguments take the defaults declared in `methods::RPC_METHODS`.
     pub async fn rpc_json(&self, method: &str, args: &[String]) -> Result<String> {
+        let start = std::time::Instant::now();
+        let result = self.rpc_json_inner(method, args).await;
+        let ms = start.elapsed().as_secs_f64() * 1000.0;
+        match &result {
+            Ok(out) => tracing::debug!(method, ms, bytes = out.len(), "rpc call"),
+            Err(e) => tracing::debug!(method, ms, "rpc call failed: {e:#}"),
+        }
+        result
+    }
+
+    async fn rpc_json_inner(&self, method: &str, args: &[String]) -> Result<String> {
         let spec = methods::find(method)
             .ok_or_else(|| anyhow::anyhow!("Unknown RPC method: '{}'", method))?;
         let args = spec.resolve_args(args)?;

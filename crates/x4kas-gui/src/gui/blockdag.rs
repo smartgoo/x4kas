@@ -182,7 +182,7 @@ fn draw_blocks(
             ""
         };
         let text = format!(
-            "{}{tip}\nDAA score {} · {} parents\nClick for block info",
+            "{}{tip}\nDAA score {} | {} parents\nClick for block info",
             shorten_middle(&block.hash, 11),
             format_number(block.daa_score),
             block.parents.len(),

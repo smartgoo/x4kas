@@ -243,7 +243,10 @@ fn run_offline(network: &str, cmd: QueryCommand) -> Result<()> {
                 );
             }
             let labels = LabelBook::load();
-            let watchlist = Watchlists::load().unwrap_or_default();
+            let watchlist = Watchlists::load().unwrap_or_else(|e| {
+                tracing::warn!("couldn't load the watchlists: {e:#}");
+                Watchlists::default()
+            });
             let settings = x4kas_core::config::IndexSettings::load()?;
             let now = now_ms();
             let inputs = Inputs {
@@ -272,7 +275,7 @@ fn run_offline(network: &str, cmd: QueryCommand) -> Result<()> {
                     if last.elapsed() >= Duration::from_secs(1) {
                         last = Instant::now();
                         eprint!(
-                            "\rscanned {} · matched {} · {:.0}s",
+                            "\rscanned {} | matched {} | {:.0}s",
                             format_number(p.scanned),
                             format_number(p.matched),
                             p.elapsed.as_secs_f64()
@@ -529,10 +532,10 @@ fn caret_column(text: &str, e: &QueryError) -> Option<usize> {
     Some(text[..pos].chars().count())
 }
 
-/// `N rows (M matched, S scanned in T) · plan`, then the `notes`.
+/// `N rows (M matched, S scanned in T) | plan`, then the `notes`.
 fn summary(result: &ResultSet, notes: &[&str]) -> String {
     let mut s = format!(
-        "{} row{} ({} matched, {} scanned in {:.2}s) · {}",
+        "{} row{} ({} matched, {} scanned in {:.2}s) | {}",
         format_number(result.rows.len() as u64),
         if result.rows.len() == 1 { "" } else { "s" },
         format_number(result.matched),
@@ -541,13 +544,13 @@ fn summary(result: &ResultSet, notes: &[&str]) -> String {
         result.plan
     );
     if result.truncated {
-        s.push_str(" · more matched than shown");
+        s.push_str(" | more matched than shown");
     }
     if let Some(partial) = result.partial {
-        s.push_str(&format!(" · {}", partial.label()));
+        s.push_str(&format!(" | {}", partial.label()));
     }
     for note in notes {
-        s.push_str(" · ");
+        s.push_str(" | ");
         s.push_str(note);
     }
     s
@@ -809,7 +812,7 @@ mod tests {
         assert_eq!(exit_code(&result), PARTIAL_EXIT);
         assert!(
             summary(&result, &["limit clamped to 10,000"])
-                .ends_with("stopped at the scan cap · limit clamped to 10,000")
+                .ends_with("stopped at the scan cap | limit clamped to 10,000")
         );
         let all = text::parse("tx").unwrap();
         assert!(scans_everything(&all, &Source::TxTimeScan));
@@ -911,7 +914,7 @@ mod tests {
             &["ids shortened; --format csv or json for full values"],
         );
         assert!(s.ends_with(
-            "more matched than shown · ids shortened; --format csv or json for full values"
+            "more matched than shown | ids shortened; --format csv or json for full values"
         ));
         // Short cells aren't reported as shortened.
         let mut short = result.clone();

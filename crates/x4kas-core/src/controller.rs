@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
@@ -12,7 +13,10 @@ use tokio::sync::{RwLock, mpsc, oneshot};
 
 use crate::alerts::{AlertHistory, LoadError};
 use crate::analytics;
-use crate::app::{ActiveConnection, AddressView, App, ChainPhase, ConnectionStatus, ExportOrigin};
+use crate::app::{
+    ActiveConnection, AddressView, App, ChainPhase, ConnectionStatus, ExportOrigin, FileFind,
+    LogSearch, OpenLogFile,
+};
 use crate::chain_stream::{self, StreamStart};
 use crate::explorer::{
     self, AddressPageData, BlockView, ExplorerPage, PageData, ProtocolPageData, TxView,
@@ -22,6 +26,11 @@ use crate::index::export::{self, ExportFormat};
 use crate::index::query::{self, AddressProfile, Cursor, FlowGraph};
 use crate::index::{self, IndexStore, parse_hex};
 use crate::labels::{self, LabelBook};
+use crate::log_files::{self, LogFile, LogFileInfo, SearchText};
+use crate::logging::{
+    self, ErrorChange, LogControl, LogLevel, LogSettings, LogSettingsEdit, error_change,
+    log_error_change,
+};
 use crate::polling::{PollingHandles, create_and_start_rpc, start_hashrate_polling};
 use crate::query::exec::{self, Cell, ColumnSource, Inputs, QUERY_BUDGET, RunControl};
 use crate::query::fields::FieldId;
@@ -52,10 +61,16 @@ pub enum UiCommand {
     /// Stop whatever is running and stay disconnected.
     Disconnect,
     /// Run an RPC method with its arguments and store the result in `app.rpc_explorer`.
-    ExecuteRpc { method: String, args: Vec<String> },
+    ExecuteRpc {
+        method: String,
+        args: Vec<String>,
+    },
     /// Append the next (older) page of transactions to the address's loaded page
     /// (`app.explorer`'s cache, shown by the info pane or an Explorer tab).
-    AddressPage { address: String, before: Cursor },
+    AddressPage {
+        address: String,
+        before: Cursor,
+    },
     /// Append the next (older) page of a protocol's transactions to its loaded page.
     ProtocolPage {
         protocol: TransactionProtocol,
@@ -69,7 +84,10 @@ pub enum UiCommand {
     ExplorerLoad(ExplorerPage),
     /// Expand the flow graph from `address` by `hops` counterparties (merged into
     /// `app.address.flows`).
-    AddressFlows { address: String, hops: u8 },
+    AddressFlows {
+        address: String,
+        hops: u8,
+    },
     /// Load a transaction and its outputs' spenders for the transaction flow window
     /// (`app.sankey`).
     TxSankey {
@@ -106,8 +124,61 @@ pub enum UiCommand {
     /// Discard the index store (and with it the Dashboard's analytics) and rebuild it
     /// from the node, from scratch. Only with a direct node.
     Resync,
+    /// Save a change to the logging settings; the level and extra filter apply at once.
+    LogSettingsEdit(LogSettingsEdit),
+    /// List the log files on disk (`App::logs.files`).
+    LogFilesRefresh,
+    /// Index a log file for the Logs page (`App::logs.open`).
+    LogFileOpen(PathBuf),
+    /// Index the lines appended to the open log file since (following it).
+    LogFileTail,
+    /// Find a text in the open log file (an empty one clears the find).
+    LogFileFind {
+        text: SearchText,
+        min: Option<LogLevel>,
+    },
+    /// Search these log files (`App::logs.search`).
+    LogSearch {
+        files: Vec<PathBuf>,
+        text: SearchText,
+        min: Option<LogLevel>,
+    },
+    LogSearchCancel,
     /// Tear everything down; the sender is notified once state has been saved.
     Shutdown(oneshot::Sender<()>),
+}
+
+impl UiCommand {
+    /// The command's name, for the log (its payload can be large, or name addresses).
+    pub fn kind(&self) -> &'static str {
+        match self {
+            UiCommand::Connect(_) => "Connect",
+            UiCommand::Disconnect => "Disconnect",
+            UiCommand::ExecuteRpc { .. } => "ExecuteRpc",
+            UiCommand::AddressPage { .. } => "AddressPage",
+            UiCommand::ProtocolPage { .. } => "ProtocolPage",
+            UiCommand::ExplorerLoad(_) => "ExplorerLoad",
+            UiCommand::AddressFlows { .. } => "AddressFlows",
+            UiCommand::TxSankey { .. } => "TxSankey",
+            UiCommand::Export(_) => "Export",
+            UiCommand::QueryRun { .. } => "QueryRun",
+            UiCommand::QueryCancel => "QueryCancel",
+            UiCommand::QueriesSet(_) => "QueriesSet",
+            UiCommand::WatchEdit(_) => "WatchEdit",
+            UiCommand::SetLabel { .. } => "SetLabel",
+            UiCommand::RefreshLabels => "RefreshLabels",
+            UiCommand::IndexSettingsEdit(_) => "IndexSettingsEdit",
+            UiCommand::Resync => "Resync",
+            UiCommand::LogSettingsEdit(_) => "LogSettingsEdit",
+            UiCommand::LogFilesRefresh => "LogFilesRefresh",
+            UiCommand::LogFileOpen(_) => "LogFileOpen",
+            UiCommand::LogFileTail => "LogFileTail",
+            UiCommand::LogFileFind { .. } => "LogFileFind",
+            UiCommand::LogSearch { .. } => "LogSearch",
+            UiCommand::LogSearchCancel => "LogSearchCancel",
+            UiCommand::Shutdown(_) => "Shutdown",
+        }
+    }
 }
 
 pub type CommandSender = mpsc::UnboundedSender<UiCommand>;
@@ -152,10 +223,14 @@ pub struct ControllerArgs {
     /// How far back the chain stream (analytics and the address index) fills in on a
     /// direct node; `None` for everything the node retains.
     pub backfill: Option<Duration>,
+    /// Changes the running log filter (`None`: logging didn't start).
+    pub log: Option<LogControl>,
 }
 
 struct Controller {
     app: Arc<RwLock<App>>,
+    /// Applies the log settings' level and filter while running.
+    log: Option<LogControl>,
     refresh_interval_ms: u64,
     backfill: Option<Duration>,
     /// The node to connect to, if any.
@@ -167,6 +242,15 @@ struct Controller {
     /// The query being answered (`UiCommand::QueryRun`): it reads the store, so a
     /// connection switch cancels it and waits for it before closing the store.
     query_task: Option<tokio::task::JoinHandle<()>>,
+    /// The Logs page's file work (listing, opening, finding, searching): blocking
+    /// tasks, cancelled and awaited on shutdown.
+    log_tasks: tokio::task::JoinSet<()>,
+    /// Cancels the file being opened, the find and the search in progress.
+    log_cancel: LogCancel,
+    /// The last find's number: never reused, so a cancelled find still running can't
+    /// answer for a later one (a find that didn't start, or a newly opened file, leaves
+    /// no number behind in `App` to count on from).
+    log_find_generation: u64,
     /// The network whose alert history `App` shows, and its revision when last saved.
     alerts_network: Option<String>,
     alerts_saved_rev: u64,
@@ -196,6 +280,10 @@ pub fn spawn(
         query_task: None,
         alerts_network: None,
         alerts_saved_rev: 0,
+        log: args.log,
+        log_tasks: tokio::task::JoinSet::new(),
+        log_cancel: LogCancel::default(),
+        log_find_generation: 0,
     };
     rt.spawn(controller.run(rx));
     tx
@@ -205,21 +293,46 @@ impl Controller {
     async fn run(mut self, mut rx: mpsc::UnboundedReceiver<UiCommand>) {
         {
             let mut app = self.app.write().await;
-            app.watch.lists = Watchlists::load().unwrap_or_default();
+            app.watch.lists = Watchlists::load().unwrap_or_else(|e| {
+                tracing::warn!("couldn't load the watchlists: {e:#}");
+                Watchlists::default()
+            });
             app.watch.lists.ensure_default();
             app.labels = Arc::new(labels::LabelBook::load());
             match crate::config::IndexSettings::load_with_warning() {
                 Ok((settings, warning)) => {
                     app.index_settings = settings;
+                    if let Some(w) = &warning {
+                        tracing::warn!("{}: {w}", crate::config::IndexSettings::path().display());
+                    }
                     app.index_settings_error = warning.map(|w| {
                         format!("{}: {w}", crate::config::IndexSettings::path().display())
                     });
                 }
-                Err(e) => app.index_settings_error = Some(format!("load index settings: {e}")),
+                Err(e) => {
+                    tracing::warn!("couldn't load the index settings: {e:#}");
+                    app.index_settings_error = Some(format!("load index settings: {e}"));
+                }
             }
+            let (settings, warnings) = LogSettings::load_with_warnings().unwrap_or_else(|e| {
+                (
+                    LogSettings::default(),
+                    vec![("", format!("{e:#}: using defaults"))],
+                )
+            });
+            app.logs.settings = settings;
+            app.logs.error = crate::config::join_warnings(&warnings);
+            app.logs.env_override = match self.log.as_ref().map(|l| &l.source) {
+                Some(logging::FilterSource::Env(var)) => Some(var),
+                _ => None,
+            };
+            app.logs.live = self.log.is_some() && app.logs.env_override.is_none();
             match SavedQueries::load() {
                 Ok(list) => app.query.saved = list,
-                Err(e) => app.query.save_error = Some(format!("load queries: {e}")),
+                Err(e) => {
+                    tracing::warn!("couldn't load the saved queries: {e:#}");
+                    app.query.save_error = Some(format!("load queries: {e}"));
+                }
             }
         }
         // The alerts of the network about to connect, else of the last one picked.
@@ -246,6 +359,7 @@ impl Controller {
                 }
             };
             let Some(cmd) = cmd else { break };
+            tracing::debug!(command = cmd.kind(), "ui command");
             match cmd {
                 UiCommand::Connect(target) => self.connect(target).await,
                 UiCommand::Disconnect => self.disconnect().await,
@@ -268,15 +382,30 @@ impl Controller {
                 UiCommand::RefreshLabels => self.refresh_labels(),
                 UiCommand::IndexSettingsEdit(edit) => self.index_settings_edit(edit).await,
                 UiCommand::Resync => self.resync().await,
+                UiCommand::LogSettingsEdit(edit) => self.log_settings_edit(edit).await,
+                UiCommand::LogFilesRefresh => self.log_files_refresh(),
+                UiCommand::LogFileOpen(path) => self.log_file_open(path).await,
+                UiCommand::LogFileTail => self.log_file_tail(),
+                UiCommand::LogFileFind { text, min } => self.log_file_find(text, min).await,
+                UiCommand::LogSearch { files, text, min } => {
+                    self.log_search(files, text, min).await
+                }
+                UiCommand::LogSearchCancel => self.log_cancel.search.store(true, Ordering::Relaxed),
                 UiCommand::Shutdown(done) => {
+                    tracing::info!("shutting down");
+                    let started = Instant::now();
+                    self.stop_log_tasks().await;
                     self.stop_all().await;
                     self.save_alerts().await;
+                    tracing::info!(ms = started.elapsed().as_millis() as u64, "shut down");
                     let _ = done.send(());
                     return;
                 }
             }
         }
         // Frontend dropped the channel without an explicit shutdown.
+        tracing::info!("frontend gone: stopping");
+        self.stop_log_tasks().await;
         self.stop_all().await;
         self.save_alerts().await;
     }
@@ -298,6 +427,10 @@ impl Controller {
             Err(e @ LoadError::SetAside(..)) => (AlertHistory::default(), Some(e), true),
             Err(e @ LoadError::Kept(_)) => (AlertHistory::default(), Some(e), false),
         };
+        match &error {
+            Some(e) => tracing::warn!(network, "couldn't load the alert history: {e}"),
+            None => tracing::debug!(network, "loaded the alert history"),
+        }
         history.restore(&mut app);
         app.watch.history_error = error.map(|e| format!("Couldn't load the alert history: {e}"));
         self.alerts_saved_rev = AlertHistory::revision(&app);
@@ -318,38 +451,52 @@ impl Controller {
             }
             (AlertHistory::of(&app), rev)
         };
-        let saved = tokio::task::spawn_blocking(move || history.save(&network))
-            .await
-            .map_err(|e| anyhow!("alert history task: {e}"))
-            .and_then(|r| r);
+        let saved = tokio::task::spawn_blocking({
+            let network = network.clone();
+            move || history.save(&network)
+        })
+        .await
+        .map_err(|e| anyhow!("alert history task: {e}"))
+        .and_then(|r| r);
         let mut app = self.app.write().await;
-        match saved {
-            Ok(()) => {
+        let error = saved.err().map(|e| format!("{SAVE_ERROR}: {e:#}"));
+        // Retried every few seconds: logged when it changes. `history_error` also
+        // holds a load error, which isn't this.
+        let before = app
+            .watch
+            .history_error
+            .as_deref()
+            .filter(|e| e.starts_with(SAVE_ERROR));
+        let change = error_change(before, error.as_deref());
+        log_error_change!(tracing::Level::WARN, change, "alert history save", network = %network);
+        match error {
+            None => {
                 self.alerts_saved_rev = rev;
-                if app
-                    .watch
-                    .history_error
-                    .as_ref()
-                    .is_some_and(|e| e.starts_with(SAVE_ERROR))
-                {
+                if change == ErrorChange::Recovered {
                     app.watch.history_error = None;
                     app.mark_dirty();
                 }
             }
-            Err(e) => {
-                app.watch.history_error = Some(format!("{SAVE_ERROR}: {e:#}"));
+            Some(error) => {
+                app.watch.history_error = Some(error);
                 app.mark_dirty();
             }
         }
     }
 
     async fn connect(&mut self, target: RemoteTarget) {
+        tracing::info!(
+            node = target.url.as_deref().unwrap_or("public resolver"),
+            network = %target.network,
+            "switching connection"
+        );
         self.stop_all().await;
         self.remote = Some(target);
         self.connect_remote().await;
     }
 
     async fn disconnect(&mut self) {
+        tracing::info!("disconnecting");
         self.stop_all().await;
         self.remote = None;
     }
@@ -367,7 +514,7 @@ impl Controller {
                 Some(ref url) => ActiveConnection::Url(url.clone()),
                 None => ActiveConnection::Resolver,
             };
-            app.node.connection_status = ConnectionStatus::Connecting;
+            app.node.set_status(ConnectionStatus::Connecting);
             app.mark_dirty();
         }
 
@@ -387,8 +534,9 @@ impl Controller {
                 self.rpc = Some(rpc);
             }
             Err(e) => {
+                tracing::error!("couldn't create the RPC client: {e:#}");
                 let mut app = self.app.write().await;
-                app.node.connection_status = ConnectionStatus::Error(e.to_string());
+                app.node.set_status(ConnectionStatus::Error(e.to_string()));
                 app.node.last_error = Some(e.to_string());
                 app.mark_dirty();
             }
@@ -402,7 +550,7 @@ impl Controller {
     async fn start_chain_stream(&mut self, rpc: &Arc<RpcManager>, network: &str) {
         {
             let mut app = self.app.write().await;
-            app.chain.phase = ChainPhase::Opening;
+            app.chain.set_phase(ChainPhase::Opening);
             app.mark_dirty();
         }
         let network_owned = network.to_string();
@@ -413,7 +561,11 @@ impl Controller {
         let opened = tokio::task::spawn_blocking(move || {
             let store = IndexStore::open(&network_owned, slab_hours)?;
             // Best effort: a cache that can't be imported is just stale.
-            let _ = index::analytics::import_legacy_cache(&store, &analytics::legacy_cache_path());
+            if let Err(e) =
+                index::analytics::import_legacy_cache(&store, &analytics::legacy_cache_path())
+            {
+                tracing::warn!("couldn't import the legacy analytics cache: {e:#}");
+            }
             Ok::<_, anyhow::Error>(store)
         })
         .await
@@ -464,6 +616,7 @@ impl Controller {
         else {
             return;
         };
+        tracing::info!(network, "resync: deleting the index to rebuild it");
         self.polling.stop_chain().await;
         self.stop_query().await;
         self.index = None;
@@ -471,7 +624,7 @@ impl Controller {
             let mut app = self.app.write().await;
             app.clear_chain_data();
             app.query.clear();
-            app.chain.phase = ChainPhase::Opening;
+            app.chain.set_phase(ChainPhase::Opening);
             app.mark_dirty();
         }
         let discarded = {
@@ -489,21 +642,28 @@ impl Controller {
 
     async fn chain_failed(&mut self, e: anyhow::Error) {
         let mut app = self.app.write().await;
-        app.chain.phase = ChainPhase::Error(format!("{e:#}"));
+        app.chain.set_phase(ChainPhase::Error(format!("{e:#}")));
         app.mark_dirty();
     }
 
     /// Stop polling and clear all node data.
     async fn stop_all(&mut self) {
+        let started = Instant::now();
         self.polling.abort_all();
         self.stop_query().await;
         self.index = None;
         // The writer finishes its batch and releases the store before we go on, so a
         // reconnect can reopen it.
         self.polling.stop_index().await;
-        if let Some(rpc) = self.rpc.take() {
-            let _ = rpc.disconnect().await;
+        if let Some(rpc) = self.rpc.take()
+            && let Err(e) = rpc.disconnect().await
+        {
+            tracing::debug!("disconnect: {e:#}");
         }
+        tracing::debug!(
+            ms = started.elapsed().as_millis() as u64,
+            "stopped every task"
+        );
 
         let mut app = self.app.write().await;
         app.clear_node_data();
@@ -832,6 +992,10 @@ impl Controller {
             .await
             .map_err(|e| anyhow!("export task: {e}"))
             .and_then(|r| r);
+            match &result {
+                Ok(path) => tracing::info!(path = %path.display(), "export written"),
+                Err(e) => tracing::warn!("export failed: {e:#}"),
+            }
             let mut app = app.write().await;
             app.address
                 .export
@@ -941,7 +1105,10 @@ impl Controller {
                 }
             }
         }
-        app.query.save_error = list.save().err().map(|e| format!("save queries: {e}"));
+        app.query.save_error = list.save().err().map(|e| {
+            tracing::warn!("couldn't save the queries: {e:#}");
+            format!("save queries: {e}")
+        });
         app.query.saved = list;
         app.mark_dirty();
     }
@@ -981,6 +1148,7 @@ impl Controller {
                     changed
                 }
                 Err(e) => {
+                    tracing::warn!("couldn't save the watchlists: {e:#}");
                     app.watch.status.last_error = Some(format!("watchlist: {e}"));
                     false
                 }
@@ -1004,6 +1172,7 @@ impl Controller {
         let mut app = self.app.write().await;
         let mut book = (*app.labels).clone();
         if let Err(e) = book.set_user(&address, name.as_deref()) {
+            tracing::warn!("couldn't save the labels: {e:#}");
             app.watch.status.last_error = Some(format!("save labels: {e}"));
         }
         app.labels = Arc::new(book);
@@ -1015,13 +1184,328 @@ impl Controller {
         // app takes only its own edit: the CLI's changes apply from the next launch, as
         // it says, so a shorter retention set there never deletes data unasked.
         let saved = crate::config::IndexSettings::update_file(&[edit]);
+        tracing::info!(edit = ?edit, "index settings changed");
         let mut app = self.app.write().await;
         app.index_settings.apply(edit);
         app.index_settings_error = match saved {
-            Ok((_, warnings)) => crate::config::join_warnings(&warnings),
-            Err(e) => Some(format!("save index settings: {e:#}")),
+            Ok((_, warnings)) => {
+                for (_, w) in &warnings {
+                    tracing::warn!("{}: {w}", crate::config::IndexSettings::path().display());
+                }
+                crate::config::join_warnings(&warnings)
+            }
+            Err(e) => {
+                tracing::warn!("couldn't save the index settings: {e:#}");
+                Some(format!("save index settings: {e:#}"))
+            }
         };
         app.mark_dirty();
+    }
+
+    async fn log_settings_edit(&mut self, edit: LogSettingsEdit) {
+        tracing::info!(edit = ?edit, "log settings changed");
+        // Applied to the file as it is, keeping what the CLI changed since launch; the
+        // app takes only its own edit, as for the index settings.
+        let saved = LogSettings::update_file(std::slice::from_ref(&edit));
+        let mut app = self.app.write().await;
+        app.logs.settings.apply(edit);
+        let mut error = match saved {
+            Ok((_, warnings)) => {
+                for (_, w) in &warnings {
+                    tracing::warn!("{}: {w}", LogSettings::path().display());
+                }
+                crate::config::join_warnings(&warnings)
+            }
+            Err(e) => {
+                tracing::warn!("couldn't save the log settings: {e:#}");
+                Some(format!("save log settings: {e:#}"))
+            }
+        };
+        if let Some(log) = &self.log
+            && let Err(e) = log.apply(&app.logs.settings)
+        {
+            tracing::warn!("couldn't apply the log filter: {e:#}");
+            error = Some(format!("{e:#}"));
+        }
+        app.logs.error = error;
+        app.mark_dirty();
+    }
+
+    fn log_files_refresh(&mut self) {
+        let app = self.app.clone();
+        self.spawn_log_task(async move {
+            let listed = tokio::task::spawn_blocking(|| log_files::list(&logging::logs_dir()))
+                .await
+                .map_err(|e| anyhow!("{e}"))
+                .and_then(|r| r.map_err(anyhow::Error::from));
+            let mut app = app.write().await;
+            match listed {
+                Ok(files) => app.logs.files = Some(files),
+                Err(e) => tracing::debug!("couldn't list the log files: {e:#}"),
+            }
+            app.mark_dirty();
+        });
+    }
+
+    /// Index `path` in a blocking task, reporting progress, replacing the open file.
+    async fn log_file_open(&mut self, path: PathBuf) {
+        self.log_cancel.open.store(true, Ordering::Relaxed);
+        self.log_cancel.find.store(true, Ordering::Relaxed);
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.log_cancel.open = cancel.clone();
+        let generation = {
+            let mut app = self.app.write().await;
+            let generation = app.logs.open.as_ref().map_or(0, |o| o.generation) + 1;
+            app.logs.open = Some(OpenLogFile {
+                path: path.clone(),
+                generation,
+                ..Default::default()
+            });
+            app.mark_dirty();
+            generation
+        };
+        let app = self.app.clone();
+        self.spawn_log_task(async move {
+            let progress_app = app.clone();
+            let mut last = Instant::now();
+            let opened = tokio::task::spawn_blocking(move || {
+                LogFile::open(&path, &cancel, |done, total| {
+                    if last.elapsed() < LOG_PROGRESS_EVERY {
+                        return;
+                    }
+                    last = Instant::now();
+                    let mut app = progress_app.blocking_write();
+                    if let Some(open) = app.logs.open.as_mut().filter(|o| o.generation == generation) {
+                        open.progress = done as f32 / total.max(1) as f32;
+                        app.mark_dirty();
+                    }
+                })
+            })
+            .await
+            .map_err(|e| anyhow!("{e}"))
+            .and_then(|r| r);
+            let mut app = app.write().await;
+            let Some(open) = app.logs.open.as_mut().filter(|o| o.generation == generation) else {
+                return;
+            };
+            match opened {
+                Ok(file) => {
+                    tracing::debug!(path = %open.path.display(), lines = file.len(), "opened log file");
+                    open.file = Some(Arc::new(std::sync::RwLock::new(file)));
+                    open.progress = 1.0;
+                }
+                Err(e) => open.error = Some(format!("{e:#}")),
+            }
+            app.mark_dirty();
+        });
+    }
+
+    /// Index what was appended to the open file since (the Logs page following it).
+    fn log_file_tail(&mut self) {
+        let app = self.app.clone();
+        self.spawn_log_task(async move {
+            // Not while a find reads the file: the write would wait for it, and the
+            // GUI's reads behind the write.
+            let file = {
+                let app = app.read().await;
+                let Some(open) = app.logs.open.as_ref() else {
+                    return;
+                };
+                let finding = open
+                    .find
+                    .as_ref()
+                    .is_some_and(|f| f.lines.is_none() && f.error.is_none());
+                match (&open.file, finding) {
+                    (Some(file), false) => file.clone(),
+                    _ => return,
+                }
+            };
+            let added = tokio::task::spawn_blocking(move || {
+                file.write().expect("log file lock poisoned").refresh()
+            })
+            .await;
+            if let Ok(Ok(added)) = added
+                && added > 0
+            {
+                app.write().await.mark_dirty();
+            }
+        });
+    }
+
+    /// Find `text` in the open file (at `min` or above) in a blocking task.
+    async fn log_file_find(&mut self, text: SearchText, min: Option<LogLevel>) {
+        self.log_cancel.find.store(true, Ordering::Relaxed);
+        let matcher = match text.matcher() {
+            Ok(matcher) => matcher,
+            Err(e) => {
+                let mut app = self.app.write().await;
+                if let Some(open) = app.logs.open.as_mut() {
+                    open.find = Some(FileFind {
+                        text,
+                        min,
+                        error: Some(e),
+                        ..Default::default()
+                    });
+                }
+                app.mark_dirty();
+                return;
+            }
+        };
+        let (file, generation) = {
+            let mut app = self.app.write().await;
+            let Some(open) = app.logs.open.as_mut() else {
+                return;
+            };
+            if text.text.is_empty() {
+                open.find = None;
+                app.mark_dirty();
+                return;
+            }
+            let Some(file) = open.file.clone() else {
+                return;
+            };
+            self.log_find_generation += 1;
+            let generation = self.log_find_generation;
+            open.find = Some(FileFind {
+                text,
+                min,
+                generation,
+                ..Default::default()
+            });
+            app.mark_dirty();
+            (file, generation)
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.log_cancel.find = cancel.clone();
+        let app = self.app.clone();
+        self.spawn_log_task(async move {
+            let progress_app = app.clone();
+            let mut last = Instant::now();
+            let found = tokio::task::spawn_blocking(move || {
+                let file = file.read().expect("log file lock poisoned");
+                file.find(&matcher, min, &cancel, |done, total| {
+                    if last.elapsed() < LOG_PROGRESS_EVERY {
+                        return;
+                    }
+                    last = Instant::now();
+                    let mut app = progress_app.blocking_write();
+                    if let Some(find) = current_find(&mut app, generation) {
+                        find.progress = done as f32 / total.max(1) as f32;
+                        app.mark_dirty();
+                    }
+                })
+            })
+            .await
+            .map_err(|e| anyhow!("{e}"))
+            .and_then(|r| r);
+            let mut app = app.write().await;
+            if let Some(find) = current_find(&mut app, generation) {
+                match found {
+                    Ok(lines) => {
+                        find.lines = Some(Arc::new(lines));
+                        find.progress = 1.0;
+                    }
+                    Err(e) => find.error = Some(format!("{e:#}")),
+                }
+                app.mark_dirty();
+            }
+        });
+    }
+
+    /// Search `files` for `text` (at `min` or above) in a blocking task.
+    async fn log_search(&mut self, files: Vec<PathBuf>, text: SearchText, min: Option<LogLevel>) {
+        self.log_cancel.search.store(true, Ordering::Relaxed);
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.log_cancel.search = cancel.clone();
+        let (generation, infos) = {
+            let mut app = self.app.write().await;
+            let generation = app.logs.search.generation + 1;
+            let error = text.matcher().err();
+            app.logs.search = LogSearch {
+                running: error.is_none(),
+                error,
+                generation,
+                ..Default::default()
+            };
+            app.mark_dirty();
+            if !app.logs.search.running {
+                return;
+            }
+            let infos: Vec<LogFileInfo> = app
+                .logs
+                .files
+                .iter()
+                .flatten()
+                .filter(|f| files.contains(&f.path))
+                .cloned()
+                .collect();
+            (generation, infos)
+        };
+        let Ok(matcher) = text.matcher() else {
+            return;
+        };
+        tracing::debug!(files = infos.len(), "searching the log files");
+        let app = self.app.clone();
+        self.spawn_log_task(async move {
+            let progress_app = app.clone();
+            let mut last = Instant::now();
+            let result = tokio::task::spawn_blocking(move || {
+                log_files::search(
+                    &infos,
+                    &matcher,
+                    min,
+                    LOG_SEARCH_MAX_HITS,
+                    &cancel,
+                    |done, total| {
+                        if last.elapsed() < LOG_PROGRESS_EVERY {
+                            return;
+                        }
+                        last = Instant::now();
+                        let mut app = progress_app.blocking_write();
+                        if app.logs.search.generation == generation {
+                            app.logs.search.progress = done as f32 / total.max(1) as f32;
+                            app.mark_dirty();
+                        }
+                    },
+                )
+            })
+            .await
+            .map_err(|e| anyhow!("{e}"))
+            .and_then(|r| r);
+            let mut app = app.write().await;
+            let search = &mut app.logs.search;
+            if search.generation != generation {
+                return;
+            }
+            search.running = false;
+            match result {
+                Ok(result) => {
+                    search.progress = 1.0;
+                    search.result = Some(result);
+                }
+                Err(e) => search.error = Some(format!("{e:#}")),
+            }
+            app.mark_dirty();
+        });
+    }
+
+    /// Track a Logs page task, first dropping those that finished: following a file and
+    /// listing the files add one every few seconds while the page is open.
+    fn spawn_log_task(&mut self, task: impl Future<Output = ()> + Send + 'static) {
+        while self.log_tasks.try_join_next().is_some() {}
+        self.log_tasks.spawn(task);
+    }
+
+    /// Cancel the Logs page's file work and wait for it.
+    async fn stop_log_tasks(&mut self) {
+        for flag in [
+            &self.log_cancel.open,
+            &self.log_cancel.find,
+            &self.log_cancel.search,
+        ] {
+            flag.store(true, Ordering::Relaxed);
+        }
+        while self.log_tasks.join_next().await.is_some() {}
     }
 
     fn refresh_labels(&mut self) {
@@ -1030,6 +1514,29 @@ impl Controller {
             labels::refresh_kaspa_org(&app).await;
         });
     }
+}
+
+/// How often a log file task reports its progress.
+const LOG_PROGRESS_EVERY: Duration = Duration::from_millis(100);
+/// The most hits a search across log files keeps.
+const LOG_SEARCH_MAX_HITS: usize = 10_000;
+
+/// The cancel flags of the Logs page's file work.
+#[derive(Default)]
+struct LogCancel {
+    open: Arc<AtomicBool>,
+    find: Arc<AtomicBool>,
+    search: Arc<AtomicBool>,
+}
+
+/// The open file's find, if it is still the one numbered `generation`.
+fn current_find(app: &mut App, generation: u64) -> Option<&mut FileFind> {
+    app.logs
+        .open
+        .as_mut()?
+        .find
+        .as_mut()
+        .filter(|f| f.generation == generation)
 }
 
 /// Why a query can't run on `app`: the index isn't open (yet), and the reason.

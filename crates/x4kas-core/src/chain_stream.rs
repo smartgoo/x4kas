@@ -12,6 +12,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use kaspa_rpc_core::{GetVirtualChainFromBlockV2Response, RpcHash};
 use tokio::sync::{RwLock, mpsc};
+use tracing::Instrument;
 
 use crate::app::{App, ChainPhase, ConnectionStatus, StartPoint, TimeWindow};
 use crate::config::Retention;
@@ -102,21 +103,44 @@ pub async fn run(
     start: StreamStart,
     sinks: Vec<BatchSender>,
 ) {
+    stream(rpc, app, start, sinks)
+        .instrument(tracing::info_span!("chain_stream"))
+        .await
+}
+
+async fn stream(
+    rpc: Arc<RpcManager>,
+    app: Arc<RwLock<App>>,
+    start: StreamStart,
+    sinks: Vec<BatchSender>,
+) {
     // The first request must wait for the connection: this task starts before the
     // RPC client has finished connecting.
     wait_for_node(&app).await;
 
     let backfill = start.backfill;
+    tracing::info!(
+        position = ?start.position.map(|(hash, _)| hash),
+        backfill_hours = backfill.map(|b| b.as_secs_f64() / 3600.0),
+        "chain stream starting"
+    );
     let (mut current_hash, mut jumped) = resolve_start(&rpc, &app, start.position, backfill).await;
 
     // Initial catch-up, then incremental polling.
     let mut synced = false;
+    // Sinks found gone, so each is reported once.
+    let mut closed = vec![false; sinks.len()];
     loop {
         wait_for_node(&app).await;
 
+        let fetch_start = Instant::now();
         let response = match rpc.fetch_vspc_v2(current_hash).await {
             Ok(response) => response,
             Err(e) if is_out_of_retention(&e) => {
+                tracing::warn!(
+                    from = %current_hash,
+                    "the node pruned past the stream position: starting over from the window"
+                );
                 // The node pruned past our position (a catch-up slower than the pruning
                 // point moved), so this hash can never succeed. Start over in the window.
                 (current_hash, _) = resolve_start(&rpc, &app, None, backfill).await;
@@ -131,6 +155,16 @@ pub async fn run(
         };
 
         let block_count = response.chain_block_accepted_transactions.len();
+        let removed = response.removed_chain_block_hashes.len();
+        tracing::debug!(
+            blocks = block_count,
+            removed,
+            ms = fetch_start.elapsed().as_millis() as u64,
+            "fetched VSPC batch"
+        );
+        if removed > 0 {
+            tracing::info!(removed, "chain reorg: chain blocks removed");
+        }
         let newest_daa = response
             .chain_block_accepted_transactions
             .iter()
@@ -145,7 +179,10 @@ pub async fn run(
             // removals every poll. Continue from the fork point, the selected parent of
             // the oldest removed block (the node lists them from the start backwards).
             match rpc.selected_parent(oldest_removed).await {
-                Ok(fork_point) => current_hash = fork_point,
+                Ok(fork_point) => {
+                    tracing::debug!(%fork_point, "reorg without new chain blocks: continuing from the fork point");
+                    current_hash = fork_point;
+                }
                 Err(e) => {
                     // Nothing applied yet: the same response comes again after the retry.
                     set_phase(&app, ChainPhase::Error(format!("{e:#}"))).await;
@@ -158,10 +195,11 @@ pub async fn run(
         // Hand the batch to every sink; a full queue makes this wait (backpressure).
         let batch = Arc::new(ChainBatch { response, jumped });
         jumped = false;
-        for sink in &sinks {
-            if sink.send(batch.clone()).await.is_err() {
-                // A sink that went away (its task ended) can't be fed; the others go on.
-                continue;
+        for (sink, closed) in sinks.iter().zip(&mut closed) {
+            // A sink that went away (its task ended) can't be fed; the others go on.
+            if sink.send(batch.clone()).await.is_err() && !*closed {
+                *closed = true;
+                tracing::warn!("a chain stream sink has stopped; it gets no more batches");
             }
         }
 
@@ -174,11 +212,12 @@ pub async fn run(
             let mut app = app.write().await;
             let status = &mut app.chain;
             status.record_batch(block_count, newest_daa, Instant::now());
-            status.phase = if synced {
+            let phase = if synced {
                 ChainPhase::Live
             } else {
                 ChainPhase::CatchingUp
             };
+            status.set_phase(phase);
             app.mark_dirty();
         }
 
@@ -219,18 +258,24 @@ async fn resolve_start(
                     Some((_, saved_at)) => StartPoint::Index(saved_at),
                     None => StartPoint::PruningPoint,
                 };
+                tracing::info!(from = %hash, start = ?started_from, skipped, "chain stream start found");
                 let mut app = app.write().await;
                 let status = &mut app.chain;
+                status.set_phase(ChainPhase::CatchingUp);
                 status.started_from = Some(started_from);
                 // Progress and speed restart from the new position.
                 status.start_daa = None;
                 status.current_daa = None;
                 status.daa_per_sec = None;
-                status.phase = ChainPhase::CatchingUp;
                 app.mark_dirty();
                 return (hash, !matches!(started_from, StartPoint::Index(_)));
             }
-            Err(e) if position.is_some() && is_out_of_retention(&e) => position = None,
+            Err(e) if position.is_some() && is_out_of_retention(&e) => {
+                tracing::warn!(
+                    "the node pruned past the index position: starting from the pruning point"
+                );
+                position = None;
+            }
             Err(e) => {
                 set_phase(app, ChainPhase::Error(format!("{e:#}"))).await;
                 tokio::time::sleep(RETRY_DELAY).await;
@@ -268,13 +313,13 @@ async fn skip_to_window(
         }
         current = last;
     }
+    tracing::debug!(skipped_from = %start, to = %current, "skipped ahead to the backfill window");
     Ok((current, current != start))
 }
 
 pub(crate) async fn set_phase(app: &RwLock<App>, phase: ChainPhase) {
     let mut app = app.write().await;
-    if app.chain.phase != phase {
-        app.chain.phase = phase;
+    if app.chain.set_phase(phase) {
         app.mark_dirty();
     }
 }
@@ -290,8 +335,7 @@ async fn wait_for_node(app: &RwLock<App>) {
             if ready && !app.paused {
                 return;
             }
-            if !ready && app.chain.phase != ChainPhase::WaitingForNode {
-                app.chain.phase = ChainPhase::WaitingForNode;
+            if !ready && app.chain.set_phase(ChainPhase::WaitingForNode) {
                 app.mark_dirty();
             }
         }

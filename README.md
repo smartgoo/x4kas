@@ -105,9 +105,17 @@ x4kas-cli watch --list Exchanges
 
 # Labels
 x4kas-cli labels set kaspa:qq... "My wallet"
+
+# Logs
+x4kas-cli logs settings --level debug
+x4kas-cli logs tail -f --level warn
 ```
 
 Index-reading commands (`address`, `query run`) need the index to be free: they can't run while the GUI (connected to a node) or `index run` holds it. Run `x4kas-cli <command> --help` for details.
+
+## Logs
+
+The GUI writes a log file per day to `~/.x4kas/logs/` (`x4kas.<date>.log`, the last 7 days kept). The CLI logs to stderr, never stdout, and to `x4kas-cli.<date>.log` with `--log-file`. In the GUI, the heartbeat on the health icon (right of ⚙) turns amber or red when something is failing or a warning was logged; clicking the icon opens the Logs page: what this session logs, live, and every log file (the CLI's too), opened, filtered by level and searched, one file or all of them. Both apps read `~/.x4kas/logging.toml`, which Settings › Logs (the level applies at once) and `x4kas-cli logs settings` edit: the level (`error`, `warn`, `info` (default), `debug`, `trace`), extra filter directives such as `fjall=info`, text or JSON lines, and how many days to keep. For one CLI run, `--log-level`, `-v`/`-vv` and `-q` override the level. `X4KAS_LOG` or `RUST_LOG` replaces the level and filter for either app, e.g. `RUST_LOG=x4kas=trace,kaspa_notify=debug`. A reset keeps the logs.
 
 ## Roadmap
 - Split indexer off to its own daemon. With built in API to serve CLI and GUI requests

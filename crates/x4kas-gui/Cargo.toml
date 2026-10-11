@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 x4kas-core.workspace = true
 anyhow.workspace = true
+tracing.workspace = true
 clap.workspace = true
 tokio.workspace = true
 dirs.workspace = true

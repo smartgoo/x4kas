@@ -200,7 +200,8 @@ impl MonitoringTab {
                     .map(|ev| ev.time_ms)
                     .max(app.watch.lists.last_activity(&e.address, &network))
                     .map(ago);
-                // Net of the events seen in the last 24h (since this session started).
+                // Net of the events of the last 24h: the alert history keeps those of
+                // earlier sessions, but nothing is seen while the app is closed.
                 let day: i128 = app
                     .watch
                     .events
@@ -253,9 +254,12 @@ impl MonitoringTab {
             }
             None => {
                 ui.label(
-                    RichText::new("Click an address for its info, history and alert settings.")
-                        .weak()
-                        .small(),
+                    RichText::new(
+                        "Click an address for its info, history and alert settings. \
+                         24h change counts only what x4kas saw while running.",
+                    )
+                    .weak()
+                    .small(),
                 );
             }
         }
@@ -562,11 +566,21 @@ fn activity(ui: &mut Ui, app: &mut App, filter: Option<ListId>, fill: bool) {
         app.watch.set_read(index, !read);
     }
     ui.add_space(2.0);
-    ui.label(
-        RichText::new("● marks an alert the address's rules raised; click it to mark it read.")
-            .weak()
-            .small(),
-    );
+    // A history that couldn't be loaded or saved takes the hint's line until it can.
+    match &app.watch.history_error {
+        Some(err) => {
+            ui.label(RichText::new(err).color(theme::ERROR).small());
+        }
+        None => {
+            ui.label(
+                RichText::new(
+                    "● marks an alert the address's rules raised; click it to mark it read.",
+                )
+                .weak()
+                .small(),
+            );
+        }
+    }
 }
 
 /// The alert dot at the start of an Activity row: filled while unread, a ring once

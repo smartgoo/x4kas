@@ -113,6 +113,11 @@ impl Seen {
         self.set.len()
     }
 
+    /// The keys, oldest first.
+    pub fn keys(&self) -> impl Iterator<Item = &String> {
+        self.order.iter()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.set.is_empty()
     }
@@ -207,7 +212,7 @@ async fn run(
             _ = stop.notified() => return,
             _ = ticker.tick() => {}
         }
-        let (position, queries, labels, watchlist, prune_floor, raised, features) = {
+        let (position, queries, labels, watchlist, prune_floor, raised, known, features) = {
             let app = app.read().await;
             let features = app.index_settings;
             (
@@ -222,6 +227,14 @@ async fn run(
                     .iter()
                     .map(|e| (e.query_id.clone(), e.primary.clone()))
                     .collect::<Vec<_>>(),
+                // What the address queries not followed yet learned before (an earlier
+                // connection or launch): their first run doesn't learn it again.
+                app.query
+                    .known
+                    .iter()
+                    .filter(|(id, _)| !watched.contains_key(*id))
+                    .map(|(id, known)| (id.clone(), known.clone()))
+                    .collect::<std::collections::HashMap<_, _>>(),
                 features,
             )
         };
@@ -239,13 +252,18 @@ async fn run(
                 .unwrap_or(POLL.as_millis() as u64);
             let entry = watched.entry(saved.id.clone()).or_insert_with(|| {
                 let mut seen = Seen::default();
+                let learned = known.get(&saved.id);
+                for primary in learned.into_iter().flatten() {
+                    seen.insert(primary.clone());
+                }
                 for (id, primary) in raised.iter().rev() {
                     if *id == saved.id {
                         seen.insert(primary.clone());
                     }
                 }
                 Watched {
-                    seeded: !seen.is_empty(),
+                    // Raised events alone don't say what else matched then.
+                    seeded: learned.is_some(),
                     seen,
                     last_run_ms: now.saturating_sub(every_ms),
                 }
@@ -298,8 +316,15 @@ async fn run(
             let events = new_events(&saved, &result, &mut entry.seen, now);
             // An address query's first run only learns which addresses match.
             let notify = query.entity.is_timed() || entry.seeded;
+            // An address query keeps what it knows with the alert history, so a
+            // restart neither raises those rows nor learns them silently again.
+            let learned = !query.entity.is_timed() && (!entry.seeded || !events.is_empty());
             entry.seeded = true;
             let mut app = app.write().await;
+            if learned {
+                app.query
+                    .set_known(&saved.id, entry.seen.keys().cloned().collect());
+            }
             if notify {
                 for event in events {
                     app.query.push_event(event);

@@ -626,7 +626,13 @@ pub struct WatchState {
     pub events: VecDeque<AddressEvent>,
     /// Events pushed in total, so a frontend can tell which of `events` are new to it.
     pub events_raised: u64,
+    /// Bumped by every change to `events` or their read marks, so the alert history
+    /// (`alerts`) knows when to save them.
+    pub events_rev: u64,
     pub status: WatchStatus,
+    /// Why the alert history (`alerts`) couldn't be loaded or saved. Not node data, so
+    /// a connection switch keeps it.
+    pub history_error: Option<String>,
 }
 
 impl WatchState {
@@ -634,6 +640,7 @@ impl WatchState {
         self.events.push_front(event);
         self.events.truncate(crate::watch::MAX_EVENTS);
         self.events_raised += 1;
+        self.events_rev = self.events_rev.wrapping_add(1);
     }
 
     /// Events with an alert the user hasn't marked as read.
@@ -651,8 +658,11 @@ impl WatchState {
 
     /// Mark the alert of the event at `index` (newest first) read or unread.
     pub fn set_read(&mut self, index: usize, read: bool) {
-        if let Some(event) = self.events.get_mut(index) {
+        if let Some(event) = self.events.get_mut(index)
+            && event.read != read
+        {
             event.read = read;
+            self.events_rev = self.events_rev.wrapping_add(1);
         }
     }
 
@@ -662,16 +672,21 @@ impl WatchState {
 
     /// Mark the alerts of the events `shown` keeps read.
     pub fn mark_read_where(&mut self, shown: impl Fn(&AddressEvent) -> bool) {
-        for event in self.events.iter_mut().filter(|e| shown(e)) {
+        let mut changed = false;
+        for event in self.events.iter_mut().filter(|e| !e.read && shown(e)) {
             event.read = true;
+            changed = true;
+        }
+        if changed {
+            self.events_rev = self.events_rev.wrapping_add(1);
         }
     }
 
-    /// Drop node data (balances, pending, events) but keep the list.
+    /// Drop node data (balances, pending) but keep the lists and the events, which are
+    /// the network's alert history (`alerts`).
     pub fn clear_node_data(&mut self) {
         self.balances.clear();
         self.pending.clear();
-        self.events.clear();
         self.status = WatchStatus::default();
     }
 }
@@ -980,6 +995,13 @@ pub struct QueryState {
     pub events: VecDeque<QueryEvent>,
     /// Events pushed in total, so a frontend can tell which of `events` are new to it.
     pub events_raised: u64,
+    /// Bumped by every change to `events` or their read marks, so the alert history
+    /// (`alerts`) knows when to save them.
+    pub events_rev: u64,
+    /// The primary values each watched address query has matched, oldest first, by
+    /// saved query id. Its first run learns them without raising them; kept with the
+    /// alert history so a restart neither raises them nor learns them again.
+    pub known: HashMap<String, Vec<String>>,
     /// What each watched query last did, by saved query id.
     pub watch_status: HashMap<String, QueryWatchStatus>,
 }
@@ -1091,13 +1113,23 @@ impl QueryState {
 
     /// Forget the watched queries' events.
     pub fn clear_events(&mut self) {
-        self.events.clear();
+        if !self.events.is_empty() {
+            self.events.clear();
+            self.events_rev = self.events_rev.wrapping_add(1);
+        }
+    }
+
+    /// Remember the rows the watched address query `id` has matched, oldest first.
+    pub fn set_known(&mut self, id: &str, known: Vec<String>) {
+        self.known.insert(id.to_string(), known);
+        self.events_rev = self.events_rev.wrapping_add(1);
     }
 
     pub fn push_event(&mut self, event: QueryEvent) {
         self.events.push_front(event);
         self.events.truncate(crate::query::watch::MAX_EVENTS);
         self.events_raised += 1;
+        self.events_rev = self.events_rev.wrapping_add(1);
     }
 
     /// Events not marked read.
@@ -1115,14 +1147,22 @@ impl QueryState {
 
     /// Mark the event at `index` (newest first) read or unread.
     pub fn set_read(&mut self, index: usize, read: bool) {
-        if let Some(event) = self.events.get_mut(index) {
+        if let Some(event) = self.events.get_mut(index)
+            && event.read != read
+        {
             event.read = read;
+            self.events_rev = self.events_rev.wrapping_add(1);
         }
     }
 
     pub fn mark_all_read(&mut self) {
-        for event in &mut self.events {
+        let mut changed = false;
+        for event in self.events.iter_mut().filter(|e| !e.read) {
             event.read = true;
+            changed = true;
+        }
+        if changed {
+            self.events_rev = self.events_rev.wrapping_add(1);
         }
     }
 }
@@ -1859,6 +1899,19 @@ mod tests {
     }
 
     #[test]
+    fn read_marks_that_change_nothing_leave_the_revision() {
+        let mut query = QueryState::default();
+        query.mark_all_read();
+        query.clear_events();
+        query.set_read(0, true);
+        assert_eq!(query.events_rev, 0);
+        let mut watch = WatchState::default();
+        watch.mark_all_read();
+        watch.set_read(0, true);
+        assert_eq!(watch.events_rev, 0);
+    }
+
+    #[test]
     fn unread_alerts_follow_events_and_read_marks() {
         let mut watch = WatchState::default();
         let event = |alerts: Vec<&str>| AddressEvent {
@@ -1890,7 +1943,8 @@ mod tests {
         assert_eq!(watch.unread_alerts_where(|e| e.alerts.len() == 2), 0);
         watch.mark_all_read();
         assert_eq!(watch.unread_alerts(), 0);
+        // A connection switch keeps the events: they are the alert history.
         watch.clear_node_data();
-        assert!(watch.events.is_empty());
+        assert_eq!(watch.events.len(), 3);
     }
 }

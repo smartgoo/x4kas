@@ -180,7 +180,7 @@ impl SettingsPage {
             ui.add_space(4.0);
             for item in [
                 "the connection choice and the window's layout and preferences",
-                "watchlists and their alert rules",
+                "watchlists, their alert rules and the alert history",
                 "your address labels, the cached public list and online lookups",
                 "saved queries and their alerts",
                 "the index settings and the whole index (it rebuilds from the node)",

@@ -1,6 +1,7 @@
 //! Everything below the frontends: node RPC, app state, analytics and config. Shared by
 //! the `x4kas` GUI and the `x4kas-cli` binary, and free of GUI and CLI-parsing code.
 
+pub mod alerts;
 pub mod analytics;
 pub mod app;
 pub mod chain_stream;

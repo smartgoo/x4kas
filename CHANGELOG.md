@@ -10,6 +10,10 @@ Notable changes to x4kas. The format follows [Keep a Changelog](https://keepacha
 - Reset App in Settings, which wipes the app's data and restarts it from scratch.
 - Resync the index from Settings > Reset.
 
+### Fixed
+
+- Watchlist activity and query alerts, with their read marks, are kept across restarts and connection switches.
+
 ## [0.1.0]
 
 First release.

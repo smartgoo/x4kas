@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow};
 use tokio::sync::{RwLock, mpsc, oneshot};
 
+use crate::alerts::{AlertHistory, LoadError};
 use crate::analytics;
 use crate::app::{ActiveConnection, AddressView, App, ChainPhase, ConnectionStatus, ExportOrigin};
 use crate::chain_stream::{self, StreamStart};
@@ -165,7 +166,16 @@ struct Controller {
     /// The query being answered (`UiCommand::QueryRun`): it reads the store, so a
     /// connection switch cancels it and waits for it before closing the store.
     query_task: Option<tokio::task::JoinHandle<()>>,
+    /// The network whose alert history `App` shows, and its revision when last saved.
+    alerts_network: Option<String>,
+    alerts_saved_rev: u64,
 }
+
+/// How a failed save of the alert history starts, so a later save clears it.
+const SAVE_ERROR: &str = "Couldn't save the alert history";
+
+/// How often the alert history is written when it changed.
+const ALERTS_SAVE_EVERY: Duration = Duration::from_secs(2);
 
 /// Spawn the controller on the given runtime and return the command channel.
 pub fn spawn(
@@ -183,6 +193,8 @@ pub fn spawn(
         index: None,
         polling: PollingHandles::default(),
         query_task: None,
+        alerts_network: None,
+        alerts_saved_rev: 0,
     };
     rt.spawn(controller.run(rx));
     tx
@@ -204,10 +216,30 @@ impl Controller {
                 Err(e) => app.query.save_error = Some(format!("load queries: {e}")),
             }
         }
+        // The alerts of the network about to connect, else of the last one picked.
+        let network = match &self.remote {
+            Some(target) => target.network.clone(),
+            None => {
+                crate::config::ConnectionSettings::load()
+                    .unwrap_or_default()
+                    .network
+            }
+        };
+        self.load_alerts(&network).await;
         // Connect on startup if `--url` was given; otherwise wait for the user to pick.
         self.connect_remote().await;
 
-        while let Some(cmd) = rx.recv().await {
+        let mut save_alerts = tokio::time::interval(ALERTS_SAVE_EVERY);
+        save_alerts.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            let cmd = tokio::select! {
+                cmd = rx.recv() => cmd,
+                _ = save_alerts.tick() => {
+                    self.save_alerts().await;
+                    continue;
+                }
+            };
+            let Some(cmd) = cmd else { break };
             match cmd {
                 UiCommand::Connect(target) => self.connect(target).await,
                 UiCommand::Disconnect => self.disconnect().await,
@@ -232,6 +264,7 @@ impl Controller {
                 UiCommand::Resync => self.resync().await,
                 UiCommand::Shutdown(done) => {
                     self.stop_all().await;
+                    self.save_alerts().await;
                     let _ = done.send(());
                     return;
                 }
@@ -239,6 +272,69 @@ impl Controller {
         }
         // Frontend dropped the channel without an explicit shutdown.
         self.stop_all().await;
+        self.save_alerts().await;
+    }
+
+    /// Show `network`'s alert history, first saving the one shown if it is another
+    /// network's.
+    async fn load_alerts(&mut self, network: &str) {
+        if self.alerts_network.as_deref() == Some(network) {
+            return;
+        }
+        self.save_alerts().await;
+        let owned = network.to_string();
+        let loaded = tokio::task::spawn_blocking(move || AlertHistory::load(&owned))
+            .await
+            .unwrap_or_else(|e| Err(LoadError::Kept(anyhow!("alert history task: {e}"))));
+        let mut app = self.app.write().await;
+        let (history, error, may_save) = match loaded {
+            Ok(history) => (history, None, true),
+            Err(e @ LoadError::SetAside(..)) => (AlertHistory::default(), Some(e), true),
+            Err(e @ LoadError::Kept(_)) => (AlertHistory::default(), Some(e), false),
+        };
+        history.restore(&mut app);
+        app.watch.history_error = error.map(|e| format!("Couldn't load the alert history: {e}"));
+        self.alerts_saved_rev = AlertHistory::revision(&app);
+        // A file that couldn't be read or moved aside is never written over.
+        self.alerts_network = may_save.then(|| network.to_string());
+    }
+
+    /// Write the alert history if it changed since it was last written.
+    async fn save_alerts(&mut self) {
+        let Some(network) = self.alerts_network.clone() else {
+            return;
+        };
+        let (history, rev) = {
+            let app = self.app.read().await;
+            let rev = AlertHistory::revision(&app);
+            if rev == self.alerts_saved_rev {
+                return;
+            }
+            (AlertHistory::of(&app), rev)
+        };
+        let saved = tokio::task::spawn_blocking(move || history.save(&network))
+            .await
+            .map_err(|e| anyhow!("alert history task: {e}"))
+            .and_then(|r| r);
+        let mut app = self.app.write().await;
+        match saved {
+            Ok(()) => {
+                self.alerts_saved_rev = rev;
+                if app
+                    .watch
+                    .history_error
+                    .as_ref()
+                    .is_some_and(|e| e.starts_with(SAVE_ERROR))
+                {
+                    app.watch.history_error = None;
+                    app.mark_dirty();
+                }
+            }
+            Err(e) => {
+                app.watch.history_error = Some(format!("{SAVE_ERROR}: {e:#}"));
+                app.mark_dirty();
+            }
+        }
     }
 
     async fn connect(&mut self, target: RemoteTarget) {
@@ -258,6 +354,7 @@ impl Controller {
         let Some(target) = self.remote.clone() else {
             return;
         };
+        self.load_alerts(&target.network).await;
         {
             let mut app = self.app.write().await;
             app.connection = match target.url {

@@ -43,6 +43,8 @@ tracing-log = "0.2"
 regex = "1"
 # The Kaspa client logs through workflow-log, which prints to stdout unless piped.
 workflow-log = "0.18"
+# The process's CPU, memory and disk use, charted on the Logs page's Live view.
+sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 eframe = { version = "0.33", features = ["persistence"] }
 egui_extras = "0.33"
 # Integrated terminal widget, vendored with patches (see vendor/egui_term/Cargo.toml).

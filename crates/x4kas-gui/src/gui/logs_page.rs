@@ -1,4 +1,4 @@
-//! The Logs page (`LogsPage`, opened by the health button in the top bar): a left
+//! The Health page (`LogsPage`, opened by the health button in the top bar): a left
 //! navigation of the Live view (this session's records, `LogViewer`), a search across
 //! the log files, and every file in the logs folder; the chosen one's view on the
 //! right, in place of the active tab. A file is read through its line index
@@ -12,6 +12,7 @@ use std::sync::Arc;
 use eframe::egui::{self, RichText, TextEdit, Ui};
 use egui_extras::Column;
 
+use super::health_charts::HealthCharts;
 use super::log_table::{
     RowSelection, cell, copy_button, copy_requested, footer_height, header_height, level_color,
     level_combo, regex_and_case, search_line, selectable_table, submitted,
@@ -50,6 +51,8 @@ enum View {
 pub struct LogsPage {
     view: View,
     live: LogViewer,
+    /// The Health card over the Live view.
+    health: HealthCharts,
     file: FileView,
     search: SearchForm,
     /// When the file list was last asked for (egui time).
@@ -62,6 +65,11 @@ impl LogsPage {
             live: LogViewer::new(buffer),
             ..Self::default()
         }
+    }
+
+    /// Called once per frame with the time it took to draw (the Health card's chart).
+    pub fn record_frame(&mut self, took: std::time::Duration) {
+        self.health.record_frame(took);
     }
 
     pub fn show(&mut self, ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
@@ -91,7 +99,10 @@ impl LogsPage {
                 let height = ui.available_height() - card_overhead(ui) - 4.0;
                 match self.view.clone() {
                     View::Live => {
-                        card(ui, "Live", |ui| self.live.show(ui, height));
+                        self.health.show(ui, app);
+                        ui.add_space(CARD_GAP);
+                        let height = ui.available_height() - card_overhead(ui) - 4.0;
+                        card(ui, "Live Logs", |ui| self.live.show(ui, height));
                     }
                     View::Search => {
                         self.search
@@ -104,21 +115,21 @@ impl LogsPage {
 
     fn nav(&mut self, ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
         ui.label(
-            RichText::new("Logs")
+            RichText::new("Health")
                 .color(theme::TEXT_BRIGHT)
                 .size(theme::CARD_TITLE_SIZE),
         );
         ui.add_space(6.0);
         ui.with_layout(egui::Layout::top_down_justified(egui::Align::Min), |ui| {
             if ui
-                .selectable_label(self.view == View::Live, "Live")
-                .on_hover_text("What this session logs, as it logs it")
+                .selectable_label(self.view == View::Live, "Live Health")
+                .on_hover_text("The app's resource use and this session's logs, as they happen")
                 .clicked()
             {
                 self.view = View::Live;
             }
             if ui
-                .selectable_label(self.view == View::Search, "Search files")
+                .selectable_label(self.view == View::Search, "Search logs")
                 .on_hover_text("Search every log file, the GUI's and the CLI's")
                 .clicked()
             {
@@ -127,7 +138,7 @@ impl LogsPage {
         });
         ui.add_space(10.0);
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Files").color(theme::LABEL));
+            ui.label(RichText::new("Log Files").color(theme::LABEL));
             if let Some(files) = &app.logs.files {
                 let bytes = files.iter().map(|f| f.bytes).sum();
                 ui.label(RichText::new(format!("{} | {}", files.len(), format_size(bytes))).weak());

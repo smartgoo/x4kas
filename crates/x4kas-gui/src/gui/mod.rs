@@ -9,6 +9,7 @@ mod dashboard;
 mod dialogs;
 mod explorer;
 mod flows;
+mod health_charts;
 mod help;
 mod log_table;
 mod log_view;
@@ -98,6 +99,7 @@ pub fn run(
         let _guard = rt.enter();
         market::start_market_polling(app.clone(), Duration::from_secs(60));
         labels::start_label_refresh(app.clone());
+        let sampler = x4kas_core::metrics::start_sampler(app.clone());
         controller::spawn(
             rt.handle(),
             app.clone(),
@@ -106,11 +108,12 @@ pub fn run(
                 refresh_interval_ms: args.refresh_interval_ms,
                 backfill: Some(StreamStart::default_backfill()),
                 log: logs.map(|l| l.control()),
+                app_tasks: vec![sampler],
             },
         )
     };
 
-    // The latest log records, for Settings › Logs.
+    // The latest log records, for the Health page.
     let log_buffer = logs.and_then(|l| l.buffer());
 
     let options = eframe::NativeOptions {
@@ -249,7 +252,7 @@ struct GuiApp {
     page: Option<Page>,
     settings: SettingsPage,
     logs: LogsPage,
-    /// The latest log records (the Logs page's Live view, the health icon's count).
+    /// The latest log records (the Health page's Live view, the health icon's count).
     log_buffer: Option<Arc<LogBuffer>>,
     pane: InfoPane,
     flow_window: FlowWindowUi,
@@ -461,6 +464,17 @@ impl eframe::App for GuiApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let started = std::time::Instant::now();
+        self.frame(ctx);
+        // Charted on the Health page's Live view (waiting for the app's lock included:
+        // the window stalls through it all the same).
+        self.logs.record_frame(started.elapsed());
+    }
+}
+
+impl GuiApp {
+    /// Draw one frame.
+    fn frame(&mut self, ctx: &egui::Context) {
         self.handle_close(ctx);
 
         let app_state = self.app.clone();
@@ -485,7 +499,7 @@ impl eframe::App for GuiApp {
         widgets::set_direct(ctx, app.connection.is_direct());
         widgets::set_labels(ctx, app.labels.clone());
 
-        // The Logs page on show is someone looking: nothing logged so far is new.
+        // The Health page on show is someone looking: nothing logged so far is new.
         let unseen = match &self.log_buffer {
             Some(buffer) if self.page == Some(Page::Logs) => {
                 buffer.mark_seen();
@@ -892,7 +906,7 @@ fn toggle_page(page: &mut Option<Page>, which: Page) {
     };
 }
 
-/// The app's health at a glance, opening the Logs page: green while all is well,
+/// The app's health at a glance, opening the Health page: green while all is well,
 /// amber or red by the worst of what is failing now (`App::health`) and what was
 /// logged since the page was last open; the hover lists both.
 fn health_button(

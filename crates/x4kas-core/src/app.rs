@@ -475,13 +475,13 @@ pub struct LogState {
     /// The log files on disk, newest first (`UiCommand::LogFilesRefresh`); `None`
     /// until listed.
     pub files: Option<Vec<crate::log_files::LogFileInfo>>,
-    /// The file the Logs page shows (`UiCommand::LogFileOpen`).
+    /// The file the Health page shows (`UiCommand::LogFileOpen`).
     pub open: Option<OpenLogFile>,
     /// The search across files (`UiCommand::LogSearch`).
     pub search: LogSearch,
 }
 
-/// A log file being opened or open in the Logs page.
+/// A log file being opened or open in the Health page.
 #[derive(Debug, Clone, Default)]
 pub struct OpenLogFile {
     pub path: std::path::PathBuf,
@@ -1329,6 +1329,8 @@ pub struct App {
     pub index_settings_error: Option<String>,
     /// The logging settings and what the Settings page shows about the logs.
     pub logs: LogState,
+    /// The app's own health over this run, charted on the Health page's Live view.
+    pub metrics: crate::metrics::HealthMetrics,
     pub market_data: Option<MarketData>,
     /// Why the last market fetch failed; cleared by the next success.
     pub market_error: Option<String>,

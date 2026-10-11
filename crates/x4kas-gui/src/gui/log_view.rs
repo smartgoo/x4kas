@@ -1,4 +1,4 @@
-//! The Logs page's Live view: the records the logger keeps in memory
+//! The Health page's Live view: the records the logger keeps in memory
 //! (`logging::LogBuffer`, what the filter let through since launch), filtered by level
 //! and text, newest at the bottom, following new ones as they come; rows can be
 //! selected and copied (`RowSelection`).

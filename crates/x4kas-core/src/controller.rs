@@ -128,7 +128,7 @@ pub enum UiCommand {
     LogSettingsEdit(LogSettingsEdit),
     /// List the log files on disk (`App::logs.files`).
     LogFilesRefresh,
-    /// Index a log file for the Logs page (`App::logs.open`).
+    /// Index a log file for the Health page (`App::logs.open`).
     LogFileOpen(PathBuf),
     /// Index the lines appended to the open log file since (following it).
     LogFileTail,
@@ -225,6 +225,9 @@ pub struct ControllerArgs {
     pub backfill: Option<Duration>,
     /// Changes the running log filter (`None`: logging didn't start).
     pub log: Option<LogControl>,
+    /// Tasks that live as long as the app (the health sampler), outlasting connection
+    /// switches: aborted and awaited on shutdown.
+    pub app_tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 struct Controller {
@@ -242,7 +245,7 @@ struct Controller {
     /// The query being answered (`UiCommand::QueryRun`): it reads the store, so a
     /// connection switch cancels it and waits for it before closing the store.
     query_task: Option<tokio::task::JoinHandle<()>>,
-    /// The Logs page's file work (listing, opening, finding, searching): blocking
+    /// The Health page's file work (listing, opening, finding, searching): blocking
     /// tasks, cancelled and awaited on shutdown.
     log_tasks: tokio::task::JoinSet<()>,
     /// Cancels the file being opened, the find and the search in progress.
@@ -254,6 +257,8 @@ struct Controller {
     /// The network whose alert history `App` shows, and its revision when last saved.
     alerts_network: Option<String>,
     alerts_saved_rev: u64,
+    /// `ControllerArgs::app_tasks`.
+    app_tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 /// How a failed save of the alert history starts, so a later save clears it.
@@ -284,6 +289,7 @@ pub fn spawn(
         log_tasks: tokio::task::JoinSet::new(),
         log_cancel: LogCancel::default(),
         log_find_generation: 0,
+        app_tasks: args.app_tasks,
     };
     rt.spawn(controller.run(rx));
     tx
@@ -394,6 +400,7 @@ impl Controller {
                 UiCommand::Shutdown(done) => {
                     tracing::info!("shutting down");
                     let started = Instant::now();
+                    self.stop_app_tasks().await;
                     self.stop_log_tasks().await;
                     self.stop_all().await;
                     self.save_alerts().await;
@@ -405,9 +412,18 @@ impl Controller {
         }
         // Frontend dropped the channel without an explicit shutdown.
         tracing::info!("frontend gone: stopping");
+        self.stop_app_tasks().await;
         self.stop_log_tasks().await;
         self.stop_all().await;
         self.save_alerts().await;
+    }
+
+    /// Abort the tasks that live as long as the app and wait for them to end.
+    async fn stop_app_tasks(&mut self) {
+        for task in self.app_tasks.drain(..) {
+            task.abort();
+            let _ = task.await;
+        }
     }
 
     /// Show `network`'s alert history, first saving the one shown if it is another
@@ -1300,7 +1316,7 @@ impl Controller {
         });
     }
 
-    /// Index what was appended to the open file since (the Logs page following it).
+    /// Index what was appended to the open file since (the Health page following it).
     fn log_file_tail(&mut self) {
         let app = self.app.clone();
         self.spawn_log_task(async move {
@@ -1489,14 +1505,14 @@ impl Controller {
         });
     }
 
-    /// Track a Logs page task, first dropping those that finished: following a file and
+    /// Track a Health page task, first dropping those that finished: following a file and
     /// listing the files add one every few seconds while the page is open.
     fn spawn_log_task(&mut self, task: impl Future<Output = ()> + Send + 'static) {
         while self.log_tasks.try_join_next().is_some() {}
         self.log_tasks.spawn(task);
     }
 
-    /// Cancel the Logs page's file work and wait for it.
+    /// Cancel the Health page's file work and wait for it.
     async fn stop_log_tasks(&mut self) {
         for flag in [
             &self.log_cancel.open,
@@ -1521,7 +1537,7 @@ const LOG_PROGRESS_EVERY: Duration = Duration::from_millis(100);
 /// The most hits a search across log files keeps.
 const LOG_SEARCH_MAX_HITS: usize = 10_000;
 
-/// The cancel flags of the Logs page's file work.
+/// The cancel flags of the Health page's file work.
 #[derive(Default)]
 struct LogCancel {
     open: Arc<AtomicBool>,

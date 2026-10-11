@@ -1,4 +1,4 @@
-//! What the Logs page's tables share: selecting rows (a drag across them, Cmd/Ctrl+click
+//! What the Health page's tables share: selecting rows (a drag across them, Cmd/Ctrl+click
 //! to add or drop one, Shift+click for the rows from the last one) to copy them, and
 //! the controls above them (the level, the search line, pause, copy).
 

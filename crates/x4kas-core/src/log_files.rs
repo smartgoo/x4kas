@@ -1,4 +1,4 @@
-//! The log files read back for the GUI's Logs page: the files in the logs folder
+//! The log files read back for the GUI's Health page: the files in the logs folder
 //! ([`list`]), one file indexed by line ([`LogFile`], so a view reads only the lines it
 //! shows, however big the file), and search within one file or across many
 //! ([`LogFile::find`], [`search`]). Synchronous: the controller runs the slow parts

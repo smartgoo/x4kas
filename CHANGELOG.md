@@ -7,13 +7,11 @@ Notable changes to x4kas. The format follows [Keep a Changelog](https://keepacha
 ### Added
 
 - Multiple named watchlists, each with its own alert rules, in the GUI and the CLI.
-- Reset App in Settings, which wipes the app's data and restarts it from scratch.
-- Resync the index from Settings > Reset.
-- Configurable index slab size.
-- Configurable index retention period, mirroring the node by default.
+- Reset the app or resync the index from Settings.
+- Configurable index slab size and retention period.
 - The index records the stretches it skipped, and queries over them say so.
 - Logging with configurable levels, to rolling files for the GUI and stderr for the CLI.
-- A Logs page to follow, open and search the log files, and a health icon in the top bar.
+- A Health page with live logs, log file search and resource charts, opened from the top bar.
 
 ### Fixed
 

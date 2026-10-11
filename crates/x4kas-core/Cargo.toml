@@ -31,6 +31,7 @@ tracing-appender.workspace = true
 tracing-log.workspace = true
 regex.workspace = true
 workflow-log.workspace = true
+sysinfo.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

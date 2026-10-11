@@ -215,14 +215,52 @@ impl IndexFeature {
     }
 }
 
-/// Which [`IndexFeature`]s are on (`~/.x4kas/index.toml`). The index writer reads it
-/// before every batch, so a change applies from the next one.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// The width of an index slab (`index::Slab`) unless the settings say otherwise.
+pub const DEFAULT_SLAB_HOURS: u32 = 6;
+
+/// The slab widths one can pick: whole hours that divide a day, so slabs line up with
+/// days. One hour is the least: narrower slabs would multiply the keyspaces for little.
+pub const SLAB_HOURS_CHOICES: [u32; 8] = [1, 2, 3, 4, 6, 8, 12, 24];
+
+/// Whether `hours` is one of [`SLAB_HOURS_CHOICES`].
+pub fn validate_slab_hours(hours: u32) -> std::result::Result<(), String> {
+    if SLAB_HOURS_CHOICES.contains(&hours) {
+        Ok(())
+    } else {
+        Err(format!(
+            "slab size must be one of {} hours, not {hours}",
+            SLAB_HOURS_CHOICES.map(|h| h.to_string()).join(", ")
+        ))
+    }
+}
+
+/// Which [`IndexFeature`]s are on and how wide new slabs are (`~/.x4kas/index.toml`).
+/// The index writer reads the features before every batch, so a change applies from the
+/// next one; the slab width is fixed when an index is created (it is stored in the
+/// index), so a change applies from the next Resync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexSettings {
     #[serde(default)]
     pub full_payloads: bool,
     #[serde(default)]
     pub redeem_scripts: bool,
+    /// The slab width of the next index built, one of [`SLAB_HOURS_CHOICES`].
+    #[serde(default = "default_slab_hours")]
+    pub slab_hours: u32,
+}
+
+fn default_slab_hours() -> u32 {
+    DEFAULT_SLAB_HOURS
+}
+
+impl Default for IndexSettings {
+    fn default() -> Self {
+        Self {
+            full_payloads: false,
+            redeem_scripts: false,
+            slab_hours: DEFAULT_SLAB_HOURS,
+        }
+    }
 }
 
 impl IndexSettings {
@@ -230,12 +268,30 @@ impl IndexSettings {
         data_dir().join("index.toml")
     }
 
+    /// The settings on disk ([`IndexSettings::load_with_warning`] without the warning).
     pub fn load() -> Result<Self> {
+        Ok(Self::load_with_warning()?.0)
+    }
+
+    /// The settings on disk, and why a slab width that isn't one of
+    /// [`SLAB_HOURS_CHOICES`] (a hand edit) was replaced by the default: the rest of the
+    /// file still counts.
+    pub fn load_with_warning() -> Result<(Self, Option<String>)> {
         let path = Self::path();
         if !path.exists() {
-            return Ok(Self::default());
+            return Ok((Self::default(), None));
         }
-        Ok(toml::from_str(&std::fs::read_to_string(&path)?)?)
+        Self::parse(&std::fs::read_to_string(&path)?)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))
+    }
+
+    fn parse(text: &str) -> Result<(Self, Option<String>)> {
+        let mut settings: Self = toml::from_str(text)?;
+        let warning = validate_slab_hours(settings.slab_hours).err().map(|e| {
+            settings.slab_hours = DEFAULT_SLAB_HOURS;
+            format!("{e}: using {DEFAULT_SLAB_HOURS}")
+        });
+        Ok((settings, warning))
     }
 
     pub fn save(&self) -> Result<()> {
@@ -300,6 +356,26 @@ mod tests {
             IndexSettings::default()
         );
         assert!(IndexFeature::FullPayloads.off_reason().contains("Settings"));
+        // A file of an earlier version, without the slab width, gets the default.
+        let old: IndexSettings = toml::from_str("full_payloads = true").unwrap();
+        assert_eq!(old.slab_hours, DEFAULT_SLAB_HOURS);
+        // A width that isn't a choice falls back to the default, keeping the rest.
+        let (s, warning) = IndexSettings::parse("full_payloads = true\nslab_hours = 5").unwrap();
+        assert!(s.full_payloads);
+        assert_eq!(s.slab_hours, DEFAULT_SLAB_HOURS);
+        assert!(warning.unwrap().contains("not 5"));
+        assert_eq!(IndexSettings::parse("slab_hours = 12").unwrap().1, None);
+    }
+
+    #[test]
+    fn slab_hours_divide_a_day() {
+        for h in SLAB_HOURS_CHOICES {
+            assert_eq!(24 % h, 0);
+            assert!(validate_slab_hours(h).is_ok());
+        }
+        assert!(validate_slab_hours(0).is_err());
+        assert!(validate_slab_hours(5).is_err());
+        assert!(validate_slab_hours(48).is_err());
     }
 
     #[test]

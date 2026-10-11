@@ -38,8 +38,11 @@ const INTERN_CACHE_MAX: usize = 1_000_000;
 /// A transaction with more sender × receiver pairs than this (a huge batch payout from
 /// many inputs) gets no counterparty entries: they'd be noise and cost a lot.
 const MAX_PEER_PAIRS: usize = 10_000;
-/// Removed chain blocks are looked for in this many newest slabs.
+/// Removed chain blocks are looked for in at least this many newest slabs…
 const REORG_SLABS: usize = 2;
+/// …and in every slab ending within this long of the newest one's end, so narrow slabs
+/// (one opened early by a block stamped a little in the future) don't shorten the reach.
+const REORG_WINDOW_MS: u64 = 12 * 60 * 60 * 1000;
 /// A response is committed in chunks of this many chain blocks (the node sends up to ten
 /// mergesets' worth, 2,480 at 10 BPS, which at full blocks is a batch of hundreds of
 /// megabytes). Each chunk is atomic and advances the manifest, and a chain block is never
@@ -477,7 +480,11 @@ impl IndexWriter {
     ) -> Result<Option<u64>> {
         let block = hash.as_bytes();
         let slabs = self.store.slabs();
-        for slab in slabs.iter().rev().take(REORG_SLABS) {
+        let newest_end = slabs.last().map_or(0, |s| s.end_ms());
+        for (i, slab) in slabs.iter().rev().enumerate() {
+            if i >= REORG_SLABS && slab.end_ms() + REORG_WINDOW_MS <= newest_end {
+                break;
+            }
             let txids: Vec<Hash32> = slab
                 .block_tx
                 .prefix(block)
@@ -1239,7 +1246,7 @@ mod tests {
     use super::testing::*;
     use super::*;
     use crate::index::query;
-    use crate::index::records::SLAB_MS;
+    use crate::index::records::DEFAULT_SLAB_MS;
     use crate::index::{TempStore, temp_store};
 
     /// A writer on a temporary store; the writer drops before the directory.
@@ -1987,7 +1994,11 @@ mod tests {
             vec![],
             vec![
                 chain_block(1, 100, vec![tx(1, &[(1, 100)], &[(2, 90)])]),
-                chain_block(2, SLAB_MS + 100, vec![tx(2, &[(1, 100)], &[(2, 90)])]),
+                chain_block(
+                    2,
+                    DEFAULT_SLAB_MS + 100,
+                    vec![tx(2, &[(1, 100)], &[(2, 90)])],
+                ),
             ],
         );
         w.apply(&r).unwrap();
@@ -1995,9 +2006,12 @@ mod tests {
         assert_eq!(store.slabs().len(), 2);
         let a2 = store.lookup(&address(2).to_string()).unwrap().unwrap();
         assert_eq!(query::stats(store, a2).unwrap().received, 180);
-        assert_eq!(store.prune_before(SLAB_MS).unwrap(), 1);
+        assert_eq!(store.prune_before(DEFAULT_SLAB_MS).unwrap(), 1);
         let stats = query::stats(store, a2).unwrap();
-        assert_eq!((stats.received, stats.first_seen_ms), (90, SLAB_MS + 100));
+        assert_eq!(
+            (stats.received, stats.first_seen_ms),
+            (90, DEFAULT_SLAB_MS + 100)
+        );
     }
 
     /// Throughput check for the write path (Phase 0 of the address monitoring plan):

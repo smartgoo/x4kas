@@ -73,6 +73,7 @@ fn run(
         status.position = manifest.position;
         status.rebuilt_from = store.rebuilt_from();
         status.slabs = store.slabs().len();
+        status.slab_hours = Some(store.slab_hours());
         status.coverage = store.coverage();
         status.disk_bytes = store.disk_space();
         app.mark_dirty();

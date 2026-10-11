@@ -13,7 +13,7 @@ use tokio::sync::RwLock;
 
 use x4kas_core::app::{App, ChainPhase};
 use x4kas_core::chain_stream::{self, StreamStart};
-use x4kas_core::config::{IndexFeature, IndexSettings};
+use x4kas_core::config::{self, IndexFeature, IndexSettings};
 use x4kas_core::format::{format_number, now_ms};
 use x4kas_core::index::{self, IndexStore};
 use x4kas_core::polling::{PollingHandles, create_and_start_rpc};
@@ -28,11 +28,16 @@ pub enum IndexCommand {
         /// Print progress this often, in seconds; 0 for no progress output
         #[arg(long, default_value = "5")]
         progress: u64,
+        /// Delete the index first and rebuild it from the node, as the GUI's Resync does
+        /// (and with the slab size of `index settings`)
+        #[arg(long)]
+        resync: bool,
     },
     /// What the index on disk holds
     Status,
     /// Show or change the opt-in data the index keeps (off by default; `index run` and
     /// the GUI apply a change from their next launch, the GUI's Settings › Index at once)
+    /// and the slab size of the next index built
     Settings {
         /// Keep every transaction's whole payload, not only its first 128 bytes: on|off
         #[arg(long, value_parser = parse_on_off)]
@@ -40,7 +45,23 @@ pub enum IndexCommand {
         /// Keep the redeem script every P2SH spend reveals: on|off
         #[arg(long, value_parser = parse_on_off)]
         redeem_scripts: Option<bool>,
+        /// The width of the index's time slabs, in hours (1, 2, 3, 4, 6, 8, 12 or 24;
+        /// default 6): applies when the index is next rebuilt (`index run --resync`)
+        ///
+        /// A slab is one time window of the index: its own set of keyspaces (the separate
+        /// key-value trees of fjall, the embedded database the index is stored in, see
+        /// https://docs.rs/fjall), so a whole window is deleted at once.
+        #[arg(long, value_parser = parse_slab_hours)]
+        slab_hours: Option<u32>,
     },
+}
+
+fn parse_slab_hours(s: &str) -> Result<u32, String> {
+    let hours = s
+        .parse()
+        .map_err(|_| format!("expected a number of hours, not \"{s}\""))?;
+    config::validate_slab_hours(hours)?;
+    Ok(hours)
 }
 
 fn parse_on_off(s: &str) -> Result<bool, String> {
@@ -52,14 +73,25 @@ fn parse_on_off(s: &str) -> Result<bool, String> {
 }
 
 /// Show the index settings, after applying any change.
-fn settings(full_payloads: Option<bool>, redeem_scripts: Option<bool>) -> Result<()> {
-    let mut s = IndexSettings::load()?;
+fn settings(
+    network: &str,
+    full_payloads: Option<bool>,
+    redeem_scripts: Option<bool>,
+    slab_hours: Option<u32>,
+) -> Result<()> {
+    let (mut s, warning) = IndexSettings::load_with_warning()?;
+    if let Some(w) = warning.filter(|_| slab_hours.is_none()) {
+        eprintln!("{}: {w}", IndexSettings::path().display());
+    }
     let before = s;
     if let Some(on) = full_payloads {
         s.set(IndexFeature::FullPayloads, on);
     }
     if let Some(on) = redeem_scripts {
         s.set(IndexFeature::RedeemScripts, on);
+    }
+    if let Some(hours) = slab_hours {
+        s.slab_hours = hours;
     }
     if s != before {
         s.save()?;
@@ -71,12 +103,35 @@ fn settings(full_payloads: Option<bool>, redeem_scripts: Option<bool>) -> Result
             serde_json::Value::Bool(s.enabled(f)),
         );
     }
+    out.insert("slab_hours".into(), s.slab_hours.into());
     println!("{}", serde_json::to_string_pretty(&out)?);
     if s != before {
+        eprintln!("saved {}", IndexSettings::path().display());
+    }
+    let features = |s: &IndexSettings| IndexFeature::ALL.map(|f| s.enabled(f));
+    if features(&s) != features(&before) {
         eprintln!(
-            "saved {}: applies to transactions indexed from the next launch of `index run` \
-             or the GUI on; Resync to cover the whole window",
-            IndexSettings::path().display()
+            "the features apply to transactions indexed from the next launch of `index run` \
+             or the GUI on; Resync to cover the whole window"
+        );
+    }
+    // The width the index on disk was built with, if there is one to read.
+    let in_use = if index::index_dir(network).is_dir() {
+        match IndexStore::open_existing(network) {
+            Ok(store) => Some(store.slab_hours()),
+            Err(e) => {
+                eprintln!("couldn't check the {network} index's slab size: {e:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(hours) = in_use.filter(|h| *h != s.slab_hours) {
+        eprintln!(
+            "the {network} index has {hours}h slabs: rebuild it with `index run --resync` \
+             (or Resync in the GUI) for {}h ones",
+            s.slab_hours
         );
     }
     Ok(())
@@ -90,6 +145,8 @@ struct Status {
     blocks_indexed: u64,
     addresses: u32,
     slabs: usize,
+    /// The width of the index's slabs, in hours
+    slab_hours: u32,
     /// `(from_ms, to_ms)`
     coverage: Option<(u64, u64)>,
     position: Option<index::Position>,
@@ -102,16 +159,22 @@ pub async fn run(url: Option<&str>, network: &str, cmd: IndexCommand) -> Result<
         IndexCommand::Settings {
             full_payloads,
             redeem_scripts,
-        } => settings(full_payloads, redeem_scripts),
+            slab_hours,
+        } => settings(network, full_payloads, redeem_scripts, slab_hours),
         IndexCommand::Run {
             backfill_hours,
             progress,
+            resync,
         } => {
             let url = url.ok_or_else(|| {
                 anyhow!("index run needs a direct node: pass --url (the resolver won't do)")
             })?;
             let backfill =
                 (backfill_hours > 0.0).then(|| Duration::from_secs_f64(backfill_hours * 3600.0));
+            if resync {
+                index::discard(network)?;
+                eprintln!("deleted the {network} index: rebuilding it from the node");
+            }
             run_indexer(url, network, backfill, progress).await
         }
     }
@@ -127,6 +190,7 @@ fn status(network: &str) -> Result<()> {
         blocks_indexed: manifest.blocks_indexed,
         addresses: manifest.next_addr_id,
         slabs: store.slabs().len(),
+        slab_hours: store.slab_hours(),
         coverage: store.coverage(),
         position: manifest.position,
         disk_bytes: store.disk_space(),
@@ -150,13 +214,17 @@ pub(crate) fn start_pipeline(
     network: &str,
     backfill: Option<Duration>,
 ) -> Result<Pipeline> {
+    let (index_settings, warning) = IndexSettings::load_with_warning()?;
+    if let Some(w) = warning {
+        eprintln!("{}: {w}", IndexSettings::path().display());
+    }
     let app = Arc::new(RwLock::new(App {
-        index_settings: IndexSettings::load()?,
+        index_settings,
         ..App::default()
     }));
     let mut handles = PollingHandles::default();
 
-    let store = Arc::new(IndexStore::open(network)?);
+    let store = Arc::new(IndexStore::open(network, index_settings.slab_hours)?);
     let labels = Arc::new(x4kas_core::labels::LabelBook::load());
     let sink = index::task::start_writer(store.clone(), labels, app.clone(), &mut handles)?;
     let position = sink.stream_position();

@@ -28,13 +28,20 @@ pub type AddrId = u32;
 /// Transaction id (or block hash) bytes.
 pub type Hash32 = [u8; 32];
 
-/// Duration of one time slab: every data keyspace is partitioned by slab, so pruning is a
-/// keyspace drop and a 30h retention window spans at most six slabs.
-pub const SLAB_MS: u64 = 6 * 60 * 60 * 1000;
+/// Duration of one time slab unless the index was created with another
+/// (`config::IndexSettings::slab_hours`, kept in the index): every data keyspace is
+/// partitioned by slab, so pruning is a keyspace drop and a 30h retention window spans at
+/// most six slabs of six hours.
+pub const DEFAULT_SLAB_MS: u64 = slab_ms(crate::config::DEFAULT_SLAB_HOURS);
 
-/// The slab a timestamp belongs to.
-pub fn slab_of(time_ms: u64) -> u64 {
-    time_ms / SLAB_MS
+/// The duration of a slab `hours` wide.
+pub const fn slab_ms(hours: u32) -> u64 {
+    hours as u64 * 60 * 60 * 1000
+}
+
+/// The slab a timestamp belongs to, with slabs `slab_ms` wide.
+pub fn slab_of(time_ms: u64, slab_ms: u64) -> u64 {
+    time_ms / slab_ms
 }
 
 /// How many bytes of a transaction's payload the record keeps (`IndexedTx::payload_head`):
@@ -812,9 +819,11 @@ mod tests {
     }
 
     #[test]
-    fn slabs_are_six_hours() {
-        assert_eq!(slab_of(0), 0);
-        assert_eq!(slab_of(SLAB_MS - 1), 0);
-        assert_eq!(slab_of(SLAB_MS), 1);
+    fn slabs_split_time() {
+        assert_eq!(DEFAULT_SLAB_MS, 6 * 60 * 60 * 1000);
+        assert_eq!(slab_of(0, DEFAULT_SLAB_MS), 0);
+        assert_eq!(slab_of(DEFAULT_SLAB_MS - 1, DEFAULT_SLAB_MS), 0);
+        assert_eq!(slab_of(DEFAULT_SLAB_MS, DEFAULT_SLAB_MS), 1);
+        assert_eq!(slab_of(DEFAULT_SLAB_MS, slab_ms(1)), 6);
     }
 }

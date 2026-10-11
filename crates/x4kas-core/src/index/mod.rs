@@ -3,7 +3,8 @@
 //! `chain_stream`), stored on disk with fjall (an LSM-tree, so random-key inserts at
 //! thousands of transactions per second stay cheap) under `~/.x4kas/index/<network>/`.
 //!
-//! Every data keyspace is partitioned into six-hour slabs (`tx_<n>`, `atx_<n>`, …), so
+//! Every data keyspace is partitioned into time slabs (`tx_<n>`, `atx_<n>`, …; six hours
+//! wide unless the index was created with another width, `IndexStore::slab_hours`), so
 //! pruning behind the node's pruning point drops whole keyspaces instead of scanning, and
 //! an address's totals are the sum of at most a few per-slab records. Only the address
 //! interning tables, the clusters, the Dashboard's analytics buckets (`analytics`, see
@@ -33,7 +34,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config;
 use records::{
-    AddrId, Hash32, IndexedTx, SLAB_MS, addr_key, decode, encode, parse_addr_key, slab_of,
+    AddrId, Hash32, IndexedTx, addr_key, decode, encode, parse_addr_key, slab_ms, slab_of,
 };
 
 /// Bumped when the on-disk layout or the meaning of stored data changes; an index with
@@ -78,10 +79,25 @@ pub fn index_dir(network: &str) -> PathBuf {
 
 /// Delete the index of `network` from disk (nothing to do when there is none), so the
 /// next [`IndexStore::open`] starts from scratch. Close the store first: a writer
-/// holding it would keep writing into files that no longer have a directory.
+/// holding it would keep writing into files that no longer have a directory. Refuses
+/// while another process (the GUI, `x4kas-cli index run`) holds it.
 pub fn discard(network: &str) -> Result<()> {
-    let path = index_dir(network);
-    match std::fs::remove_dir_all(&path) {
+    discard_at(&index_dir(network))
+}
+
+fn discard_at(path: &std::path::Path) -> Result<()> {
+    if path.is_dir()
+        && matches!(
+            Database::builder(path).cache_size(1024 * 1024).open(),
+            Err(fjall::Error::Locked)
+        )
+    {
+        return Err(anyhow!(
+            "the address index at {} is in use by another x4kas process",
+            path.display()
+        ));
+    }
+    match std::fs::remove_dir_all(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e).with_context(|| format!("discard {}", path.display())),
@@ -154,10 +170,12 @@ impl Manifest {
     }
 }
 
-/// The keyspaces of one six-hour slab.
+/// The keyspaces of one slab: everything timestamped in `no * width_ms..(no + 1) * width_ms`.
 #[derive(Clone)]
 pub struct Slab {
     pub no: u64,
+    /// The index's slab width (`IndexStore::slab_hours`).
+    pub width_ms: u64,
     /// `txid → IndexedTx`
     pub tx: Keyspace,
     /// `addr_id ‖ time_ms ‖ txid → balance delta`
@@ -187,11 +205,11 @@ pub struct Slab {
 
 impl Slab {
     pub fn start_ms(&self) -> u64 {
-        self.no * SLAB_MS
+        self.no * self.width_ms
     }
 
     pub fn end_ms(&self) -> u64 {
-        (self.no + 1) * SLAB_MS
+        (self.no + 1) * self.width_ms
     }
 
     /// Every keyspace of the slab.
@@ -247,6 +265,8 @@ pub struct IndexStore {
     network: String,
     /// The format of the index that was on disk and had to be discarded, if any.
     rebuilt_from: Option<u32>,
+    /// The slab width this index was created with (`meta` key `slab_hours`).
+    slab_hours: u32,
     /// `format`, `network`, `manifest`
     meta: Keyspace,
     /// `address → addr_id`
@@ -260,20 +280,24 @@ pub struct IndexStore {
 }
 
 impl IndexStore {
-    /// Open (or create) the index for `network` in the default data directory.
-    pub fn open(network: &str) -> Result<Self> {
-        Self::open_at(index_dir(network), network)
+    /// Open (or create) the index for `network` in the default data directory. A new
+    /// index gets slabs `slab_hours` wide (`config::IndexSettings::slab_hours`); one on
+    /// disk keeps the width it was created with.
+    pub fn open(network: &str, slab_hours: u32) -> Result<Self> {
+        Self::open_at(index_dir(network), network, slab_hours)
     }
 
     /// Open the index at `path`, discarding it first when its format or network doesn't
     /// match. Waits a few seconds for the directory lock if another process holds it.
-    pub fn open_at(path: PathBuf, network: &str) -> Result<Self> {
-        let store = Self::open_dir(&path, network)?;
+    pub fn open_at(path: PathBuf, network: &str, slab_hours: u32) -> Result<Self> {
+        config::validate_slab_hours(slab_hours).map_err(|e| anyhow!(e))?;
+        let mut store = Self::open_dir(&path, network)?;
         let format: Option<u32> = store.meta_get("format")?;
         let stored_network: Option<String> = store.meta_get("network")?;
         if format.is_none() {
             store.meta_put("format", &FORMAT_VERSION)?;
             store.meta_put("network", &network.to_string())?;
+            store.init_slab_hours(slab_hours)?;
             return Ok(store);
         }
         if format == Some(FORMAT_VERSION) && stored_network.as_deref() == Some(network) {
@@ -285,6 +309,7 @@ impl IndexStore {
         let mut store = Self::open_dir(&path, network)?;
         store.meta_put("format", &FORMAT_VERSION)?;
         store.meta_put("network", &network.to_string())?;
+        store.init_slab_hours(slab_hours)?;
         store.rebuilt_from = format.filter(|_| stored_network.as_deref() == Some(network));
         Ok(store)
     }
@@ -371,18 +396,25 @@ impl IndexStore {
             member: db.keyspace("cl_member", KeyspaceCreateOptions::default)?,
         };
         let analytics = db.keyspace("analytics", small_keyspace)?;
+        // An index of an earlier version, which didn't store it, has the default width.
+        let slab_hours = match meta.get("slab_hours")? {
+            Some(bytes) => decode(&bytes)?,
+            None => config::DEFAULT_SLAB_HOURS,
+        };
+        config::validate_slab_hours(slab_hours).map_err(|e| anyhow!("address index: {e}"))?;
 
         // Reopen the slabs that exist on disk.
         let mut slabs = BTreeMap::new();
         for name in db.list_keyspace_names() {
             if let Some(no) = name.strip_prefix("tx_").and_then(|n| n.parse::<u64>().ok()) {
-                slabs.insert(no, open_slab(&db, no)?);
+                slabs.insert(no, open_slab(&db, no, slab_ms(slab_hours))?);
             }
         }
         Ok(Self {
             db,
             network: network.to_string(),
             rebuilt_from: None,
+            slab_hours,
             meta,
             addr_by_str,
             str_by_id,
@@ -405,6 +437,24 @@ impl IndexStore {
     /// rebuild from the node can be explained.
     pub fn rebuilt_from(&self) -> Option<u32> {
         self.rebuilt_from
+    }
+
+    /// The width of this index's slabs, in hours: what it was created with, whatever the
+    /// settings say now.
+    pub fn slab_hours(&self) -> u32 {
+        self.slab_hours
+    }
+
+    /// Set the slab width of an index being created (it has no slabs yet).
+    fn init_slab_hours(&mut self, hours: u32) -> Result<()> {
+        debug_assert!(self.slabs.read().expect("slab map poisoned").is_empty());
+        self.meta_put("slab_hours", &hours)?;
+        self.slab_hours = hours;
+        Ok(())
+    }
+
+    fn slab_ms(&self) -> u64 {
+        slab_ms(self.slab_hours)
     }
 
     pub fn disk_space(&self) -> u64 {
@@ -502,7 +552,7 @@ impl IndexStore {
 
     /// The slab for `time_ms`, creating it if needed.
     pub fn slab_for(&self, time_ms: u64) -> Result<Slab> {
-        let no = slab_of(time_ms);
+        let no = slab_of(time_ms, self.slab_ms());
         if let Some(slab) = self.slabs.read().expect("slab map poisoned").get(&no) {
             return Ok(slab.clone());
         }
@@ -510,7 +560,7 @@ impl IndexStore {
         if let Some(slab) = slabs.get(&no) {
             return Ok(slab.clone());
         }
-        let slab = open_slab(&self.db, no)?;
+        let slab = open_slab(&self.db, no, self.slab_ms())?;
         slabs.insert(no, slab.clone());
         Ok(slab)
     }
@@ -520,7 +570,7 @@ impl IndexStore {
         self.slabs
             .read()
             .expect("slab map poisoned")
-            .get(&slab_of(time_ms))
+            .get(&slab_of(time_ms, self.slab_ms()))
             .cloned()
     }
 
@@ -577,12 +627,13 @@ fn small_point_read_keyspace() -> KeyspaceCreateOptions {
     point_read_keyspace().max_memtable_size(SMALL_MEMTABLE_BYTES)
 }
 
-fn open_slab(db: &Database, no: u64) -> Result<Slab> {
+fn open_slab(db: &Database, no: u64, width_ms: u64) -> Result<Slab> {
     let open = |p: &str, options: fn() -> KeyspaceCreateOptions| {
         db.keyspace(&format!("{p}_{no}"), options)
     };
     Ok(Slab {
         no,
+        width_ms,
         tx: open("tx", point_read_keyspace)?,
         addr_tx: open("atx", KeyspaceCreateOptions::default)?,
         block_tx: open("btx", point_read_keyspace)?,
@@ -626,7 +677,12 @@ pub(crate) struct TempStore {
 #[cfg(test)]
 pub(crate) fn temp_store() -> TempStore {
     let dir = tempfile::tempdir().unwrap();
-    let store = IndexStore::open_at(dir.path().join("index"), "mainnet").unwrap();
+    let store = IndexStore::open_at(
+        dir.path().join("index"),
+        "mainnet",
+        config::DEFAULT_SLAB_HOURS,
+    )
+    .unwrap();
     TempStore {
         store: std::sync::Arc::new(store),
         _dir: dir,
@@ -636,6 +692,7 @@ pub(crate) fn temp_store() -> TempStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use records::DEFAULT_SLAB_MS;
 
     #[test]
     fn hex_roundtrip() {
@@ -649,8 +706,12 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         assert_eq!(locked_index_in(root.path()), None);
         let path = root.path().join("mainnet");
-        let store = IndexStore::open_at(path.clone(), "mainnet").unwrap();
-        assert_eq!(locked_index_in(root.path()), Some(path));
+        let store =
+            IndexStore::open_at(path.clone(), "mainnet", config::DEFAULT_SLAB_HOURS).unwrap();
+        assert_eq!(locked_index_in(root.path()), Some(path.clone()));
+        // Nor is it discarded under its holder.
+        assert!(format!("{:#}", discard_at(&path).unwrap_err()).contains("in use"));
+        assert!(path.is_dir());
         drop(store);
         assert_eq!(locked_index_in(root.path()), None);
     }
@@ -660,26 +721,67 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("index");
         {
-            let store = IndexStore::open_at(path.clone(), "mainnet").unwrap();
+            let store =
+                IndexStore::open_at(path.clone(), "mainnet", config::DEFAULT_SLAB_HOURS).unwrap();
             store.slab_for(0).unwrap();
-            store.slab_for(SLAB_MS * 3).unwrap();
+            store.slab_for(DEFAULT_SLAB_MS * 3).unwrap();
             assert_eq!(store.slabs().len(), 2);
-            assert_eq!(store.coverage(), Some((0, SLAB_MS * 4)));
+            assert_eq!(store.coverage(), Some((0, DEFAULT_SLAB_MS * 4)));
             assert_eq!(store.network(), "mainnet");
             let nos = |slabs: Vec<Slab>| slabs.iter().map(|s| s.no).collect::<Vec<_>>();
             assert_eq!(nos(store.slabs_in(0, 1)), vec![0]);
-            assert_eq!(nos(store.slabs_in(SLAB_MS, SLAB_MS * 3)), Vec::<u64>::new());
             assert_eq!(
-                nos(store.slabs_in(SLAB_MS - 1, SLAB_MS * 3 + 1)),
+                nos(store.slabs_in(DEFAULT_SLAB_MS, DEFAULT_SLAB_MS * 3)),
+                Vec::<u64>::new()
+            );
+            assert_eq!(
+                nos(store.slabs_in(DEFAULT_SLAB_MS - 1, DEFAULT_SLAB_MS * 3 + 1)),
                 vec![0, 3]
             );
         }
-        let store = IndexStore::open_at(path.clone(), "mainnet").unwrap();
+        let store =
+            IndexStore::open_at(path.clone(), "mainnet", config::DEFAULT_SLAB_HOURS).unwrap();
         assert_eq!(store.slabs().len(), 2);
-        assert_eq!(store.prune_before(SLAB_MS).unwrap(), 1);
+        assert_eq!(store.prune_before(DEFAULT_SLAB_MS).unwrap(), 1);
         assert_eq!(store.slabs().len(), 1);
         assert_eq!(store.existing_slab(0).map(|s| s.no), None);
-        assert_eq!(store.existing_slab(SLAB_MS * 3).map(|s| s.no), Some(3));
+        assert_eq!(
+            store.existing_slab(DEFAULT_SLAB_MS * 3).map(|s| s.no),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn the_slab_width_is_the_one_the_index_was_created_with() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index");
+        {
+            let store = IndexStore::open_at(path.clone(), "mainnet", 1).unwrap();
+            assert_eq!(store.slab_hours(), 1);
+            assert_eq!(store.slab_for(DEFAULT_SLAB_MS).unwrap().no, 6);
+            assert_eq!(store.coverage(), Some((DEFAULT_SLAB_MS, slab_ms(7))));
+        }
+        // Another width asked for later doesn't change it.
+        let store = IndexStore::open_at(path.clone(), "mainnet", 12).unwrap();
+        assert_eq!(store.slab_hours(), 1);
+        assert_eq!(store.existing_slab(DEFAULT_SLAB_MS).map(|s| s.no), Some(6));
+        drop(store);
+        let store = IndexStore::open_existing_at(path.clone(), "mainnet").unwrap();
+        assert_eq!(store.slab_hours(), 1);
+        drop(store);
+        // An index without a stored width (an earlier version's) has the default.
+        {
+            let store = IndexStore::open_at(path.clone(), "mainnet", 1).unwrap();
+            store.meta.remove("slab_hours").unwrap();
+        }
+        let store = IndexStore::open_at(path.clone(), "mainnet", 1).unwrap();
+        assert_eq!(store.slab_hours(), config::DEFAULT_SLAB_HOURS);
+        drop(store);
+        // Rebuilt from scratch, it takes the width asked for.
+        discard_at(&path).unwrap();
+        let store = IndexStore::open_at(path, "mainnet", 24).unwrap();
+        assert_eq!(store.slab_hours(), 24);
+        assert!(IndexStore::open_at(dir.path().join("other"), "mainnet", 5).is_err());
     }
 
     #[test]
@@ -687,10 +789,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("index");
         {
-            let store = IndexStore::open_at(path.clone(), "mainnet").unwrap();
+            let store =
+                IndexStore::open_at(path.clone(), "mainnet", config::DEFAULT_SLAB_HOURS).unwrap();
             store.slab_for(0).unwrap();
         }
-        let store = IndexStore::open_at(path, "testnet-10").unwrap();
+        let store = IndexStore::open_at(path, "testnet-10", config::DEFAULT_SLAB_HOURS).unwrap();
         assert!(store.slabs().is_empty());
         assert_eq!(store.rebuilt_from(), None);
     }
@@ -700,15 +803,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("index");
         {
-            let store = IndexStore::open_at(path.clone(), "mainnet").unwrap();
+            let store =
+                IndexStore::open_at(path.clone(), "mainnet", config::DEFAULT_SLAB_HOURS).unwrap();
             store.slab_for(0).unwrap();
             store.meta_put("format", &(FORMAT_VERSION - 1)).unwrap();
         }
-        let store = IndexStore::open_at(path.clone(), "mainnet").unwrap();
+        let store =
+            IndexStore::open_at(path.clone(), "mainnet", config::DEFAULT_SLAB_HOURS).unwrap();
         assert!(store.slabs().is_empty());
         assert_eq!(store.rebuilt_from(), Some(FORMAT_VERSION - 1));
         drop(store);
-        let store = IndexStore::open_at(path, "mainnet").unwrap();
+        let store = IndexStore::open_at(path, "mainnet", config::DEFAULT_SLAB_HOURS).unwrap();
         assert_eq!(store.rebuilt_from(), None);
     }
 
@@ -725,7 +830,8 @@ mod tests {
         assert!(refused(&path, "mainnet").contains("no address index"));
         assert!(!path.exists());
         {
-            let store = IndexStore::open_at(path.clone(), "mainnet").unwrap();
+            let store =
+                IndexStore::open_at(path.clone(), "mainnet", config::DEFAULT_SLAB_HOURS).unwrap();
             store.slab_for(0).unwrap();
             // Held open: a second opener fails at once.
             assert!(refused(&path, "mainnet").contains("in use"));
@@ -739,7 +845,7 @@ mod tests {
         drop(store);
         assert!(refused(&path, "mainnet").contains("has format"));
         // Nothing was discarded: the slab is still there for a normal open to reset.
-        let store = IndexStore::open_at(path, "mainnet").unwrap();
+        let store = IndexStore::open_at(path, "mainnet", config::DEFAULT_SLAB_HOURS).unwrap();
         assert_eq!(store.rebuilt_from(), Some(FORMAT_VERSION - 1));
     }
 }

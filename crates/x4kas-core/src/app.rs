@@ -470,6 +470,8 @@ pub struct ChainStatus {
     pub position: Option<crate::index::Position>,
     pub disk_bytes: u64,
     pub slabs: usize,
+    /// The open index's slab width (`IndexStore::slab_hours`); `None` while none is open.
+    pub slab_hours: Option<u32>,
     /// The time span the index covers, `(from_ms, to_ms)`.
     pub coverage: Option<(u64, u64)>,
     /// Smoothed write speed, in transactions per second of writer time.

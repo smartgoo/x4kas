@@ -9,6 +9,7 @@ Notable changes to x4kas. The format follows [Keep a Changelog](https://keepacha
 - Multiple named watchlists, each with its own alert rules, in the GUI and the CLI.
 - Reset App in Settings, which wipes the app's data and restarts it from scratch.
 - Resync the index from Settings > Reset.
+- Configurable index slab size.
 
 ### Fixed
 

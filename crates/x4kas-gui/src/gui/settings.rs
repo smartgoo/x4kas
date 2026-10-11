@@ -2,7 +2,8 @@
 //! navigation of sections with the chosen one's content on the right, in place of the
 //! active tab. Address Labels: the public list (its sources and refresh) and the user's
 //! every known label (label, address, source; add, edit in place, remove). Index: the
-//! opt-in data the address index keeps (full payloads, redeem scripts). Reset: wipe
+//! opt-in data the address index keeps (full payloads, redeem scripts) and the width of
+//! its time slabs (applied by a Resync). Reset: wipe
 //! everything the app keeps under `~/.x4kas` (but exports) and relaunch it; the GUI
 //! closes through its usual shutdown first (`SettingsPage::reset_requested`), and
 //! `main` deletes and relaunches once the window and runtime are gone.
@@ -16,7 +17,7 @@ use super::widgets::{
     kv_with, label_cell, modal_window, placeholder, primary_button, request_label, section_title,
 };
 use x4kas_core::app::{App, ChainPhase};
-use x4kas_core::config::{IndexFeature, data_dir};
+use x4kas_core::config::{DEFAULT_SLAB_HOURS, IndexFeature, SLAB_HOURS_CHOICES, data_dir};
 use x4kas_core::controller::{CommandSender, UiCommand};
 use x4kas_core::format::{format_duration, format_number};
 use x4kas_core::labels::LabelSource;
@@ -24,6 +25,8 @@ use x4kas_core::watch::validate_address;
 
 /// Width of the section navigation.
 const NAV_WIDTH: f32 = 170.0;
+/// fjall's documentation, linked from the Slab Size card.
+const FJALL_DOCS: &str = "https://docs.rs/fjall";
 /// Rows of labels shown before the table scrolls.
 const TABLE_HEIGHT: f32 = 420.0;
 
@@ -477,6 +480,12 @@ fn resync(ui: &mut Ui, app: &App, cmd_tx: &CommandSender) {
          tracked in lower left corner.",
     );
     ui.add_space(8.0);
+    resync_button(ui, app, cmd_tx);
+}
+
+/// The button that sends `UiCommand::Resync`, disabled (with the reason) without a
+/// direct node or while the index opens.
+fn resync_button(ui: &mut Ui, app: &App, cmd_tx: &CommandSender) {
     let direct = app.connection.is_direct();
     let opening = matches!(app.chain.phase, ChainPhase::Opening);
     let button = ui
@@ -521,4 +530,87 @@ fn index(ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
             ui.label(RichText::new(err).color(theme::ERROR));
         }
     });
+    ui.add_space(CARD_GAP);
+    card(ui, "Slab Size", |ui| slab_size(ui, app, cmd_tx));
+}
+
+/// The width of the index's time slabs: picked here, applied when the index is next
+/// built (a Resync), since the index keeps the width it was created with.
+fn slab_size(ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
+    let hours_text = |h: u32| {
+        let unit = if h == 1 { "hour" } else { "hours" };
+        if h == DEFAULT_SLAB_HOURS {
+            format!("{h} {unit} (default)")
+        } else {
+            format!("{h} {unit}")
+        }
+    };
+    let mut settings = app.index_settings;
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Slab size:").color(theme::LABEL));
+        egui::ComboBox::from_id_salt("index_slab_hours")
+            .selected_text(hours_text(settings.slab_hours))
+            .show_ui(ui, |ui| {
+                for h in SLAB_HOURS_CHOICES {
+                    ui.selectable_value(&mut settings.slab_hours, h, hours_text(h));
+                }
+            });
+    });
+    if settings != app.index_settings {
+        app.index_settings = settings;
+        let _ = cmd_tx.send(UiCommand::IndexSettingsSet(settings));
+    }
+    if let Some(err) = &app.index_settings_error {
+        ui.label(RichText::new(err).color(theme::ERROR));
+    }
+    ui.indent("index_slab_doc", |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new(
+                    "A slab is one time window of the index: its own set of keyspaces (the \
+                     separate key-value trees of fjall, the embedded database the index is \
+                     stored in), so a whole window is deleted at once.",
+                )
+                .weak(),
+            );
+            ui.hyperlink_to("fjall docs ↗", FJALL_DOCS)
+                .on_hover_text(FJALL_DOCS);
+        });
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(
+                "The index splits its data into time slabs and drops whole slabs once the \
+                 node prunes past them. Smaller slabs keep less data past the pruning point but \
+                 add keyspaces, and a lookup by transaction id alone reads one per slab. \
+                 Larger slabs keep up to one slab of extra data on disk.",
+            )
+            .weak(),
+        );
+    });
+    ui.add_space(6.0);
+    match app.chain.slab_hours {
+        Some(in_use) if in_use != settings.slab_hours => {
+            ui.label(
+                RichText::new(format!(
+                    "The index in use has {in_use}-hour slabs. Resync DAG index to rebuild it \
+                     with {}-hour ones.",
+                    settings.slab_hours
+                ))
+                .color(theme::WARN),
+            );
+            ui.add_space(6.0);
+            resync_button(ui, app, cmd_tx);
+        }
+        Some(in_use) => {
+            ui.label(RichText::new(format!("The index in use has {in_use}-hour slabs.")).weak());
+        }
+        None => {
+            ui.label(
+                RichText::new(
+                    "Fixed when the index is built: a change applies from the next Resync.",
+                )
+                .weak(),
+            );
+        }
+    }
 }

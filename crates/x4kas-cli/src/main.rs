@@ -143,6 +143,33 @@ mod tests {
     }
 
     #[test]
+    fn index_slab_hours() {
+        let args = Args::parse_from(["x4kas-cli", "index", "settings", "--slab-hours", "12"]);
+        assert!(matches!(
+            args.command,
+            Command::Index {
+                cmd: IndexCommand::Settings {
+                    slab_hours: Some(12),
+                    ..
+                }
+            }
+        ));
+        for bad in ["0", "5", "48", "six"] {
+            assert!(
+                Args::try_parse_from(["x4kas-cli", "index", "settings", "--slab-hours", bad])
+                    .is_err()
+            );
+        }
+        let args = Args::parse_from(["x4kas-cli", "index", "run", "--resync"]);
+        assert!(matches!(
+            args.command,
+            Command::Index {
+                cmd: IndexCommand::Run { resync: true, .. }
+            }
+        ));
+    }
+
+    #[test]
     fn requires_a_command() {
         assert!(Args::try_parse_from(["x4kas-cli"]).is_err());
     }

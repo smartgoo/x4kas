@@ -207,8 +207,13 @@ impl Controller {
             app.watch.lists = Watchlists::load().unwrap_or_default();
             app.watch.lists.ensure_default();
             app.labels = Arc::new(labels::LabelBook::load());
-            match crate::config::IndexSettings::load() {
-                Ok(settings) => app.index_settings = settings,
+            match crate::config::IndexSettings::load_with_warning() {
+                Ok((settings, warning)) => {
+                    app.index_settings = settings;
+                    app.index_settings_error = warning.map(|w| {
+                        format!("{}: {w}", crate::config::IndexSettings::path().display())
+                    });
+                }
                 Err(e) => app.index_settings_error = Some(format!("load index settings: {e}")),
             }
             match SavedQueries::load() {
@@ -400,8 +405,10 @@ impl Controller {
             app.mark_dirty();
         }
         let network_owned = network.to_string();
+        // The width of a new index's slabs; one on disk keeps its own.
+        let slab_hours = self.app.read().await.index_settings.slab_hours;
         let opened = tokio::task::spawn_blocking(move || {
-            let store = IndexStore::open(&network_owned)?;
+            let store = IndexStore::open(&network_owned, slab_hours)?;
             // Best effort: a cache that can't be imported is just stale.
             let _ = index::analytics::import_legacy_cache(&store, &analytics::legacy_cache_path());
             Ok::<_, anyhow::Error>(store)

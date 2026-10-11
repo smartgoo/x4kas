@@ -2267,6 +2267,7 @@ mod tests {
         f.features = IndexSettings {
             full_payloads: true,
             redeem_scripts: true,
+            ..IndexSettings::default()
         };
         assert!(
             f.run("tx all time where payload is not null")
@@ -2334,6 +2335,7 @@ mod tests {
         writer.set_features(IndexSettings {
             full_payloads: true,
             redeem_scripts: true,
+            ..IndexSettings::default()
         });
         let mut krc = tx(3, &[(4, 1_000)], &[(5, 990)]);
         krc.inputs[0].signature_script = Some(vec![7, b'k', b'a', b's', b'p', b'l', b'e', b'x']);
@@ -2386,6 +2388,7 @@ mod tests {
             features: IndexSettings {
                 full_payloads: true,
                 redeem_scripts: true,
+                ..IndexSettings::default()
             },
         }
     }

@@ -1028,6 +1028,14 @@ fn chain_chip(ui: &mut egui::Ui, app: &App, cmd_tx: &CommandSender) {
         kv(ui, "Transactions", format_number(status.txs_indexed));
         kv(ui, "Blocks", format_number(status.blocks_indexed));
         kv(ui, "Addresses", format_number(status.addresses));
+        if let Some(hours) = status.slab_hours {
+            let pending = app.index_settings.slab_hours;
+            let mut text = format!("{} × {hours}h", status.slabs);
+            if pending != hours {
+                text.push_str(&format!(" ({pending}h after a Resync)"));
+            }
+            kv(ui, "Slabs", text);
+        }
         if let Some(format) = status.rebuilt_from {
             kv(
                 ui,

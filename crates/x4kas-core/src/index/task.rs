@@ -75,6 +75,8 @@ fn run(
         status.slabs = store.slabs().len();
         status.slab_hours = Some(store.slab_hours());
         status.coverage = store.coverage();
+        status.oldest_ms = store.oldest_ms();
+        status.gaps = store.gaps().unwrap_or_default();
         status.disk_bytes = store.disk_space();
         app.mark_dirty();
     }
@@ -83,27 +85,33 @@ fn run(
     let mut miners = MinerTally::default();
     let mut batches = 0u64;
     while let Some(batch) = receiver.blocking_recv() {
-        // The latest labels for the clustering guard, and the node's pruning point
-        // (which polling keeps in the app state) to prune behind.
+        // The latest labels for the clustering guard, and the retention floor (the
+        // node's pruning point, which polling keeps in the app state, by default) to
+        // prune behind.
         let (labels, floor, features) = {
             let app = app.blocking_read();
             (
                 app.labels.clone(),
-                app.node.pruning_point_timestamp_ms,
+                app.index_floor_ms(now_ms()),
                 app.index_settings,
             )
         };
         writer.set_labels(labels);
         writer.set_features(features);
         let started = Instant::now();
-        let result = writer.apply(&batch);
+        if batch.jumped {
+            writer.mark_jump();
+        }
+        let result = writer.apply(&batch.response);
         batches += 1;
 
         let pruned = match floor {
             Some(floor) => store.prune_before(floor).unwrap_or(0),
             None => 0,
         };
-        let pool_labels: Vec<(String, String)> = coinbase_miners(&batch)
+        // A gap with no data left before it is just where the index starts now.
+        let gaps_changed = pruned > 0 && store.forget_gaps().unwrap_or(false);
+        let pool_labels: Vec<(String, String)> = coinbase_miners(&batch.response)
             .into_iter()
             .filter_map(|(address, tag)| {
                 let name = miners.observe(&address, tag.as_deref())?;
@@ -124,6 +132,9 @@ fn run(
                 status.record_write(report.txs, started.elapsed());
                 status.unresolved_reorgs += report.unresolved_reorgs.len() as u64;
                 status.cluster_cap_hits += report.cluster_cap_hits;
+                if report.gap.is_some() {
+                    status.gaps = store.gaps().unwrap_or_default();
+                }
                 if let Some(hash) = report.analytics_reorgs.first() {
                     app.analytics.reorg_notification = Some(format!(
                         "Reorg detected affecting finalized block {hash}. Analytics may be slightly inaccurate.",
@@ -137,7 +148,11 @@ fn run(
         if pruned > 0 || batches % DISK_EVERY == 1 {
             app.chain.slabs = store.slabs().len();
             app.chain.coverage = store.coverage();
+            app.chain.oldest_ms = store.oldest_ms();
             app.chain.disk_bytes = store.disk_space();
+        }
+        if gaps_changed {
+            app.chain.gaps = store.gaps().unwrap_or_default();
         }
         if !pool_labels.is_empty() {
             let mut book = (*app.labels).clone();

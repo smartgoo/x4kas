@@ -220,7 +220,7 @@ async fn run(
                 app.query.saved.watched().cloned().collect::<Vec<_>>(),
                 app.labels.clone(),
                 app.watch.lists.clone(),
-                app.node.pruning_point_timestamp_ms,
+                app.index_floor_ms(now_ms()),
                 // What was raised before (an earlier connection): not raised again.
                 app.query
                     .events

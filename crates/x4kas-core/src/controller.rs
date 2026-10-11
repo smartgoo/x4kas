@@ -100,8 +100,9 @@ pub enum UiCommand {
     },
     /// Fetch the public label list now.
     RefreshLabels,
-    /// Save the index's opt-in features; the writer applies them from its next batch.
-    IndexSettingsSet(crate::config::IndexSettings),
+    /// Change one index setting (an opt-in feature, the retention, the slab width) in the
+    /// file; the writer applies the features and retention from its next batch.
+    IndexSettingsEdit(crate::config::IndexSettingsEdit),
     /// Discard the index store (and with it the Dashboard's analytics) and rebuild it
     /// from the node, from scratch. Only with a direct node.
     Resync,
@@ -265,7 +266,7 @@ impl Controller {
                 UiCommand::WatchEdit(edit) => self.edit_watchlists(edit).await,
                 UiCommand::SetLabel { address, name } => self.set_label(address, name).await,
                 UiCommand::RefreshLabels => self.refresh_labels(),
-                UiCommand::IndexSettingsSet(settings) => self.index_settings_set(settings).await,
+                UiCommand::IndexSettingsEdit(edit) => self.index_settings_edit(edit).await,
                 UiCommand::Resync => self.resync().await,
                 UiCommand::Shutdown(done) => {
                     self.stop_all().await;
@@ -405,8 +406,10 @@ impl Controller {
             app.mark_dirty();
         }
         let network_owned = network.to_string();
-        // The width of a new index's slabs; one on disk keeps its own.
-        let slab_hours = self.app.read().await.index_settings.slab_hours;
+        // The width of a new index's slabs (one on disk keeps its own), and how long it
+        // keeps data, which may widen the backfill.
+        let settings = self.app.read().await.index_settings;
+        let slab_hours = settings.slab_hours;
         let opened = tokio::task::spawn_blocking(move || {
             let store = IndexStore::open(&network_owned, slab_hours)?;
             // Best effort: a cache that can't be imported is just stale.
@@ -440,7 +443,7 @@ impl Controller {
             &mut self.polling,
             StreamStart {
                 position: sink.stream_position(),
-                backfill: self.backfill,
+                backfill: StreamStart::backfill_for(self.backfill, settings.retention),
             },
             vec![sink.sender],
         );
@@ -853,7 +856,7 @@ impl Controller {
                 cancel,
                 app.labels.clone(),
                 app.watch.lists.clone(),
-                app.node.pruning_point_timestamp_ms,
+                app.index_floor_ms(now_ms()),
                 index_not_open(&app),
                 app.index_settings,
             )
@@ -1007,11 +1010,17 @@ impl Controller {
         app.mark_dirty();
     }
 
-    async fn index_settings_set(&mut self, settings: crate::config::IndexSettings) {
-        let saved = settings.save();
+    async fn index_settings_edit(&mut self, edit: crate::config::IndexSettingsEdit) {
+        // Applied to the file as it is, keeping what the CLI changed since launch. The
+        // app takes only its own edit: the CLI's changes apply from the next launch, as
+        // it says, so a shorter retention set there never deletes data unasked.
+        let saved = crate::config::IndexSettings::update_file(&[edit]);
         let mut app = self.app.write().await;
-        app.index_settings = settings;
-        app.index_settings_error = saved.err().map(|e| format!("save index settings: {e}"));
+        app.index_settings.apply(edit);
+        app.index_settings_error = match saved {
+            Ok((_, warnings)) => crate::config::join_warnings(&warnings),
+            Err(e) => Some(format!("save index settings: {e:#}")),
+        };
         app.mark_dirty();
     }
 

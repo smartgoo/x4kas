@@ -2,8 +2,9 @@
 //! navigation of sections with the chosen one's content on the right, in place of the
 //! active tab. Address Labels: the public list (its sources and refresh) and the user's
 //! every known label (label, address, source; add, edit in place, remove). Index: the
-//! opt-in data the address index keeps (full payloads, redeem scripts) and the width of
-//! its time slabs (applied by a Resync). Reset: wipe
+//! opt-in data the address index keeps (full payloads, redeem scripts), how long it
+//! keeps data (shortening it asks first) and the width of its time slabs (applied by a
+//! Resync). Reset: wipe
 //! everything the app keeps under `~/.x4kas` (but exports) and relaunch it; the GUI
 //! closes through its usual shutdown first (`SettingsPage::reset_requested`), and
 //! `main` deletes and relaunches once the window and runtime are gone.
@@ -17,9 +18,12 @@ use super::widgets::{
     kv_with, label_cell, modal_window, placeholder, primary_button, request_label, section_title,
 };
 use x4kas_core::app::{App, ChainPhase};
-use x4kas_core::config::{DEFAULT_SLAB_HOURS, IndexFeature, SLAB_HOURS_CHOICES, data_dir};
+use x4kas_core::config::{
+    DEFAULT_SLAB_HOURS, IndexFeature, IndexSettingsEdit, RETENTION_DAYS_CHOICES, Retention,
+    SLAB_HOURS_CHOICES, data_dir,
+};
 use x4kas_core::controller::{CommandSender, UiCommand};
-use x4kas_core::format::{format_duration, format_number};
+use x4kas_core::format::{format_duration, format_number, format_utc, now_ms};
 use x4kas_core::labels::LabelSource;
 use x4kas_core::watch::validate_address;
 
@@ -63,6 +67,8 @@ pub struct SettingsPage {
     /// The address whose 🗑 was clicked once, and when: a second click within
     /// `CONFIRM_SECS` deletes.
     confirm_delete: Option<(String, f64)>,
+    /// A shorter retention picked, waiting for the user to confirm the deletion.
+    confirm_retention: Option<Retention>,
     /// The window confirming a reset is open.
     confirm_reset: bool,
     /// What went wrong with the reset this launch followed (`--reset-report`).
@@ -136,7 +142,7 @@ impl SettingsPage {
             .show_inside(ui, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| match self.section {
                     Section::AddressLabels => self.address_labels(ui, app, cmd_tx),
-                    Section::Index => index(ui, app, cmd_tx),
+                    Section::Index => index(ui, app, cmd_tx, &mut self.confirm_retention),
                     Section::Reset => self.reset(ui, app, cmd_tx),
                 });
             });
@@ -501,9 +507,19 @@ fn resync_button(ui: &mut Ui, app: &App, cmd_tx: &CommandSender) {
     }
 }
 
-/// The opt-in data the address index keeps, each a switch with what it costs. A change
-/// applies from the writer's next batch.
-fn index(ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
+/// The opt-in data the address index keeps, each a switch with what it costs, and how
+/// long it keeps data. A change applies from the writer's next batch.
+fn index(
+    ui: &mut Ui,
+    app: &mut App,
+    cmd_tx: &CommandSender,
+    confirm_retention: &mut Option<Retention>,
+) {
+    // One for the section: a save that failed, or a hand edit the file fell back from.
+    if let Some(err) = &app.index_settings_error {
+        ui.label(RichText::new(err).color(theme::ERROR));
+        ui.add_space(CARD_GAP);
+    }
     card(ui, "Optional Data", |ui| {
         let mut settings = app.index_settings;
         for feature in IndexFeature::ALL {
@@ -512,7 +528,9 @@ fn index(ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
                 settings.set(feature, on);
                 // Shown at once; the controller saves it and the writer picks it up.
                 app.index_settings = settings;
-                let _ = cmd_tx.send(UiCommand::IndexSettingsSet(settings));
+                let _ = cmd_tx.send(UiCommand::IndexSettingsEdit(IndexSettingsEdit::Feature(
+                    feature, on,
+                )));
             }
             ui.indent(("index_feature_doc", feature.label()), |ui| {
                 ui.label(RichText::new(feature.doc()).weak());
@@ -526,12 +544,137 @@ fn index(ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
             )
             .weak(),
         );
-        if let Some(err) = &app.index_settings_error {
-            ui.label(RichText::new(err).color(theme::ERROR));
-        }
+    });
+    ui.add_space(CARD_GAP);
+    card(ui, "Retention", |ui| {
+        retention(ui, app, cmd_tx, confirm_retention)
     });
     ui.add_space(CARD_GAP);
     card(ui, "Slab Size", |ui| slab_size(ui, app, cmd_tx));
+}
+
+/// How long the index keeps data: the node's pruning point (the default) or a fixed
+/// number of days. A setting that deletes indexed data asks first, in place.
+fn retention(ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender, confirm: &mut Option<Retention>) {
+    let text = |r: Retention| {
+        if r == Retention::default() {
+            format!("{} (default)", r.label())
+        } else {
+            r.label()
+        }
+    };
+    let current = app.index_settings.retention;
+    let mut choices: Vec<Retention> = std::iter::once(Retention::Node)
+        .chain(RETENTION_DAYS_CHOICES.map(Retention::Days))
+        .collect();
+    // A period set from the CLI that Settings doesn't offer.
+    if !choices.contains(&current) {
+        choices.push(current);
+        choices.sort_by_key(|r| r.duration_ms());
+    }
+    let mut picked = confirm.unwrap_or(current);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Keep data for:").color(theme::LABEL));
+        egui::ComboBox::from_id_salt("index_retention")
+            .selected_text(text(picked))
+            .show_ui(ui, |ui| {
+                for r in &choices {
+                    ui.selectable_value(&mut picked, *r, text(*r));
+                }
+            });
+    });
+    let now = now_ms();
+    let pruning_point = app.node.pruning_point_timestamp_ms;
+    let floor = |r: Retention| r.floor_ms(now, pruning_point);
+    // Pruning drops whole slabs: a floor deletes what lies before the start of its slab.
+    let slab_ms = app.chain.slab_hours.map(|h| u64::from(h) * 3_600_000);
+    let cut = |floor: u64| slab_ms.map_or(floor, |w| floor - floor % w);
+    let oldest = app.chain.oldest_ms;
+    if picked == current {
+        *confirm = None;
+    } else if Some(picked) != *confirm {
+        // Ask first when it would delete what the index holds now.
+        let deletes = match (floor(current), floor(picked)) {
+            // The node's, before its pruning point is known: it may keep less, unless
+            // there is nothing to delete.
+            (_, None) => oldest.is_some(),
+            (Some(old), Some(new)) if new <= old => false,
+            (_, Some(new)) => oldest.is_none_or(|oldest| oldest < cut(new)),
+        };
+        if deletes {
+            *confirm = Some(picked);
+        } else {
+            set_retention(app, cmd_tx, picked);
+            *confirm = None;
+        }
+    }
+    if let Some(pending) = *confirm {
+        ui.add_space(4.0);
+        let what = match floor(pending) {
+            Some(at) => format!("Deletes indexed data from before {}.", format_utc(cut(at))),
+            None => "May delete indexed data: the node's pruning point isn't known yet, and \
+                     data older than it is deleted once it is."
+                .to_string(),
+        };
+        ui.label(
+            RichText::new(format!(
+                "{what} Data deleted can't be indexed again once the node has pruned it."
+            ))
+            .color(theme::WARN),
+        );
+        ui.horizontal(|ui| {
+            if ui.add(danger_button("Delete older data")).clicked() {
+                set_retention(app, cmd_tx, pending);
+                *confirm = None;
+            }
+            if ui.button("Cancel").clicked() {
+                *confirm = None;
+            }
+        });
+    }
+    ui.indent("index_retention_doc", |ui| {
+        ui.label(
+            RichText::new(
+                "The default setting \"Mirror Kaspa node\" drops data once the node prunes \
+                 past it (about 30 hours on mainnet). Fewer days saves disk space, more keeps \
+                 data the node has pruned.",
+            )
+            .weak(),
+        );
+    });
+    ui.add_space(6.0);
+    if let Some(estimate) = disk_estimate(app, app.index_settings.retention, now) {
+        ui.label(RichText::new(estimate).weak());
+    }
+}
+
+/// Save `retention`: the writer prunes by it from its next batch.
+fn set_retention(app: &mut App, cmd_tx: &CommandSender, retention: Retention) {
+    app.index_settings.retention = retention;
+    let _ = cmd_tx.send(UiCommand::IndexSettingsEdit(IndexSettingsEdit::Retention(
+        retention,
+    )));
+}
+
+/// The index's disk use, and for a fixed period what it would come to at the rate it
+/// has grown at over the time it covers.
+fn disk_estimate(app: &App, retention: Retention, now: u64) -> Option<String> {
+    let (from, to) = app.chain.coverage?;
+    let bytes = app.chain.disk_bytes;
+    let mb = |b: f64| format_number((b / (1024.0 * 1024.0)) as u64);
+    let used = format!("The index uses {} MB on disk.", mb(bytes as f64));
+    // The first slab may hold less than its width: measure from the oldest block.
+    let from = app.chain.oldest_ms.map_or(from, |oldest| oldest.max(from));
+    let covered = to.min(now).saturating_sub(from);
+    match retention.duration_ms() {
+        // Under an hour of data says little about the rate.
+        Some(period) if covered >= 3_600_000 => Some(format!(
+            "{used} About {} MB for {} at the rate so far.",
+            mb(bytes as f64 * period as f64 / covered as f64),
+            retention.label()
+        )),
+        _ => Some(used),
+    }
 }
 
 /// The width of the index's time slabs: picked here, applied when the index is next
@@ -558,10 +701,9 @@ fn slab_size(ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
     });
     if settings != app.index_settings {
         app.index_settings = settings;
-        let _ = cmd_tx.send(UiCommand::IndexSettingsSet(settings));
-    }
-    if let Some(err) = &app.index_settings_error {
-        ui.label(RichText::new(err).color(theme::ERROR));
+        let _ = cmd_tx.send(UiCommand::IndexSettingsEdit(IndexSettingsEdit::SlabHours(
+            settings.slab_hours,
+        )));
     }
     ui.indent("index_slab_doc", |ui| {
         ui.horizontal_wrapped(|ui| {
@@ -579,8 +721,8 @@ fn slab_size(ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
         ui.add_space(4.0);
         ui.label(
             RichText::new(
-                "The index splits its data into time slabs and drops whole slabs once the \
-                 node prunes past them. Smaller slabs keep less data past the pruning point but \
+                "The index splits its data into time slabs and drops whole slabs once they \
+                 fall out of the retention period. Smaller slabs keep less data past it but \
                  add keyspaces, and a lookup by transaction id alone reads one per slab. \
                  Larger slabs keep up to one slab of extra data on disk.",
             )

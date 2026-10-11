@@ -101,6 +101,7 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use x4kas_core::config::Retention;
 
     #[test]
     fn args_defaults() {
@@ -143,7 +144,7 @@ mod tests {
     }
 
     #[test]
-    fn index_slab_hours() {
+    fn index_settings_args() {
         let args = Args::parse_from(["x4kas-cli", "index", "settings", "--slab-hours", "12"]);
         assert!(matches!(
             args.command,
@@ -160,7 +161,32 @@ mod tests {
                     .is_err()
             );
         }
+        let args = Args::parse_from(["x4kas-cli", "index", "settings", "--retention", "7d"]);
+        assert!(matches!(
+            args.command,
+            Command::Index {
+                cmd: IndexCommand::Settings {
+                    retention: Some(Retention::Days(7)),
+                    ..
+                }
+            }
+        ));
+        for bad in ["0d", "week", "forever"] {
+            assert!(
+                Args::try_parse_from(["x4kas-cli", "index", "settings", "--retention", bad])
+                    .is_err()
+            );
+        }
         let args = Args::parse_from(["x4kas-cli", "index", "run", "--resync"]);
+        assert!(matches!(
+            args.command,
+            Command::Index {
+                cmd: IndexCommand::Run {
+                    backfill_hours: None,
+                    ..
+                }
+            }
+        ));
         assert!(matches!(
             args.command,
             Command::Index {

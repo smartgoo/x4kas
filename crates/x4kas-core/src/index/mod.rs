@@ -112,6 +112,46 @@ pub struct Position {
     pub time_ms: u64,
 }
 
+/// Gaps kept; the oldest go first beyond it.
+pub const MAX_GAPS: usize = 64;
+
+/// A stretch between data the index holds that it has no data for: the chain stream
+/// jumped ahead of the index's position, after a pause longer than the backfill window
+/// or when the node had pruned past it. Kept in `meta` under `gaps` (not the manifest,
+/// whose encoding has no room for a new field), written with the batch after the jump,
+/// and forgotten once pruning leaves no data before it (`IndexStore::forget_gaps`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Gap {
+    /// The last chain block indexed before it.
+    pub from_ms: u64,
+    /// The first chain block indexed after it.
+    pub to_ms: u64,
+}
+
+impl Gap {
+    /// Whether it lies within `from..to` in part.
+    pub fn overlaps(&self, from: u64, to: u64) -> bool {
+        self.from_ms < to && from < self.to_ms
+    }
+}
+
+/// Add `gap` to `gaps` (oldest first), merging it with those it touches and dropping
+/// the oldest beyond [`MAX_GAPS`].
+pub fn add_gap(gaps: &mut Vec<Gap>, gap: Gap) {
+    gaps.push(gap);
+    gaps.sort_by_key(|g| g.from_ms);
+    let mut merged: Vec<Gap> = Vec::with_capacity(gaps.len());
+    for g in gaps.drain(..) {
+        match merged.last_mut() {
+            Some(last) if g.from_ms <= last.to_ms => last.to_ms = last.to_ms.max(g.to_ms),
+            _ => merged.push(g),
+        }
+    }
+    let excess = merged.len().saturating_sub(MAX_GAPS);
+    merged.drain(..excess);
+    *gaps = merged;
+}
+
 /// Index-wide counters, persisted in the manifest with every batch.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
@@ -467,6 +507,30 @@ impl IndexStore {
         Ok(self.meta_get("manifest")?.unwrap_or_default())
     }
 
+    /// The gaps in the index, oldest first.
+    pub fn gaps(&self) -> Result<Vec<Gap>> {
+        Ok(self.meta_get("gaps")?.unwrap_or_default())
+    }
+
+    /// The gaps' bytes, for writing them in a batch.
+    pub fn encode_gaps(gaps: &[Gap]) -> Result<Vec<u8>> {
+        encode(&gaps)
+    }
+
+    /// Forget the gaps pruning has left no data before (they are now just where the
+    /// index starts). Returns whether any went.
+    pub fn forget_gaps(&self) -> Result<bool> {
+        let mut gaps = self.gaps()?;
+        let before = gaps.len();
+        let oldest = self.oldest_ms();
+        gaps.retain(|g| oldest.is_some_and(|oldest| oldest <= g.from_ms));
+        if gaps.len() == before {
+            return Ok(false);
+        }
+        self.meta_put("gaps", &gaps)?;
+        Ok(true)
+    }
+
     /// The manifest's bytes, for writing it in a batch.
     pub fn encode_manifest(manifest: &Manifest) -> Result<Vec<u8>> {
         encode(manifest)
@@ -604,6 +668,17 @@ impl IndexStore {
         Some((first.start_ms(), last.end_ms()))
     }
 
+    /// The time of the oldest block the index holds. Later than `coverage`'s start when
+    /// the first slab isn't full (an index started within it): pruning keeps or drops a
+    /// slab whole, so the slabs' bounds are not the data's.
+    pub fn oldest_ms(&self) -> Option<u64> {
+        let slabs = self.slabs.read().expect("slab map poisoned");
+        slabs.values().find_map(|slab| {
+            let first = slab.time_blocks.first_key_value()?;
+            records::parse_time_key(&first.key().ok()?).map(|(time, _)| time)
+        })
+    }
+
     /// Flush the journal so everything written so far survives a crash.
     pub fn persist(&self) -> Result<()> {
         self.db.persist(fjall::PersistMode::SyncAll)?;
@@ -702,6 +777,23 @@ mod tests {
     }
 
     #[test]
+    fn gaps_merge_and_stay_bounded() {
+        let gap = |from_ms, to_ms| Gap { from_ms, to_ms };
+        let mut gaps = vec![gap(10, 20)];
+        add_gap(&mut gaps, gap(50, 60));
+        add_gap(&mut gaps, gap(15, 30));
+        add_gap(&mut gaps, gap(30, 40));
+        assert_eq!(gaps, vec![gap(10, 40), gap(50, 60)]);
+        assert!(gaps[0].overlaps(39, 45) && !gaps[0].overlaps(40, 45));
+        for i in 0..MAX_GAPS as u64 {
+            add_gap(&mut gaps, gap(100 + i * 10, 105 + i * 10));
+        }
+        assert_eq!(gaps.len(), MAX_GAPS);
+        // The oldest went.
+        assert_eq!(gaps[0], gap(100, 105));
+    }
+
+    #[test]
     fn locked_index_finds_an_open_store() {
         let root = tempfile::tempdir().unwrap();
         assert_eq!(locked_index_in(root.path()), None);
@@ -749,6 +841,21 @@ mod tests {
             store.existing_slab(DEFAULT_SLAB_MS * 3).map(|s| s.no),
             Some(3)
         );
+        // The oldest block, not the slab's start: a slab is kept whole but needn't be full.
+        assert_eq!(store.oldest_ms(), None);
+        let slab = store.slab_for(DEFAULT_SLAB_MS * 3).unwrap();
+        let t = DEFAULT_SLAB_MS * 3 + 5_000;
+        slab.time_blocks
+            .insert(records::time_key(t, &[1; 32]), [])
+            .unwrap();
+        slab.time_blocks
+            .insert(records::time_key(t + 1, &[0; 32]), [])
+            .unwrap();
+        assert_eq!(
+            store.coverage(),
+            Some((DEFAULT_SLAB_MS * 3, DEFAULT_SLAB_MS * 4))
+        );
+        assert_eq!(store.oldest_ms(), Some(t));
     }
 
     #[test]

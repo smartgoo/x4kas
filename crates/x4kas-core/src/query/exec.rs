@@ -1437,12 +1437,11 @@ impl Meter<'_> {
 pub fn run(inputs: &Inputs<'_>, q: &Query, ctl: &mut RunControl) -> Result<ResultSet> {
     q.validate()?;
     let plan = plan(q, inputs.store, inputs.now_ms, inputs.prune_floor_ms)?;
-    // The oldest transaction the window can hold: its start, or the index's if later.
-    let oldest = plan
-        .window
-        .0
-        .max(inputs.store.coverage().map_or(0, |(from, _)| from));
-    let notes = feature_notes(inputs, q, oldest)?;
+    // The oldest transaction the window can hold: its start, or the index's oldest
+    // block if later (the first slab may start before it).
+    let oldest = plan.window.0.max(inputs.store.oldest_ms().unwrap_or(0));
+    let mut notes = feature_notes(inputs, q, oldest)?;
+    notes.extend(gap_notes(inputs.store, plan.window)?);
     let explain = plan.explain();
     let store = inputs.store;
     let all_slabs = store.slabs();
@@ -2164,6 +2163,38 @@ fn feature_notes(inputs: &Inputs<'_>, q: &Query, window_from: u64) -> Result<Vec
         .collect())
 }
 
+/// Gap notes shown at most; more are summed up in one.
+const GAP_NOTES: usize = 3;
+
+/// Say which stretches of `window` the index has no data for (`index::Gap`).
+fn gap_notes(store: &IndexStore, window: (u64, u64)) -> Result<Vec<String>> {
+    let gaps: Vec<_> = store
+        .gaps()?
+        .into_iter()
+        .filter(|g| g.overlaps(window.0, window.1))
+        .collect();
+    let mut notes: Vec<String> = gaps
+        .iter()
+        .rev()
+        .take(GAP_NOTES)
+        .map(|g| {
+            format!(
+                "The index has no data from {} to {} ({}): it was stopped longer than its backfill window or than the node keeps, and skipped ahead.",
+                format_utc(g.from_ms),
+                format_utc(g.to_ms),
+                format_duration_ms(g.to_ms - g.from_ms)
+            )
+        })
+        .collect();
+    if gaps.len() > GAP_NOTES {
+        notes.push(format!(
+            "{} older gaps in the window too (x4kas-cli index status lists them).",
+            gaps.len() - GAP_NOTES
+        ));
+    }
+    Ok(notes)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -2287,6 +2318,26 @@ mod tests {
         assert!(r.notes[0].contains("Index full payloads"), "{}", r.notes[0]);
         // A field without a feature never gets one.
         assert!(f.run("tx all time where fee > 0 sompi").notes.is_empty());
+    }
+
+    #[test]
+    fn a_window_over_a_gap_says_so() {
+        let f = fixture();
+        assert!(f.run("tx last 4h").notes.is_empty());
+        let store = &f.store.store;
+        let gap = crate::index::Gap {
+            from_ms: 7 * HOUR,
+            to_ms: 8 * HOUR,
+        };
+        store
+            .meta_keyspace()
+            .insert("gaps", IndexStore::encode_gaps(&[gap]).unwrap())
+            .unwrap();
+        let r = f.run("tx last 4h");
+        assert_eq!(r.notes.len(), 1);
+        assert!(r.notes[0].contains("no data from"), "{}", r.notes[0]);
+        // A window after it doesn't mention it.
+        assert!(f.run("tx last 1h").notes.is_empty());
     }
 
     /// The redeem script of a P2SH spend, matched as hex.

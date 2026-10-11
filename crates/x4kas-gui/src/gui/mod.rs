@@ -47,7 +47,7 @@ use x4kas_core::chain_stream;
 use x4kas_core::chain_stream::StreamStart;
 use x4kas_core::config::{ConnectionKind, ConnectionSettings};
 use x4kas_core::controller::{self, CommandSender, ControllerArgs, RemoteTarget, UiCommand};
-use x4kas_core::format::{format_duration, format_number, now_ms};
+use x4kas_core::format::{format_duration, format_duration_ms, format_number, format_utc, now_ms};
 use x4kas_core::labels;
 use x4kas_core::rpc::market;
 
@@ -1010,7 +1010,7 @@ fn chain_chip(ui: &mut egui::Ui, app: &App, cmd_tx: &CommandSender) {
             }
             Some(StartPoint::Index(None)) => kv(ui, "Started from", "index position"),
             Some(StartPoint::PruningPoint) => kv(ui, "Started from", "pruning point"),
-            Some(StartPoint::LastDay) => kv(ui, "Started from", "24 hours ago"),
+            Some(StartPoint::LastDay) => kv(ui, "Started from", "the backfill window"),
             None => {}
         }
         if status.phase == ChainPhase::CatchingUp {
@@ -1035,6 +1035,24 @@ fn chain_chip(ui: &mut egui::Ui, app: &App, cmd_tx: &CommandSender) {
                 text.push_str(&format!(" ({pending}h after a Resync)"));
             }
             kv(ui, "Slabs", text);
+        }
+        kv(ui, "Retention", app.index_settings.retention.label());
+        // Stretches the index skipped; queries over them say so too.
+        if let Some(newest) = status.gaps.last() {
+            let span = format!(
+                "{} – {} ({})",
+                format_utc(newest.from_ms),
+                format_utc(newest.to_ms),
+                format_duration_ms(newest.to_ms - newest.from_ms)
+            );
+            kv(
+                ui,
+                "Gaps",
+                match status.gaps.len() {
+                    1 => span,
+                    n => format!("{n}, the newest {span}"),
+                },
+            );
         }
         if let Some(format) = status.rebuilt_from {
             kv(

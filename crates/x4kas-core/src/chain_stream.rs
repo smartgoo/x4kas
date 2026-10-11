@@ -14,11 +14,19 @@ use kaspa_rpc_core::{GetVirtualChainFromBlockV2Response, RpcHash};
 use tokio::sync::{RwLock, mpsc};
 
 use crate::app::{App, ChainPhase, ConnectionStatus, StartPoint, TimeWindow};
+use crate::config::Retention;
 use crate::format::now_ms;
 use crate::polling::PollingHandles;
 use crate::rpc::client::RpcManager;
 
-pub type ChainBatch = GetVirtualChainFromBlockV2Response;
+/// One VSPC v2 response as the stream hands it to its sinks.
+pub struct ChainBatch {
+    pub response: GetVirtualChainFromBlockV2Response,
+    /// The stream didn't continue from the index position before this batch: it
+    /// skipped ahead (a pause longer than the backfill window) or the node had pruned
+    /// past it. The index records the stretch it missed as a gap.
+    pub jumped: bool,
+}
 pub type BatchSender = mpsc::Sender<Arc<ChainBatch>>;
 
 /// Responses a sink may have queued before the fetcher waits for it. The node answers
@@ -62,6 +70,18 @@ impl StreamStart {
     pub fn default_backfill() -> Duration {
         Duration::from_millis(TimeWindow::TwentyFourHour.duration_ms())
     }
+
+    /// The backfill for an index kept for `retention`: a fixed period longer than
+    /// `backfill` widens it, so a restart after a long pause doesn't skip what the
+    /// index would keep (the node's pruning point still bounds it). `None` (everything
+    /// the node has) stays.
+    pub fn backfill_for(backfill: Option<Duration>, retention: Retention) -> Option<Duration> {
+        let backfill = backfill?;
+        Some(match retention.duration_ms() {
+            Some(ms) => backfill.max(Duration::from_millis(ms)),
+            None => backfill,
+        })
+    }
 }
 
 /// Start the stream task, tracked in `handles.stream`.
@@ -87,7 +107,7 @@ pub async fn run(
     wait_for_node(&app).await;
 
     let backfill = start.backfill;
-    let mut current_hash = resolve_start(&rpc, &app, start.position, backfill).await;
+    let (mut current_hash, mut jumped) = resolve_start(&rpc, &app, start.position, backfill).await;
 
     // Initial catch-up, then incremental polling.
     let mut synced = false;
@@ -99,7 +119,8 @@ pub async fn run(
             Err(e) if is_out_of_retention(&e) => {
                 // The node pruned past our position (a catch-up slower than the pruning
                 // point moved), so this hash can never succeed. Start over in the window.
-                current_hash = resolve_start(&rpc, &app, None, backfill).await;
+                (current_hash, _) = resolve_start(&rpc, &app, None, backfill).await;
+                jumped = true;
                 continue;
             }
             Err(e) => {
@@ -135,7 +156,8 @@ pub async fn run(
         }
 
         // Hand the batch to every sink; a full queue makes this wait (backpressure).
-        let batch = Arc::new(response);
+        let batch = Arc::new(ChainBatch { response, jumped });
+        jumped = false;
         for sink in &sinks {
             if sink.send(batch.clone()).await.is_err() {
                 // A sink that went away (its task ended) can't be fed; the others go on.
@@ -173,13 +195,13 @@ pub async fn run(
 /// Pick the chain block to stream from and report it in the status: the index position
 /// if given, otherwise the pruning point, skipped ahead to the backfill window. Retries
 /// until the node answers; a position the node has pruned falls back to the pruning
-/// point.
+/// point. Also returns whether the stream jumps: it doesn't continue from `position`.
 async fn resolve_start(
     rpc: &RpcManager,
     app: &RwLock<App>,
     mut position: Option<(RpcHash, Option<SystemTime>)>,
     backfill: Option<Duration>,
-) -> RpcHash {
+) -> (RpcHash, bool) {
     set_phase(app, ChainPhase::Seeking).await;
     loop {
         wait_for_node(app).await;
@@ -206,7 +228,7 @@ async fn resolve_start(
                 status.daa_per_sec = None;
                 status.phase = ChainPhase::CatchingUp;
                 app.mark_dirty();
-                return hash;
+                return (hash, !matches!(started_from, StartPoint::Index(_)));
             }
             Err(e) if position.is_some() && is_out_of_retention(&e) => position = None,
             Err(e) => {
@@ -287,6 +309,28 @@ fn is_out_of_retention(err: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backfill_widens_to_a_longer_retention() {
+        let day = StreamStart::default_backfill();
+        assert_eq!(
+            StreamStart::backfill_for(Some(day), Retention::Node),
+            Some(day)
+        );
+        assert_eq!(
+            StreamStart::backfill_for(Some(day), Retention::Days(1)),
+            Some(day)
+        );
+        assert_eq!(
+            StreamStart::backfill_for(Some(day), Retention::Days(7)),
+            Some(day * 7)
+        );
+        assert_eq!(
+            StreamStart::backfill_for(Some(day * 30), Retention::Days(7)),
+            Some(day * 30)
+        );
+        assert_eq!(StreamStart::backfill_for(None, Retention::Days(7)), None);
+    }
 
     #[test]
     fn detects_out_of_retention_errors() {

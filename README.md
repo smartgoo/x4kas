@@ -55,7 +55,7 @@ For CLI usage, see [CLI usage](#cli-usage) below.
 x4kas builds its own index of the chain locally. Most other app features (analytics, the Explorer's address pages, flows and queries) read from this index.
 
 - **Source**: polls VSPCv2 via `get_virtual_chain_from_block_v2` with full verbosity.
-- **Start**: resumes where it left off. A fresh index backfills the last 24h (`--backfill-hours` in the CLI).
+- **Start**: resumes where it left off. A fresh index backfills the last 24h, or the retention period when that is longer and the node still has the data (`--backfill-hours` in the CLI).
 - **Store**: an embedded [fjall](https://github.com/fjall-rs/fjall) database located at `~/.x4kas/index/<network>/`, split into 6-hour slabs and pruned.
 - **Contents**: transactions, blocks, miners, per-address history and stats, counterparties, ownership clusters and dashboard analytics. Full payloads and P2SH redeem scripts are opt-in (Settings › Index, or `x4kas-cli index settings`).
 - **Reorgs**: changes to the selected chain are undone and reapplied, committed atomically.
@@ -63,13 +63,14 @@ x4kas builds its own index of the chain locally. Most other app features (analyt
 
 ### Pruning
 
-The index prunes similar to a Kaspa node.
+By default the index prunes like a Kaspa node: it keeps what the node keeps. To keep a fixed number of days instead, set it in Settings › DAG Index › Retention or with `x4kas-cli index settings --retention 7d` (`--retention node` sets it back). Fewer days save disk space. More days keep data the node has already pruned. A longer period doesn't fetch older data: the index grows into it from then on.
 
-- After every batch, any 6-hour slab that ends before the node's pruning point is deleted as a whole. This removes its transactions, blocks, per-address history and stats, counterparties, and opt-in payloads and redeem scripts. Because whole slabs are dropped, up to six extra hours past the pruning point can stay on disk until the next slab boundary passes.
+- After every batch, any slab that ends before the retention floor is deleted as a whole. By default the floor is the node's pruning point; with a fixed period it is that many days ago. Deleting a slab removes its transactions, blocks, per-address history and stats, counterparties, and opt-in payloads and redeem scripts. Because whole slabs are dropped, up to one extra slab (six hours by default) can stay on disk until the next slab boundary passes.
+- A node started with `--retention-period-days` keeps data past its pruning point, but RPC doesn't expose that, so "mirror the node" still follows the pruning point.
 - Address totals, balance history and query results cover the retained slabs only, not the address's full lifetime. The Analyzer hover and `x4kas-cli index status` show how far back the index reaches.
 - Dashboard analytics keep their own 24-hour window and are pruned separately.
 - Not pruned yet: the address-to-id table and the ownership clusters. They grow for as long as the index runs.
-- If the index falls behind the node's pruning point, for example after being offline for a long time, it restarts from the pruning point. The time in between is never indexed.
+- If the index falls behind the node's pruning point, for example after being offline for a long time, it restarts from the pruning point. The time in between is never indexed. The same goes for a restart after a stop longer than the backfill window, which skips ahead to it. The index records each such gap: the Analyzer hover and `x4kas-cli index status` list them, and a query whose window overlaps one says so. A gap is forgotten once pruning has deleted everything before it.
 
 ## CLI Usage
 

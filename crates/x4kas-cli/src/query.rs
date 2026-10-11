@@ -124,8 +124,9 @@ pub enum QueryCommand {
         /// every query saved as watched
         names: Vec<String>,
         /// How many hours back to fill in on start; 0 for everything the node retains
-        #[arg(long, default_value = "24")]
-        backfill_hours: f64,
+        /// (default 24, or the retention period of `index settings` when longer)
+        #[arg(long)]
+        backfill_hours: Option<f64>,
         /// Print the indexer's progress on stderr this often, in seconds; 0 for none
         #[arg(long, default_value = "5")]
         progress: u64,
@@ -200,9 +201,7 @@ pub async fn run(url: Option<&str>, network: &str, cmd: QueryCommand) -> Result<
             let url = url.ok_or_else(|| {
                 anyhow!("query watch needs a direct node: pass --url (the resolver won't do)")
             })?;
-            let backfill =
-                (backfill_hours > 0.0).then(|| Duration::from_secs_f64(backfill_hours * 3600.0));
-            watch(url, network, names, backfill, progress).await
+            watch(url, network, names, backfill_hours, progress).await
         }
         other => run_offline(network, other),
     }
@@ -245,15 +244,18 @@ fn run_offline(network: &str, cmd: QueryCommand) -> Result<()> {
             }
             let labels = LabelBook::load();
             let watchlist = Watchlists::load().unwrap_or_default();
+            let settings = x4kas_core::config::IndexSettings::load()?;
+            let now = now_ms();
             let inputs = Inputs {
                 store: &store,
                 labels: &labels,
                 watchlist: &watchlist,
-                now_ms: now_ms(),
-                prune_floor_ms: None,
-                features: x4kas_core::config::IndexSettings::load()?,
+                now_ms: now,
+                // A fixed retention's floor; the node's pruning point isn't known offline.
+                prune_floor_ms: settings.retention.floor_ms(now, None),
+                features: settings,
             };
-            if let Ok(plan) = exec::plan(&query, &store, inputs.now_ms, None)
+            if let Ok(plan) = exec::plan(&query, &store, inputs.now_ms, inputs.prune_floor_ms)
                 && scans_everything(&query, &plan.source)
             {
                 eprintln!(
@@ -427,7 +429,7 @@ async fn watch(
     url: &str,
     network: &str,
     names: Vec<String>,
-    backfill: Option<Duration>,
+    backfill_hours: Option<f64>,
     progress_secs: u64,
 ) -> Result<()> {
     let mut list = SavedQueries::load()?;
@@ -465,7 +467,7 @@ async fn watch(
          none, and an address query's first run only learns which addresses match.",
         POLL.as_secs()
     );
-    let mut pipeline = start_pipeline(url, network, backfill)?;
+    let mut pipeline = start_pipeline(url, network, backfill_hours)?;
     pipeline.app.write().await.query.saved = list;
     x4kas_core::query::watch::start_query_watch(
         pipeline.store.clone(),

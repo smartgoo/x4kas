@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -234,16 +234,115 @@ pub fn validate_slab_hours(hours: u32) -> std::result::Result<(), String> {
     }
 }
 
-/// Which [`IndexFeature`]s are on and how wide new slabs are (`~/.x4kas/index.toml`).
-/// The index writer reads the features before every batch, so a change applies from the
-/// next one; the slab width is fixed when an index is created (it is stored in the
-/// index), so a change applies from the next Resync.
+const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// The retention periods Settings offers, in days; the CLI takes any whole number of
+/// days from 1 to [`MAX_RETENTION_DAYS`].
+pub const RETENTION_DAYS_CHOICES: [u32; 6] = [1, 3, 7, 14, 30, 90];
+
+/// The longest retention period one can set, in days: every slab is a set of fjall
+/// keyspaces, and an index of more than a year's slabs hasn't been measured.
+pub const MAX_RETENTION_DAYS: u32 = 365;
+
+/// How long the address index keeps what it indexed. Pruning drops whole slabs, so up
+/// to one slab more stays on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum Retention {
+    /// Keep what the node keeps: prune behind its pruning point. The node's own
+    /// retention period (`--retention-period-days`) isn't visible over RPC, so a node
+    /// that keeps more is still followed by its pruning point.
+    #[default]
+    Node,
+    /// Keep this many days, whatever the node keeps: less saves disk space, more keeps
+    /// data the node has already pruned.
+    Days(u32),
+}
+
+impl Retention {
+    /// The time before which indexed data is dropped, if any: the node's pruning point
+    /// (unknown until the node has answered) or `days` before `now_ms`.
+    pub fn floor_ms(self, now_ms: u64, pruning_point_ms: Option<u64>) -> Option<u64> {
+        match self {
+            Self::Node => pruning_point_ms,
+            Self::Days(days) => Some(now_ms.saturating_sub(days as u64 * DAY_MS)),
+        }
+    }
+
+    /// The fixed period, if it isn't the node's.
+    pub fn duration_ms(self) -> Option<u64> {
+        match self {
+            Self::Node => None,
+            Self::Days(days) => Some(days as u64 * DAY_MS),
+        }
+    }
+
+    /// The setting's name, as Settings shows it.
+    pub fn label(self) -> String {
+        match self {
+            Self::Node => "Mirror Kaspa node".to_string(),
+            Self::Days(1) => "1 day".to_string(),
+            Self::Days(days) => format!("{days} days"),
+        }
+    }
+}
+
+impl std::fmt::Display for Retention {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Node => f.write_str("node"),
+            Self::Days(days) => write!(f, "{days}d"),
+        }
+    }
+}
+
+impl std::str::FromStr for Retention {
+    type Err = String;
+
+    /// `node`, or a number of days as `<N>d` (or a bare `<N>`).
+    fn from_str(s: &str) -> std::result::Result<Self, String> {
+        let s = s.trim().to_ascii_lowercase();
+        if s == "node" {
+            return Ok(Self::Node);
+        }
+        let digits = s.strip_suffix('d').unwrap_or(&s);
+        match digits.parse::<u32>() {
+            Ok(days) if (1..=MAX_RETENTION_DAYS).contains(&days) => Ok(Self::Days(days)),
+            _ => Err(format!(
+                "retention must be `node` or a number of days from 1d to {MAX_RETENTION_DAYS}d, not `{s}`"
+            )),
+        }
+    }
+}
+
+impl TryFrom<String> for Retention {
+    type Error = String;
+
+    fn try_from(s: String) -> std::result::Result<Self, String> {
+        s.parse()
+    }
+}
+
+impl From<Retention> for String {
+    fn from(r: Retention) -> Self {
+        r.to_string()
+    }
+}
+
+/// Which [`IndexFeature`]s are on, how long the index keeps data and how wide new slabs
+/// are (`~/.x4kas/index.toml`). The index writer reads the features and the retention
+/// before every batch, so a change applies from the next one; the slab width is fixed
+/// when an index is created (it is stored in the index), so a change applies from the
+/// next Resync.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexSettings {
     #[serde(default)]
     pub full_payloads: bool,
     #[serde(default)]
     pub redeem_scripts: bool,
+    /// How long indexed data is kept.
+    #[serde(default)]
+    pub retention: Retention,
     /// The slab width of the next index built, one of [`SLAB_HOURS_CHOICES`].
     #[serde(default = "default_slab_hours")]
     pub slab_hours: u32,
@@ -258,9 +357,53 @@ impl Default for IndexSettings {
         Self {
             full_payloads: false,
             redeem_scripts: false,
+            retention: Retention::Node,
             slab_hours: DEFAULT_SLAB_HOURS,
         }
     }
+}
+
+/// One change to the index settings, applied to the file as it is
+/// ([`IndexSettings::update_file`]) so it keeps what another process changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexSettingsEdit {
+    Feature(IndexFeature, bool),
+    Retention(Retention),
+    SlabHours(u32),
+}
+
+impl IndexSettingsEdit {
+    /// The key in `index.toml` the edit sets.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Feature(IndexFeature::FullPayloads, _) => "full_payloads",
+            Self::Feature(IndexFeature::RedeemScripts, _) => "redeem_scripts",
+            Self::Retention(_) => "retention",
+            Self::SlabHours(_) => "slab_hours",
+        }
+    }
+}
+
+/// A key of `index.toml` that didn't load, and why.
+pub type SettingsWarning = (&'static str, String);
+
+/// Write `text` to a temporary file beside `path` and rename it over `path`, so a reader
+/// never sees the file half written.
+fn write_replacing(path: &Path, text: &str) -> Result<()> {
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+pub fn join_warnings(warnings: &[SettingsWarning]) -> Option<String> {
+    (!warnings.is_empty()).then(|| {
+        warnings
+            .iter()
+            .map(|(_, w)| w.as_str())
+            .collect::<Vec<_>>()
+            .join("; ")
+    })
 }
 
 impl IndexSettings {
@@ -274,24 +417,105 @@ impl IndexSettings {
     }
 
     /// The settings on disk, and why a slab width that isn't one of
-    /// [`SLAB_HOURS_CHOICES`] (a hand edit) was replaced by the default: the rest of the
-    /// file still counts.
+    /// [`SLAB_HOURS_CHOICES`] or a retention that doesn't parse (a hand edit) was
+    /// replaced by the default: the rest of the file still counts.
     pub fn load_with_warning() -> Result<(Self, Option<String>)> {
+        let (settings, warnings) = Self::load_with_warnings()?;
+        Ok((settings, join_warnings(&warnings)))
+    }
+
+    /// [`IndexSettings::load_with_warning`] with each warning under the key it is about
+    /// (`retention`, `slab_hours`), so a command setting that key can leave its out.
+    pub fn load_with_warnings() -> Result<(Self, Vec<SettingsWarning>)> {
         let path = Self::path();
         if !path.exists() {
-            return Ok((Self::default(), None));
+            return Ok((Self::default(), Vec::new()));
         }
-        Self::parse(&std::fs::read_to_string(&path)?)
+        Self::parse_keyed(&std::fs::read_to_string(&path)?)
             .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))
     }
 
+    /// Load the file, apply `edits`, save it and return the result with the load
+    /// warnings the edits didn't settle, so a change made by another process (the CLI
+    /// while the GUI runs) since the last load is kept. A key that didn't load keeps its
+    /// text in the file unless an edit sets it, so a hand edit isn't lost to the
+    /// fallback. Under an exclusive lock on a file beside it, as `Watchlists::update_file`.
+    pub fn update_file(edits: &[IndexSettingsEdit]) -> Result<(Self, Vec<SettingsWarning>)> {
+        let path = Self::path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let lock = std::fs::File::create(path.with_extension("toml.lock"))?;
+        lock.lock()?;
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(e.into()),
+        };
+        let (settings, warnings, out) = Self::edit_text(&text, edits)
+            .map_err(|e| anyhow::anyhow!("{}: {e:#}", path.display()))?;
+        write_replacing(&path, &out)?;
+        Ok((settings, warnings))
+    }
+
+    /// [`IndexSettings::update_file`] on the file's `text`: the settings, the warnings
+    /// left and the text to save.
+    fn edit_text(
+        text: &str,
+        edits: &[IndexSettingsEdit],
+    ) -> Result<(Self, Vec<SettingsWarning>, String)> {
+        let (mut settings, mut warnings) = Self::parse_keyed(text)?;
+        for edit in edits {
+            settings.apply(*edit);
+        }
+        warnings.retain(|(key, _)| !edits.iter().any(|e| e.key() == *key));
+        let mut out = toml::Table::try_from(settings)?;
+        if !warnings.is_empty() {
+            let raw: toml::Table = toml::from_str(text)?;
+            for (key, _) in &warnings {
+                if let Some(value) = raw.get(*key) {
+                    out.insert(key.to_string(), value.clone());
+                }
+            }
+        }
+        Ok((settings, warnings, toml::to_string_pretty(&out)?))
+    }
+
+    pub fn apply(&mut self, edit: IndexSettingsEdit) {
+        match edit {
+            IndexSettingsEdit::Feature(feature, on) => self.set(feature, on),
+            IndexSettingsEdit::Retention(retention) => self.retention = retention,
+            IndexSettingsEdit::SlabHours(hours) => self.slab_hours = hours,
+        }
+    }
+
+    #[cfg(test)]
     fn parse(text: &str) -> Result<(Self, Option<String>)> {
-        let mut settings: Self = toml::from_str(text)?;
-        let warning = validate_slab_hours(settings.slab_hours).err().map(|e| {
+        let (settings, warnings) = Self::parse_keyed(text)?;
+        Ok((settings, join_warnings(&warnings)))
+    }
+
+    fn parse_keyed(text: &str) -> Result<(Self, Vec<SettingsWarning>)> {
+        let mut table: toml::Table = toml::from_str(text)?;
+        let mut warnings = Vec::new();
+        if let Some(value) = table.get("retention") {
+            let parsed = match value {
+                toml::Value::String(s) => s.parse::<Retention>().map(|_| ()),
+                other => Err(format!(
+                    "retention must be `node` or a number of days, not {other}"
+                )),
+            };
+            if let Err(e) = parsed {
+                table.remove("retention");
+                warnings.push(("retention", format!("{e}: using node")));
+            }
+        }
+        let mut settings: Self = toml::Value::Table(table).try_into()?;
+        if let Err(e) = validate_slab_hours(settings.slab_hours) {
             settings.slab_hours = DEFAULT_SLAB_HOURS;
-            format!("{e}: using {DEFAULT_SLAB_HOURS}")
-        });
-        Ok((settings, warning))
+            warnings.push(("slab_hours", format!("{e}: using {DEFAULT_SLAB_HOURS}")));
+        }
+        Ok((settings, warnings))
     }
 
     pub fn save(&self) -> Result<()> {
@@ -299,8 +523,7 @@ impl IndexSettings {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&path, toml::to_string_pretty(self)?)?;
-        Ok(())
+        write_replacing(&path, &toml::to_string_pretty(self)?)
     }
 
     pub fn enabled(&self, feature: IndexFeature) -> bool {
@@ -365,6 +588,108 @@ mod tests {
         assert_eq!(s.slab_hours, DEFAULT_SLAB_HOURS);
         assert!(warning.unwrap().contains("not 5"));
         assert_eq!(IndexSettings::parse("slab_hours = 12").unwrap().1, None);
+    }
+
+    #[test]
+    fn warnings_name_their_key_and_edits_apply() {
+        let (s, warnings) =
+            IndexSettings::parse_keyed("retention = \"week\"\nslab_hours = 5").unwrap();
+        let keys: Vec<&str> = warnings.iter().map(|(key, _)| *key).collect();
+        assert_eq!(keys, ["retention", "slab_hours"]);
+        let mut s = s;
+        for edit in [
+            IndexSettingsEdit::Feature(IndexFeature::RedeemScripts, true),
+            IndexSettingsEdit::Retention(Retention::Days(30)),
+            IndexSettingsEdit::SlabHours(12),
+        ] {
+            s.apply(edit);
+        }
+        assert_eq!(
+            s,
+            IndexSettings {
+                redeem_scripts: true,
+                retention: Retention::Days(30),
+                slab_hours: 12,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn an_edit_keeps_the_text_of_a_key_that_did_not_load() {
+        let text = "retention = \"2w\"\nslab_hours = 5";
+        let edit = [IndexSettingsEdit::Feature(IndexFeature::FullPayloads, true)];
+        let (s, warnings, out) = IndexSettings::edit_text(text, &edit).unwrap();
+        assert!(s.full_payloads);
+        assert_eq!(warnings.len(), 2);
+        let saved: toml::Table = toml::from_str(&out).unwrap();
+        assert_eq!(saved["retention"].as_str(), Some("2w"));
+        assert_eq!(saved["slab_hours"].as_integer(), Some(5));
+        assert_eq!(saved["full_payloads"].as_bool(), Some(true));
+
+        // Setting the key replaces it and settles its warning.
+        let edit = [IndexSettingsEdit::Retention(Retention::Days(14))];
+        let (_, warnings, out) = IndexSettings::edit_text(text, &edit).unwrap();
+        assert_eq!(
+            warnings.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+            ["slab_hours"]
+        );
+        let saved: toml::Table = toml::from_str(&out).unwrap();
+        assert_eq!(saved["retention"].as_str(), Some("14d"));
+        assert_eq!(saved["slab_hours"].as_integer(), Some(5));
+    }
+
+    #[test]
+    fn retention_parses_prints_and_floors() {
+        assert_eq!(IndexSettings::default().retention, Retention::Node);
+        assert_eq!("node".parse::<Retention>(), Ok(Retention::Node));
+        assert_eq!("7d".parse::<Retention>(), Ok(Retention::Days(7)));
+        assert_eq!(" 30D ".parse::<Retention>(), Ok(Retention::Days(30)));
+        assert_eq!("14".parse::<Retention>(), Ok(Retention::Days(14)));
+        for bad in ["0d", "366d", "1w", "", "-1d", "forever"] {
+            assert!(bad.parse::<Retention>().is_err(), "{bad}");
+        }
+        for r in [Retention::Node, Retention::Days(1), Retention::Days(90)] {
+            assert_eq!(r.to_string().parse::<Retention>(), Ok(r));
+        }
+        assert_eq!("365d".parse::<Retention>(), Ok(Retention::Days(365)));
+        for d in RETENTION_DAYS_CHOICES {
+            assert!(Retention::Days(d).to_string().parse::<Retention>().is_ok());
+        }
+
+        // The file keeps it as a string.
+        let s = IndexSettings {
+            retention: Retention::Days(7),
+            ..Default::default()
+        };
+        let text = toml::to_string_pretty(&s).unwrap();
+        assert!(text.contains("retention = \"7d\""), "{text}");
+        assert_eq!(IndexSettings::parse(&text).unwrap(), (s, None));
+        // One that doesn't parse falls back to the node's, keeping the rest.
+        let (s, warning) =
+            IndexSettings::parse("redeem_scripts = true\nretention = \"week\"").unwrap();
+        assert!(s.redeem_scripts);
+        assert_eq!(s.retention, Retention::Node);
+        assert!(warning.unwrap().contains("week"));
+        let (s, warning) = IndexSettings::parse("retention = 7\nslab_hours = 5").unwrap();
+        assert_eq!(s.retention, Retention::Node);
+        let warning = warning.unwrap();
+        assert!(
+            warning.contains("retention") && warning.contains("not 5"),
+            "{warning}"
+        );
+
+        let now = 100 * DAY_MS;
+        assert_eq!(Retention::Node.floor_ms(now, Some(42)), Some(42));
+        assert_eq!(Retention::Node.floor_ms(now, None), None);
+        assert_eq!(
+            Retention::Days(7).floor_ms(now, Some(42)),
+            Some(93 * DAY_MS)
+        );
+        assert_eq!(Retention::Days(7).floor_ms(now, None), Some(93 * DAY_MS));
+        assert_eq!(Retention::Days(7).floor_ms(DAY_MS, None), Some(0));
+        assert_eq!(Retention::Node.duration_ms(), None);
+        assert_eq!(Retention::Days(2).duration_ms(), Some(2 * DAY_MS));
     }
 
     #[test]

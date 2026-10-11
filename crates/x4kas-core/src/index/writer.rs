@@ -23,7 +23,7 @@ use super::records::{
     SCRIPT_UNKNOWN, Subnetwork, TxInput, TxOutput, addr_key, addr_tx_key, block_tx_key, decode,
     encode, encode_delta, peer_delta_key, protocol_tx_key, redeem_key, time_key,
 };
-use super::{IndexStore, Manifest, Position, Slab, analytics};
+use super::{Gap, IndexStore, Manifest, Position, Slab, add_gap, analytics};
 use crate::analytics::AnalyticsEngine;
 use crate::config::IndexSettings;
 use crate::format::now_ms;
@@ -69,6 +69,8 @@ pub struct BatchReport {
     /// Removed chain blocks the analytics engine had already finalized into buckets,
     /// which can't be unwound (its counts are then slightly off).
     pub analytics_reorgs: Vec<String>,
+    /// The gap recorded before this batch's blocks (`IndexWriter::mark_jump`).
+    pub gap: Option<Gap>,
 }
 
 pub struct IndexWriter {
@@ -83,6 +85,8 @@ pub struct IndexWriter {
     analytics: AnalyticsEngine,
     /// The opt-in data to keep (full payloads, redeem scripts).
     features: IndexSettings,
+    /// The stream jumped ahead of the position: the next chain block indexed ends a gap.
+    jumped: bool,
 }
 
 /// A converted transaction with what clustering needs to know about it.
@@ -292,7 +296,15 @@ impl IndexWriter {
             labels,
             analytics,
             features: IndexSettings::default(),
+            jumped: false,
         })
+    }
+
+    /// The stream doesn't continue from the index's position (it skipped ahead): the
+    /// next commit with a chain block records the stretch between them as a [`Gap`].
+    /// Nothing for an index without a position, whose data starts there.
+    pub fn mark_jump(&mut self) {
+        self.jumped = self.manifest.position.is_some();
     }
 
     pub fn manifest(&self) -> &Manifest {
@@ -455,9 +467,28 @@ impl IndexWriter {
             (manifest.txs_indexed + (report.txs - txs_before) as u64).saturating_sub(txs_undone);
         manifest.blocks_indexed = manifest.blocks_indexed.saturating_add_signed(blocks_delta);
         manifest.seq = seq;
-        if let Some(first_ms) = blocks.iter().find_map(|b| b.chain_block_header.timestamp) {
+        let first_ms = blocks.iter().find_map(|b| b.chain_block_header.timestamp);
+        if let Some(first_ms) = first_ms {
             let fresh = self.manifest.position.is_none();
             manifest.track_features(&self.features, first_ms, fresh);
+        }
+        // The first chain block after a jump ends a gap, written with it.
+        let gap = match (self.jumped, self.manifest.position, first_ms) {
+            (true, Some(position), Some(first_ms)) => Some(Gap {
+                from_ms: position.time_ms,
+                to_ms: first_ms,
+            })
+            .filter(|g| g.to_ms > g.from_ms),
+            _ => None,
+        };
+        if let Some(gap) = gap {
+            let mut gaps = self.store.gaps()?;
+            add_gap(&mut gaps, gap);
+            batch.insert(
+                self.store.meta_keyspace(),
+                "gaps",
+                IndexStore::encode_gaps(&gaps)?,
+            );
         }
         batch.insert(
             self.store.meta_keyspace(),
@@ -466,6 +497,10 @@ impl IndexWriter {
         );
         batch.commit()?;
         self.manifest = manifest;
+        if first_ms.is_some() {
+            self.jumped = false;
+            report.gap = report.gap.or(gap);
+        }
         Ok(())
     }
 
@@ -1315,6 +1350,44 @@ mod tests {
         assert_eq!(peers[0].stats.out_amount, 60);
         let peers = query::counterparties(store, a2, 10).unwrap();
         assert_eq!(peers[0].stats.in_amount, 60);
+    }
+
+    #[test]
+    fn a_jump_records_a_gap_until_pruning_passes_it() {
+        let mut tw = writer();
+        let w = &mut tw.writer;
+        let block = |n: u64, time_ms: u64| {
+            response(
+                vec![],
+                vec![chain_block(
+                    n,
+                    time_ms,
+                    vec![tx(n, &[(1, 100)], &[(2, 90)])],
+                )],
+            )
+        };
+        // A new index starts where it starts: no gap.
+        w.mark_jump();
+        assert_eq!(w.apply(&block(1, 1_000)).unwrap().gap, None);
+        w.apply(&block(2, 2_000)).unwrap();
+        // The stream skipped ahead: the gap ends at the next chain block, not at an
+        // empty response before it.
+        w.mark_jump();
+        assert_eq!(w.apply(&response(vec![], vec![])).unwrap().gap, None);
+        let later = DEFAULT_SLAB_MS * 3 + 5_000;
+        let gap = Gap {
+            from_ms: 2_000,
+            to_ms: later,
+        };
+        assert_eq!(w.apply(&block(3, later)).unwrap().gap, Some(gap));
+        assert_eq!(w.apply(&block(4, later + 1_000)).unwrap().gap, None);
+        let store = w.store();
+        assert_eq!(store.gaps().unwrap(), vec![gap]);
+        // Kept while there is data before it, forgotten once pruning drops that.
+        assert!(!store.forget_gaps().unwrap());
+        assert_eq!(store.prune_before(DEFAULT_SLAB_MS).unwrap(), 1);
+        assert!(store.forget_gaps().unwrap());
+        assert_eq!(store.gaps().unwrap(), vec![]);
     }
 
     #[test]

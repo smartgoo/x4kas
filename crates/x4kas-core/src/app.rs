@@ -472,8 +472,13 @@ pub struct ChainStatus {
     pub slabs: usize,
     /// The open index's slab width (`IndexStore::slab_hours`); `None` while none is open.
     pub slab_hours: Option<u32>,
-    /// The time span the index covers, `(from_ms, to_ms)`.
+    /// The time span the index covers, `(from_ms, to_ms)`: its slabs' bounds.
     pub coverage: Option<(u64, u64)>,
+    /// The time of the oldest block the index holds (`IndexStore::oldest_ms`).
+    pub oldest_ms: Option<u64>,
+    /// Stretches between the data the index holds that it has no data for, oldest
+    /// first (`IndexStore::gaps`).
+    pub gaps: Vec<crate::index::Gap>,
     /// Smoothed write speed, in transactions per second of writer time.
     pub tx_per_sec: Option<f64>,
     /// Batches waiting for the writer.
@@ -1190,8 +1195,8 @@ pub struct App {
     pub labels: Arc<LabelBook>,
     /// The public list fetch (on launch and periodically, `labels::start_label_refresh`).
     pub label_refresh: LabelRefresh,
-    /// The index's opt-in features (`~/.x4kas/index.toml`); the writer reads them before
-    /// every batch.
+    /// The index's opt-in features and retention (`~/.x4kas/index.toml`); the writer
+    /// reads them before every batch.
     pub index_settings: crate::config::IndexSettings,
     /// Why the last change to `index_settings` couldn't be saved.
     pub index_settings_error: Option<String>,
@@ -1230,6 +1235,14 @@ impl App {
             .as_ref()
             .map(|s| s.network_id.clone())
             .unwrap_or_else(|| "mainnet".to_string())
+    }
+
+    /// The time before which the index drops (and queries skip) data at `now_ms`: the
+    /// retention setting's floor, the node's pruning point by default.
+    pub fn index_floor_ms(&self, now_ms: u64) -> Option<u64> {
+        self.index_settings
+            .retention
+            .floor_ms(now_ms, self.node.pruning_point_timestamp_ms)
     }
 
     /// How far the app's view lags the DAG tip: `now_ms` minus the sink's timestamp.

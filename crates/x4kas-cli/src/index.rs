@@ -13,7 +13,7 @@ use tokio::sync::RwLock;
 
 use x4kas_core::app::{App, ChainPhase};
 use x4kas_core::chain_stream::{self, StreamStart};
-use x4kas_core::config::{self, IndexFeature, IndexSettings};
+use x4kas_core::config::{self, IndexFeature, IndexSettings, IndexSettingsEdit, Retention};
 use x4kas_core::format::{format_number, now_ms};
 use x4kas_core::index::{self, IndexStore};
 use x4kas_core::polling::{PollingHandles, create_and_start_rpc};
@@ -23,8 +23,9 @@ pub enum IndexCommand {
     /// Connect to a node and keep the index current until Ctrl+C
     Run {
         /// How many hours back to fill in on start; 0 for everything the node retains
-        #[arg(long, default_value = "24")]
-        backfill_hours: f64,
+        /// (default 24, or the retention period of `index settings` when longer)
+        #[arg(long)]
+        backfill_hours: Option<f64>,
         /// Print progress this often, in seconds; 0 for no progress output
         #[arg(long, default_value = "5")]
         progress: u64,
@@ -35,9 +36,9 @@ pub enum IndexCommand {
     },
     /// What the index on disk holds
     Status,
-    /// Show or change the opt-in data the index keeps (off by default; `index run` and
-    /// the GUI apply a change from their next launch, the GUI's Settings › Index at once)
-    /// and the slab size of the next index built
+    /// Show or change the opt-in data the index keeps (off by default), how long it
+    /// keeps data (`index run` and the GUI apply a change from their next launch, the
+    /// GUI's Settings › DAG Index at once) and the slab size of the next index built
     Settings {
         /// Keep every transaction's whole payload, not only its first 128 bytes: on|off
         #[arg(long, value_parser = parse_on_off)]
@@ -45,6 +46,11 @@ pub enum IndexCommand {
         /// Keep the redeem script every P2SH spend reveals: on|off
         #[arg(long, value_parser = parse_on_off)]
         redeem_scripts: Option<bool>,
+        /// How long the index keeps data: `node` (the default) mirrors the node, pruning
+        /// behind its pruning point; `<N>d` keeps N days (1 to 365), less or more than
+        /// the node keeps. Shortening it deletes older data at the next batch
+        #[arg(long, value_parser = parse_retention)]
+        retention: Option<Retention>,
         /// The width of the index's time slabs, in hours (1, 2, 3, 4, 6, 8, 12 or 24;
         /// default 6): applies when the index is next rebuilt (`index run --resync`)
         ///
@@ -64,6 +70,10 @@ fn parse_slab_hours(s: &str) -> Result<u32, String> {
     Ok(hours)
 }
 
+fn parse_retention(s: &str) -> Result<Retention, String> {
+    s.parse()
+}
+
 fn parse_on_off(s: &str) -> Result<bool, String> {
     match s.to_ascii_lowercase().as_str() {
         "on" | "true" | "yes" | "1" => Ok(true),
@@ -77,24 +87,40 @@ fn settings(
     network: &str,
     full_payloads: Option<bool>,
     redeem_scripts: Option<bool>,
+    retention: Option<Retention>,
     slab_hours: Option<u32>,
 ) -> Result<()> {
-    let (mut s, warning) = IndexSettings::load_with_warning()?;
-    if let Some(w) = warning.filter(|_| slab_hours.is_none()) {
+    let (before, warnings) = IndexSettings::load_with_warnings()?;
+    // A key this command sets no longer has the value warned about.
+    let setting = |key: &str| match key {
+        "retention" => retention.is_some(),
+        "slab_hours" => slab_hours.is_some(),
+        _ => false,
+    };
+    for (_, w) in warnings.iter().filter(|(key, _)| !setting(key)) {
         eprintln!("{}: {w}", IndexSettings::path().display());
     }
-    let before = s;
-    if let Some(on) = full_payloads {
-        s.set(IndexFeature::FullPayloads, on);
+    let edits: Vec<IndexSettingsEdit> = [
+        full_payloads.map(|on| IndexSettingsEdit::Feature(IndexFeature::FullPayloads, on)),
+        redeem_scripts.map(|on| IndexSettingsEdit::Feature(IndexFeature::RedeemScripts, on)),
+        retention.map(IndexSettingsEdit::Retention),
+        slab_hours.map(IndexSettingsEdit::SlabHours),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let mut s = before;
+    for edit in &edits {
+        s.apply(*edit);
     }
-    if let Some(on) = redeem_scripts {
-        s.set(IndexFeature::RedeemScripts, on);
-    }
-    if let Some(hours) = slab_hours {
-        s.slab_hours = hours;
-    }
-    if s != before {
-        s.save()?;
+    // Also save when a key set had a value that didn't load, though the fallback
+    // matches, so the file stops warning.
+    let replaces_bad = warnings.iter().any(|(key, _)| setting(key));
+    let save = s != before || replaces_bad;
+    if save {
+        // Applied to the file as it is now, under its lock, so a GUI saving at the same
+        // moment loses nothing.
+        s = IndexSettings::update_file(&edits)?.0;
     }
     let mut out = serde_json::Map::new();
     for f in IndexFeature::ALL {
@@ -103,9 +129,10 @@ fn settings(
             serde_json::Value::Bool(s.enabled(f)),
         );
     }
+    out.insert("retention".into(), s.retention.to_string().into());
     out.insert("slab_hours".into(), s.slab_hours.into());
     println!("{}", serde_json::to_string_pretty(&out)?);
-    if s != before {
+    if save {
         eprintln!("saved {}", IndexSettings::path().display());
     }
     let features = |s: &IndexSettings| IndexFeature::ALL.map(|f| s.enabled(f));
@@ -113,6 +140,12 @@ fn settings(
         eprintln!(
             "the features apply to transactions indexed from the next launch of `index run` \
              or the GUI on; Resync to cover the whole window"
+        );
+    }
+    if s.retention != before.retention {
+        eprintln!(
+            "the retention applies from the next launch of `index run` or the GUI: {}",
+            retention_note(before.retention, s.retention)
         );
     }
     // The width the index on disk was built with, if there is one to read.
@@ -137,6 +170,21 @@ fn settings(
     Ok(())
 }
 
+/// What changing the retention from `before` to `after` does to the index on disk.
+fn retention_note(before: Retention, after: Retention) -> String {
+    let grows = "the index doesn't fetch older data but grows into the period from now on";
+    match (before.duration_ms(), after.duration_ms()) {
+        (_, None) => "data before the node's pruning point is deleted".to_string(),
+        // The node's period isn't known offline: either may be the longer.
+        (None, Some(_)) => format!(
+            "data older than {} is deleted; if that is longer than the node keeps, {grows}",
+            after.label()
+        ),
+        (Some(b), Some(a)) if a >= b => format!("nothing is deleted; {grows}"),
+        (Some(_), Some(_)) => format!("data older than {} is deleted", after.label()),
+    }
+}
+
 #[derive(Serialize)]
 struct Status {
     path: String,
@@ -147,8 +195,17 @@ struct Status {
     slabs: usize,
     /// The width of the index's slabs, in hours
     slab_hours: u32,
+    /// How long the index keeps data (`index settings`): `node` or `<N>d`; `None` when
+    /// the settings file doesn't load
+    retention: Option<String>,
+    /// The time before which data is deleted, for a fixed retention (the node's
+    /// pruning point isn't known offline)
+    retention_floor_ms: Option<u64>,
     /// `(from_ms, to_ms)`
     coverage: Option<(u64, u64)>,
+    /// Stretches between the data held that the index has no data for (it skipped
+    /// ahead after a long stop), oldest first
+    gaps: Vec<index::Gap>,
     position: Option<index::Position>,
     disk_bytes: u64,
 }
@@ -159,8 +216,15 @@ pub async fn run(url: Option<&str>, network: &str, cmd: IndexCommand) -> Result<
         IndexCommand::Settings {
             full_payloads,
             redeem_scripts,
+            retention,
             slab_hours,
-        } => settings(network, full_payloads, redeem_scripts, slab_hours),
+        } => settings(
+            network,
+            full_payloads,
+            redeem_scripts,
+            retention,
+            slab_hours,
+        ),
         IndexCommand::Run {
             backfill_hours,
             progress,
@@ -169,13 +233,11 @@ pub async fn run(url: Option<&str>, network: &str, cmd: IndexCommand) -> Result<
             let url = url.ok_or_else(|| {
                 anyhow!("index run needs a direct node: pass --url (the resolver won't do)")
             })?;
-            let backfill =
-                (backfill_hours > 0.0).then(|| Duration::from_secs_f64(backfill_hours * 3600.0));
             if resync {
                 index::discard(network)?;
                 eprintln!("deleted the {network} index: rebuilding it from the node");
             }
-            run_indexer(url, network, backfill, progress).await
+            run_indexer(url, network, backfill_hours, progress).await
         }
     }
 }
@@ -183,6 +245,14 @@ pub async fn run(url: Option<&str>, network: &str, cmd: IndexCommand) -> Result<
 fn status(network: &str) -> Result<()> {
     let store = IndexStore::open_existing(network)?;
     let manifest = store.manifest()?;
+    // Only extra information: a settings file that doesn't load leaves it out.
+    let retention = match IndexSettings::load() {
+        Ok(settings) => Some(settings.retention),
+        Err(e) => {
+            eprintln!("{e:#}");
+            None
+        }
+    };
     let status = Status {
         path: index::index_dir(network).display().to_string(),
         format: index::FORMAT_VERSION,
@@ -191,7 +261,10 @@ fn status(network: &str) -> Result<()> {
         addresses: manifest.next_addr_id,
         slabs: store.slabs().len(),
         slab_hours: store.slab_hours(),
+        retention: retention.map(|r| r.to_string()),
+        retention_floor_ms: retention.and_then(|r| r.floor_ms(now_ms(), None)),
         coverage: store.coverage(),
+        gaps: store.gaps()?,
         position: manifest.position,
         disk_bytes: store.disk_space(),
     };
@@ -208,16 +281,24 @@ pub(crate) struct Pipeline {
     pub store: Arc<IndexStore>,
 }
 
-/// Open the index and start the pipeline from `url`.
+/// Open the index and start the pipeline from `url`, filling in `backfill_hours` back
+/// (0 for everything the node has; by default 24, or the retention period when longer).
 pub(crate) fn start_pipeline(
     url: &str,
     network: &str,
-    backfill: Option<Duration>,
+    backfill_hours: Option<f64>,
 ) -> Result<Pipeline> {
     let (index_settings, warning) = IndexSettings::load_with_warning()?;
     if let Some(w) = warning {
         eprintln!("{}: {w}", IndexSettings::path().display());
     }
+    let backfill = match backfill_hours {
+        Some(hours) => (hours > 0.0).then(|| Duration::from_secs_f64(hours * 3600.0)),
+        None => StreamStart::backfill_for(
+            Some(StreamStart::default_backfill()),
+            index_settings.retention,
+        ),
+    };
     let app = Arc::new(RwLock::new(App {
         index_settings,
         ..App::default()
@@ -238,8 +319,9 @@ pub(crate) fn start_pipeline(
         vec![sink.sender],
     );
     eprintln!(
-        "indexing {network} from {url} into {}",
-        index::index_dir(network).display()
+        "indexing {network} from {url} into {}, retention: {}",
+        index::index_dir(network).display(),
+        index_settings.retention.label()
     );
     Ok(Pipeline {
         app,
@@ -260,10 +342,10 @@ pub(crate) async fn stop_pipeline(mut pipeline: Pipeline) {
 async fn run_indexer(
     url: &str,
     network: &str,
-    backfill: Option<Duration>,
+    backfill_hours: Option<f64>,
     progress_secs: u64,
 ) -> Result<()> {
-    let pipeline = start_pipeline(url, network, backfill)?;
+    let pipeline = start_pipeline(url, network, backfill_hours)?;
     let mut ticker = tokio::time::interval(Duration::from_secs(progress_secs.max(1)));
     ticker.tick().await;
     loop {
@@ -314,4 +396,24 @@ pub(crate) fn progress_line(app: &App) -> String {
             .unwrap_or_else(|| "—".into()),
         index.backlog,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retention_notes_say_what_is_deleted() {
+        let node = Retention::Node;
+        let days = Retention::Days;
+        assert!(retention_note(days(7), node).contains("pruning point"));
+        // The node's period isn't known offline, so going to a fixed one says both.
+        let note = retention_note(node, days(90));
+        assert!(
+            note.contains("90 days") && note.contains("grows into"),
+            "{note}"
+        );
+        assert!(retention_note(days(7), days(30)).starts_with("nothing is deleted"));
+        assert!(retention_note(days(30), days(7)).contains("older than 7 days is deleted"));
+    }
 }

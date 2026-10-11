@@ -10,6 +10,8 @@ Notable changes to x4kas. The format follows [Keep a Changelog](https://keepacha
 - Reset App in Settings, which wipes the app's data and restarts it from scratch.
 - Resync the index from Settings > Reset.
 - Configurable index slab size.
+- Configurable index retention period, mirroring the node by default.
+- The index records the stretches it skipped, and queries over them say so.
 
 ### Fixed
 

@@ -1,6 +1,7 @@
 //! Owns the node connection lifecycle (RPC manager, polling tasks) and executes
 //! commands sent from the frontend.
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,7 +29,7 @@ use crate::query::{Entity, Query};
 use crate::rpc::client::RpcManager;
 use crate::rpc::methods::parse_hash;
 use crate::tx_inspect::TransactionProtocol;
-use crate::watch::{self, Watchlist};
+use crate::watch::{self, WatchEdit, Watchlists};
 
 /// Rows per page of an address's transactions.
 pub const ADDRESS_PAGE: usize = 50;
@@ -87,8 +88,10 @@ pub enum UiCommand {
     QueryCancel,
     /// Replace the saved queries: saved to disk, then `app.query.saved`.
     QueriesSet(SavedQueries),
-    /// Replace the watchlist: saved to disk, then the subscription restarts.
-    WatchSet(Watchlist),
+    /// Change the watchlists: applied to the file (keeping changes another process made
+    /// to it), then to `app.watch.lists`; the subscription restarts when the watched
+    /// addresses changed.
+    WatchEdit(WatchEdit),
     /// Set (or with `None` remove) the user's label for an address.
     SetLabel {
         address: String,
@@ -189,7 +192,8 @@ impl Controller {
     async fn run(mut self, mut rx: mpsc::UnboundedReceiver<UiCommand>) {
         {
             let mut app = self.app.write().await;
-            app.watch.list = Watchlist::load().unwrap_or_default();
+            app.watch.lists = Watchlists::load().unwrap_or_default();
+            app.watch.lists.ensure_default();
             app.labels = Arc::new(labels::LabelBook::load());
             match crate::config::IndexSettings::load() {
                 Ok(settings) => app.index_settings = settings,
@@ -221,7 +225,7 @@ impl Controller {
                 UiCommand::QueryRun { query, name } => self.query_run(query, name).await,
                 UiCommand::QueryCancel => self.query_cancel().await,
                 UiCommand::QueriesSet(list) => self.queries_set(list).await,
-                UiCommand::WatchSet(list) => self.set_watchlist(list).await,
+                UiCommand::WatchEdit(edit) => self.edit_watchlists(edit).await,
                 UiCommand::SetLabel { address, name } => self.set_label(address, name).await,
                 UiCommand::RefreshLabels => self.refresh_labels(),
                 UiCommand::IndexSettingsSet(settings) => self.index_settings_set(settings).await,
@@ -276,7 +280,7 @@ impl Controller {
                 if target.url.is_some() {
                     self.start_chain_stream(&rpc, &target.network).await;
                 }
-                watch::start_watch(&rpc, &self.app, &mut self.polling, &target.network);
+                watch::start_watch(&rpc, &self.app, &mut self.polling, &target.network, true);
                 self.rpc = Some(rpc);
             }
             Err(e) => {
@@ -744,7 +748,7 @@ impl Controller {
                 generation,
                 cancel,
                 app.labels.clone(),
-                app.watch.list.clone(),
+                app.watch.lists.clone(),
                 app.node.pruning_point_timestamp_ms,
                 index_not_open(&app),
                 app.index_settings,
@@ -835,23 +839,57 @@ impl Controller {
         app.mark_dirty();
     }
 
-    /// Save the new watchlist and restart the subscription with it.
-    async fn set_watchlist(&mut self, list: Watchlist) {
-        let network = {
+    /// Apply `edit` to the watchlists file and the app's lists, and restart the
+    /// subscription when the addresses it follows changed.
+    async fn edit_watchlists(&mut self, edit: WatchEdit) {
+        let updated =
+            tokio::task::spawn_blocking(move || Watchlists::update_file(|l| l.apply(edit)))
+                .await
+                .unwrap_or_else(|e| Err(e.into()));
+        let network = self.remote.as_ref().map(|r| r.network.clone());
+        let restart = {
             let mut app = self.app.write().await;
-            if let Err(e) = list.save() {
-                app.watch.status.last_error = Some(format!("save watchlist: {e}"));
-            }
-            app.watch.list = list;
-            app.watch.status.last_event_at = None;
+            let restart = match updated {
+                Ok(lists) => {
+                    // A set: a move or a deleted list can reorder the addresses
+                    // without changing which are followed.
+                    let addresses = |l: &Watchlists| -> HashSet<String> {
+                        let net = network.as_deref().unwrap_or_default();
+                        l.addresses(net).into_iter().map(str::to_string).collect()
+                    };
+                    let changed = addresses(&app.watch.lists) != addresses(&lists);
+                    app.watch.lists = lists;
+                    // Clear only an earlier edit's error: the running task's own (a
+                    // failing balance poll) still holds.
+                    if changed
+                        || app
+                            .watch
+                            .status
+                            .last_error
+                            .as_deref()
+                            .is_some_and(|e| e.starts_with("watchlist: "))
+                    {
+                        app.watch.status.last_error = None;
+                    }
+                    changed
+                }
+                Err(e) => {
+                    app.watch.status.last_error = Some(format!("watchlist: {e}"));
+                    false
+                }
+            };
             app.mark_dirty();
-            self.remote.as_ref().map(|r| r.network.clone())
+            restart
         };
+        if !restart {
+            return;
+        }
+        self.app.write().await.watch.status.last_event_at = None;
         if let Some(h) = self.polling.watch.take() {
             h.abort();
         }
         if let (Some(rpc), Some(network)) = (self.rpc.clone(), network) {
-            watch::start_watch(&rpc, &self.app, &mut self.polling, &network);
+            watch::start_watch(&rpc, &self.app, &mut self.polling, &network, true);
         }
     }
 

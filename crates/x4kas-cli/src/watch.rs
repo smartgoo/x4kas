@@ -1,8 +1,8 @@
 //! `x4kas-cli watch <address>…`: follow addresses live and print one JSON line per
-//! confirmed balance change (with the alerts the watchlist's rules raised for it in its
+//! confirmed balance change (with the alerts the watchlists' rules raised for it in its
 //! `alerts`) until Ctrl+C.
 //! Addresses given on the command line are watched with the default rules; without
-//! any, the saved watchlist for the network is used.
+//! any, the saved watchlists for the network (all, or those named with `--list`).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,12 +14,15 @@ use tokio::sync::RwLock;
 
 use x4kas_core::app::{App, WatchPhase};
 use x4kas_core::polling::{PollingHandles, create_and_start_rpc};
-use x4kas_core::watch::{self, AddressEvent, WatchEntry, Watchlist};
+use x4kas_core::watch::{self, AddressEvent, WatchEdit, WatchEntry, Watchlists};
 
 #[derive(Args, Debug, Clone, PartialEq)]
 pub struct WatchArgs {
-    /// Addresses to watch; none means the saved watchlist
+    /// Addresses to watch; none means the saved watchlists
     pub addresses: Vec<String>,
+    /// Follow only this saved watchlist (repeatable); without it, all of them
+    #[arg(long = "list", value_name = "NAME", conflicts_with = "addresses")]
+    pub lists: Vec<String>,
     /// Also print the current balances once subscribed
     #[arg(long)]
     pub balances: bool,
@@ -37,25 +40,43 @@ pub async fn run(url: Option<&str>, network: &str, args: WatchArgs) -> Result<()
     let app = Arc::new(RwLock::new(App::default()));
     {
         let mut app = app.write().await;
-        app.watch.list = if args.addresses.is_empty() {
-            Watchlist::load()?
-        } else {
-            Watchlist {
-                entries: args
-                    .addresses
-                    .iter()
-                    .map(|a| WatchEntry::new(a, network))
-                    .collect(),
+        app.watch.lists = if args.addresses.is_empty() {
+            let mut lists = Watchlists::load()?;
+            if !args.lists.is_empty() {
+                let mut kept = Vec::new();
+                for name in &args.lists {
+                    let list = lists
+                        .by_name(name)
+                        .ok_or_else(|| anyhow!("no watchlist named {name:?}"))?;
+                    // Named twice, followed once (its alerts would print twice).
+                    if !kept.iter().any(|k: &watch::Watchlist| k.id == list.id) {
+                        kept.push(list.clone());
+                    }
+                }
+                lists.lists = kept;
             }
+            lists
+        } else {
+            let mut lists = Watchlists::default();
+            lists.ensure_default();
+            for address in &args.addresses {
+                let entry = WatchEntry::new(address, network);
+                lists
+                    .apply(WatchEdit::Put { list: 1, entry })
+                    .map_err(|e| anyhow!(e))?;
+            }
+            lists
         };
-        if app.watch.list.active(network).is_empty() {
+        if app.watch.lists.addresses(network).is_empty() {
             return Err(anyhow!("nothing to watch on {network}"));
         }
     }
 
     let mut handles = PollingHandles::default();
     let rpc = create_and_start_rpc(url, network, &app, 1000, &mut handles)?;
-    watch::start_watch(&rpc, &app, &mut handles, network);
+    // Addresses from the command line aren't the saved lists: save nothing.
+    let persist = args.addresses.is_empty();
+    watch::start_watch(&rpc, &app, &mut handles, network, persist);
 
     let mut seen_events = 0u64;
     let mut last_phase = WatchPhase::Idle;

@@ -214,7 +214,7 @@ async fn run(
                 app.chain.position.map(|p| p.chain_block),
                 app.query.saved.watched().cloned().collect::<Vec<_>>(),
                 app.labels.clone(),
-                app.watch.list.clone(),
+                app.watch.lists.clone(),
                 app.node.pruning_point_timestamp_ms,
                 // What was raised before (an earlier connection): not raised again.
                 app.query

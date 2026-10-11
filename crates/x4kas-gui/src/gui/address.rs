@@ -2,7 +2,7 @@
 //! `widgets::request_address`) and the Explorer tab: `header` (the address and its
 //! label), `body` (the cards: summary with balance and indexed totals,
 //! balance history, transactions, counterparties, cluster and peel chain) and
-//! `watch_card` (the watchlist entry, for a watched address). The actions on an address
+//! `watch_card` (its watchlist entries, for a watched address). The actions on an address
 //! (label, watchlist, flow graph, export) are the action bar's (`gui/actions.rs`).
 
 use eframe::egui::{self, RichText, Ui};
@@ -53,68 +53,79 @@ pub(super) fn header(ui: &mut Ui, app: &App, addr: &str) {
     });
 }
 
-/// The "Watch" card of an address on the watchlist: whether alerts are on, the rules
-/// and any pending activity, with the settings dialog in its header. An address that
-/// isn't watched has no card: the action bar's "Add to watchlist" is the way in.
+/// The "Watch" card of an address on a watchlist: per list it is on, whether alerts are
+/// on and the rules, with that entry's settings dialog; then any pending activity. An
+/// address on no list has no card: the action bar's "Add to watchlist" is the way in.
 pub(super) fn watch_card(ui: &mut Ui, app: &App, addr: &str) {
-    let Some(entry) = app.watch.entry(addr) else {
+    let network = app.network_name();
+    let memberships = app.watch.lists.memberships(addr, &network);
+    if memberships.is_empty() {
         return;
-    };
+    }
+    let free = app.watch.lists.lists.len() > memberships.len();
     ui.add_space(CARD_GAP);
     card_with_header(
         ui,
         "Watch",
         &mut (),
         |ui, _| {
-            if ui
-                .small_button("Settings…")
-                .on_hover_text("Alerts on or off, the rules, or remove it from the watchlist")
-                .clicked()
+            if free
+                && ui
+                    .small_button("Add to another list…")
+                    .on_hover_text("Watch it on another list too, with rules of its own")
+                    .clicked()
             {
-                dialogs::request_watch(ui.ctx(), addr);
+                dialogs::request_watch(ui.ctx(), addr, None);
             }
         },
         |ui, _| {
             let kas = |v: u64| format!("{} KAS", format_kas(v as f64, 8));
-            let rules = &entry.rules;
             kv_grid(ui, "watch_card", |ui| {
-                kv(
-                    ui,
-                    "Alerts",
-                    if entry.enabled {
-                        RichText::new("On").color(theme::OK)
-                    } else {
-                        RichText::new("Off").color(theme::TEXT_DIM)
-                    },
-                );
-                let mut set: Vec<String> = Vec::new();
-                if rules.any_activity {
-                    set.push("any activity".to_string());
-                }
-                if let Some(v) = rules.received_min {
-                    set.push(format!("received ≥ {}", kas(v)));
-                }
-                if let Some(v) = rules.sent_min {
-                    set.push(format!("sent ≥ {}", kas(v)));
-                }
-                if let Some(v) = rules.balance_below {
-                    set.push(format!("balance < {}", kas(v)));
-                }
-                if let Some(v) = rules.balance_above {
-                    set.push(format!("balance > {}", kas(v)));
-                }
-                if let Some(h) = rules.idle_hours {
-                    set.push(format!("active after ≥ {h}h idle"));
-                }
-                kv(
-                    ui,
-                    "Rules",
-                    if set.is_empty() {
-                        "none".to_string()
+                for (list, entry) in &memberships {
+                    let rules = &entry.rules;
+                    let mut set: Vec<String> = Vec::new();
+                    if rules.any_activity {
+                        set.push("any activity".to_string());
+                    }
+                    if let Some(v) = rules.received_min {
+                        set.push(format!("received ≥ {}", kas(v)));
+                    }
+                    if let Some(v) = rules.sent_min {
+                        set.push(format!("sent ≥ {}", kas(v)));
+                    }
+                    if let Some(v) = rules.balance_below {
+                        set.push(format!("balance < {}", kas(v)));
+                    }
+                    if let Some(v) = rules.balance_above {
+                        set.push(format!("balance > {}", kas(v)));
+                    }
+                    if let Some(h) = rules.idle_hours {
+                        set.push(format!("active after ≥ {h}h idle"));
+                    }
+                    let rules = if set.is_empty() {
+                        "no rules".to_string()
                     } else {
                         set.join(", ")
-                    },
-                );
+                    };
+                    kv_with(ui, &list.name, |ui| {
+                        if ui
+                            .small_button("Settings…")
+                            .on_hover_text(format!(
+                                "Alerts on or off, the rules, another list, or remove it from {}",
+                                list.name
+                            ))
+                            .clicked()
+                        {
+                            dialogs::request_watch(ui.ctx(), addr, Some(list.id));
+                        }
+                        let text = if entry.enabled {
+                            RichText::new(rules)
+                        } else {
+                            RichText::new(format!("alerts off · {rules}")).color(theme::TEXT_DIM)
+                        };
+                        ui.add(egui::Label::new(text).truncate());
+                    });
+                }
                 let pending = app.watch.pending.get(addr).copied().unwrap_or((0, 0));
                 kv(
                     ui,

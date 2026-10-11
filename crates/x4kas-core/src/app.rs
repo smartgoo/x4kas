@@ -16,7 +16,7 @@ use crate::query::watch::QueryEvent;
 use crate::rpc::hash_links::{HashLink, block_hash_links};
 use crate::rpc::methods::{RPC_METHODS, RpcMethod};
 use crate::rpc::types::*;
-use crate::watch::{AddressEvent, WatchEntry, Watchlist};
+use crate::watch::{AddressEvent, Watchlists};
 
 /// A block from the node's `BlockAdded` stream, as the DAG visualizer needs it.
 #[derive(Debug, Clone, PartialEq)]
@@ -613,11 +613,11 @@ pub struct WatchStatus {
     pub last_event_at: Option<Instant>,
 }
 
-/// The watchlist with its live data: balances, pending activity and events (which
+/// The watchlists with their live data: balances, pending activity and events (which
 /// carry the alerts the rules raised for them).
 #[derive(Default)]
 pub struct WatchState {
-    pub list: Watchlist,
+    pub lists: Watchlists,
     /// Balance in sompi per watched address, from the node.
     pub balances: HashMap<String, u64>,
     /// Unconfirmed `(incoming, outgoing)` sompi per watched address.
@@ -638,7 +638,15 @@ impl WatchState {
 
     /// Events with an alert the user hasn't marked as read.
     pub fn unread_alerts(&self) -> usize {
-        self.events.iter().filter(|e| e.unread()).count()
+        self.unread_alerts_where(|_| true)
+    }
+
+    /// Of the events `shown` keeps, those with an alert the user hasn't marked as read.
+    pub fn unread_alerts_where(&self, shown: impl Fn(&AddressEvent) -> bool) -> usize {
+        self.events
+            .iter()
+            .filter(|e| e.unread() && shown(e))
+            .count()
     }
 
     /// Mark the alert of the event at `index` (newest first) read or unread.
@@ -649,13 +657,14 @@ impl WatchState {
     }
 
     pub fn mark_all_read(&mut self) {
-        for event in &mut self.events {
-            event.read = true;
-        }
+        self.mark_read_where(|_| true);
     }
 
-    pub fn entry(&self, address: &str) -> Option<&WatchEntry> {
-        self.list.entries.iter().find(|e| e.address == address)
+    /// Mark the alerts of the events `shown` keeps read.
+    pub fn mark_read_where(&mut self, shown: impl Fn(&AddressEvent) -> bool) {
+        for event in self.events.iter_mut().filter(|e| shown(e)) {
+            event.read = true;
+        }
     }
 
     /// Drop node data (balances, pending, events) but keep the list.
@@ -1170,6 +1179,15 @@ impl App {
         if let Some(ref repaint) = self.repaint {
             repaint();
         }
+    }
+
+    /// The connected node's network, or mainnet until its info arrives.
+    pub fn network_name(&self) -> String {
+        self.node
+            .server_info
+            .as_ref()
+            .map(|s| s.network_id.clone())
+            .unwrap_or_else(|| "mainnet".to_string())
     }
 
     /// How far the app's view lags the DAG tip: `now_ms` minus the sink's timestamp.
@@ -1867,6 +1885,9 @@ mod tests {
         // Marking an event without an alert does nothing visible.
         watch.set_read(2, true);
         assert_eq!(watch.unread_alerts(), 2);
+        watch.mark_read_where(|e| e.alerts.len() == 2);
+        assert_eq!(watch.unread_alerts(), 1);
+        assert_eq!(watch.unread_alerts_where(|e| e.alerts.len() == 2), 0);
         watch.mark_all_read();
         assert_eq!(watch.unread_alerts(), 0);
         watch.clear_node_data();

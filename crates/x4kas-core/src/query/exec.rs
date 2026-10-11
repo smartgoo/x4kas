@@ -35,7 +35,7 @@ use crate::index::records::{
 use crate::index::{IndexStore, Slab, cluster, hex};
 use crate::labels::{LabelBook, LabelSource};
 use crate::tx_inspect::{OpcodeUsage, ScriptClass, TransactionProtocol, difficulty_from_bits};
-use crate::watch::Watchlist;
+use crate::watch::Watchlists;
 
 /// Rows a result holds at most.
 pub const MAX_RESULT_ROWS: usize = 10_000;
@@ -60,7 +60,7 @@ const CLUSTER_SAMPLE: usize = 50;
 pub struct Inputs<'a> {
     pub store: &'a IndexStore,
     pub labels: &'a LabelBook,
-    pub watchlist: &'a Watchlist,
+    pub watchlist: &'a Watchlists,
     pub now_ms: u64,
     /// Slabs ending before this are being pruned: skip them.
     pub prune_floor_ms: Option<u64>,
@@ -529,6 +529,7 @@ pub fn plan(
                         | FieldId::AddrLabelSource
                         | FieldId::AddrCategory
                         | FieldId::AddrClusterLabel
+                        | FieldId::AddrWatchlist
                 ) && matches!(
                     c.op,
                     Op::Eq | Op::In | Op::Contains | Op::StartsWith | Op::IsNotNull
@@ -610,7 +611,8 @@ struct Ctx<'a> {
     names: HashMap<AddrId, Option<String>>,
     clusters: HashMap<AddrId, (AddrId, u32)>,
     cluster_names: HashMap<AddrId, Option<String>>,
-    watched: HashSet<String>,
+    /// The names of the watchlists each address on one is on (on the store's network).
+    watched: HashMap<String, Vec<String>>,
 }
 
 impl Ctx<'_> {
@@ -838,7 +840,7 @@ impl Ctx<'_> {
                             }
                             TxInputScriptClass => classes(r.inputs.iter().map(|i| i.script_class)),
                             TxAddress | TxSender | TxReceiver | TxLabel | TxSenderLabel
-                            | TxReceiverLabel | TxIsWatched => {
+                            | TxReceiverLabel | TxIsWatched | TxWatchlist => {
                                 let ids: Vec<AddrId> = match field {
                                     TxSender | TxSenderLabel => {
                                         r.inputs.iter().filter_map(|i| i.addr).collect()
@@ -854,7 +856,20 @@ impl Ctx<'_> {
                                     }
                                     TxIsWatched => {
                                         let names = self.names_of(ids)?;
-                                        Cell::Bool(names.iter().any(|n| matches!(n, Cell::Address(a) if self.watched.contains(a))))
+                                        Cell::Bool(names.iter().any(|n| matches!(n, Cell::Address(a) if self.watched.contains_key(a))))
+                                    }
+                                    TxWatchlist => {
+                                        let mut lists: Vec<Cell> = Vec::new();
+                                        for name in self.names_of(ids)? {
+                                            let Cell::Address(a) = name else { continue };
+                                            for list in self.watched.get(&a).into_iter().flatten() {
+                                                let cell = Cell::Text(list.clone());
+                                                if !lists.contains(&cell) {
+                                                    lists.push(cell);
+                                                }
+                                            }
+                                        }
+                                        Cell::List(lists)
                                     }
                                     _ => Cell::List(self.labels_of(ids)?),
                                 }
@@ -1011,7 +1026,15 @@ impl Ctx<'_> {
                     .map(Cell::Text)
                     .unwrap_or(Cell::Null),
                 AddrPeerCount => Cell::Int(self.peer_count(a.id)? as i64),
-                AddrIsWatched => Cell::Bool(self.watched.contains(&a.address)),
+                AddrIsWatched => Cell::Bool(self.watched.contains_key(&a.address)),
+                AddrWatchlist => Cell::List(
+                    self.watched
+                        .get(&a.address)
+                        .into_iter()
+                        .flatten()
+                        .map(|l| Cell::Text(l.clone()))
+                        .collect(),
+                ),
                 AddrBalance => Cell::Null,
                 _ => Cell::Null,
             },
@@ -1435,13 +1458,18 @@ pub fn run(inputs: &Inputs<'_>, q: &Query, ctl: &mut RunControl) -> Result<Resul
         names: HashMap::new(),
         clusters: HashMap::new(),
         cluster_names: HashMap::new(),
-        watched: inputs
-            .watchlist
-            .entries
-            .iter()
-            .filter(|e| e.network == store.network())
-            .map(|e| e.address.clone())
-            .collect(),
+        watched: {
+            let mut watched: HashMap<String, Vec<String>> = HashMap::new();
+            for list in &inputs.watchlist.lists {
+                for entry in list.on_network(store.network()) {
+                    let names = watched.entry(entry.address.clone()).or_default();
+                    if !names.contains(&list.name) {
+                        names.push(list.name.clone());
+                    }
+                }
+            }
+            watched
+        },
     };
     let filter = q.filter.as_ref().map(|f| prepare(f, inputs.now_ms));
     let limit = q.limit.unwrap_or(MAX_RESULT_ROWS).min(MAX_RESULT_ROWS);
@@ -1894,7 +1922,7 @@ pub fn run(inputs: &Inputs<'_>, q: &Query, ctl: &mut RunControl) -> Result<Resul
                 .into_iter()
                 .map(|(a, _)| a.to_string())
                 .collect();
-            candidates.extend(ctx.watched.iter().cloned());
+            candidates.extend(ctx.watched.keys().cloned());
             candidates.sort_unstable();
             candidates.dedup();
             'all: for address in candidates {
@@ -2148,7 +2176,7 @@ mod tests {
     };
     use crate::index::{TempStore, temp_store};
     use crate::query::text::parse;
-    use crate::watch::WatchEntry;
+    use crate::watch::{WatchEdit, WatchEntry};
 
     const HOUR: u64 = 3_600_000;
     /// "Now" for the tests: an hour after the newest block.
@@ -2157,7 +2185,7 @@ mod tests {
     struct Fixture {
         store: TempStore,
         labels: LabelBook,
-        watchlist: Watchlist,
+        watchlist: Watchlists,
         /// Every opt-in feature on, unless a test turns one off.
         features: IndexSettings,
     }
@@ -2338,12 +2366,19 @@ mod tests {
             ],
         );
         writer.apply(&r).unwrap();
-        let mut watchlist = Watchlist::default();
-        watchlist.entries.push(WatchEntry {
-            address: address(6).to_string(),
-            network: "mainnet".to_string(),
-            ..WatchEntry::default()
-        });
+        // Address 6 on two lists; "Cold" has 5 only on another network.
+        let mut watchlist = Watchlists::default();
+        for name in ["Ops", "Desk", "Cold"] {
+            let name = name.to_string();
+            watchlist.apply(WatchEdit::CreateList { name }).unwrap();
+        }
+        let put = |lists: &mut Watchlists, list, n, network: &str| {
+            let entry = WatchEntry::new(&address(n).to_string(), network);
+            lists.apply(WatchEdit::Put { list, entry }).unwrap();
+        };
+        put(&mut watchlist, 1, 6, "mainnet");
+        put(&mut watchlist, 2, 6, "mainnet");
+        put(&mut watchlist, 3, 5, "testnet-10");
         Fixture {
             store,
             labels,
@@ -2418,6 +2453,10 @@ mod tests {
         ));
         assert!(matches!(
             f.plan("addresses where label contains \"exch\"").source,
+            Source::AddrFromLabels
+        ));
+        assert!(matches!(
+            f.plan("addresses where watchlist = \"Ops\"").source,
             Source::AddrFromLabels
         ));
         assert!(matches!(
@@ -2518,6 +2557,17 @@ mod tests {
         assert_eq!(txids(&r), vec![1, 3, 10, 13], "11 pays the labelled pool");
         let r = f.run("tx all time where is_watched");
         assert_eq!(txids(&r), vec![13, 14]);
+        let r = f.run("tx all time where watchlist in (\"desk\", \"Cold\") select txid, watchlist");
+        assert_eq!(txids(&r), vec![13, 14]);
+        assert_eq!(
+            r.rows[0][col(&r, "watchlist")],
+            Cell::List(vec![Cell::Text("Ops".into()), Cell::Text("Desk".into())])
+        );
+        assert!(
+            f.run("tx all time where watchlist = \"Cold\"")
+                .rows
+                .is_empty()
+        );
         let r = f.run("tx all time where payload contains \"HELLO\"");
         assert_eq!(txids(&r), vec![13]);
         assert!(
@@ -2654,6 +2704,17 @@ mod tests {
         assert_eq!(
             r.rows[0][col(&r, "address")],
             Cell::Address(address(6).to_string())
+        );
+        let r = f.run("addresses where watchlist = \"Ops\" select address, watchlist");
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(
+            r.rows[0][col(&r, "watchlist")],
+            Cell::List(vec![Cell::Text("Ops".into()), Cell::Text("Desk".into())])
+        );
+        assert!(
+            f.run("addresses where watchlist = \"Cold\"")
+                .rows
+                .is_empty()
         );
         let r =
             f.run("addresses where address_type = p2pk and tx_count >= 3 order by tx_count desc");

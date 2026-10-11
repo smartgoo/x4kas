@@ -1,11 +1,14 @@
-//! Monitoring tab: the Watchlist pane (half the width) with live balances, and
-//! the Activity pane with the feed, where an event that tripped the address's alert
-//! rules gets an alert dot that a click marks as read. Both fill the tab's height, their
-//! tables scrolling inside; below the wrap width they stack and the tab scrolls. A row
-//! click opens the address's info pane.
+//! Monitoring tab: the Watchlist pane (half the width) with one watchlist's live
+//! balances, picked (and created, renamed, deleted) in its header's list menu, and the
+//! Activity pane with the feed of every list or the one its filter picks, where an event
+//! that tripped an alert rule gets an alert dot that a click marks as read. Both fill
+//! the tab's height, their tables scrolling inside; below the wrap width they stack and
+//! the tab scrolls. A row click opens the address's info pane.
 
-use eframe::egui::{self, RichText, Sense, Stroke, TextEdit, Ui, vec2};
+use eframe::egui::containers::menu::{MenuButton, MenuConfig};
+use eframe::egui::{self, Button, PopupCloseBehavior, RichText, Sense, Stroke, TextEdit, Ui, vec2};
 
+use super::dialogs;
 use super::theme;
 use super::widgets::{
     TABLE_HEIGHT, address, card_with_header, columns_wrap, label_search_popup, primary_button,
@@ -14,7 +17,9 @@ use super::widgets::{
 use x4kas_core::app::{App, WatchPhase};
 use x4kas_core::controller::{CommandSender, UiCommand};
 use x4kas_core::format::{format_duration, format_kas, shorten_middle};
-use x4kas_core::watch::{EventKind, WatchEntry, validate_address};
+use x4kas_core::watch::{
+    AddressEvent, EventKind, ListId, WatchEdit, WatchEntry, Watchlist, Watchlists, validate_address,
+};
 
 const DAY_MS: u64 = 24 * 3_600_000;
 /// Watchlist | Activity, half and half.
@@ -24,19 +29,50 @@ const PANE_MIN: f32 = 480.0;
 
 /// How long a notice under the add field stays.
 const NOTICE_SECS: f64 = 4.0;
+/// How long "Delete list…" stays armed for the confirming click.
+const CONFIRM_SECS: f64 = 3.0;
 
-/// The tab's own state: the add/search field.
+/// The tab's own state: the list on show, the Activity filter, the add/search field.
 #[derive(Default)]
 pub struct MonitoringTab {
+    /// The watchlist the Watchlist pane shows and adds to (remembered in `Prefs`); the
+    /// first list when unset or gone.
+    pub selected: Option<ListId>,
+    /// The list whose addresses' events Activity shows; `None` for every list.
+    pub activity_filter: Option<ListId>,
     input: String,
     /// The label matches popup is showing under the field.
     search_open: bool,
     /// Feedback under the field (added, already watched, invalid) and when it was set.
     notice: Option<(String, bool, f64)>,
+    /// "Delete list…" was clicked for this list at this time; a second click deletes.
+    confirm_delete: Option<(ListId, f64)>,
+}
+
+/// The list `selected` names, else the first.
+fn current(lists: &Watchlists, selected: Option<ListId>) -> Option<&Watchlist> {
+    selected
+        .and_then(|id| lists.get(id))
+        .or_else(|| lists.lists.first())
 }
 
 impl MonitoringTab {
+    /// The list the pane shows, which the watch dialog adds to by default.
+    pub fn target_list(&self, app: &App) -> Option<ListId> {
+        current(&app.watch.lists, self.selected).map(|l| l.id)
+    }
+
     pub fn show(&mut self, ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender) {
+        // A list just created in the name dialog: show it once it arrives.
+        if let Some(name) = dialogs::take_created_list(ui.ctx(), &app.watch.lists) {
+            self.selected = Some(name);
+        }
+        if self
+            .activity_filter
+            .is_some_and(|id| app.watch.lists.get(id).is_none())
+        {
+            self.activity_filter = None;
+        }
         if columns_wrap(ui, PANE_WEIGHTS, PANE_MIN) {
             egui::ScrollArea::vertical().show(ui, |ui| self.panes(ui, app, cmd_tx, false));
         } else {
@@ -49,32 +85,41 @@ impl MonitoringTab {
         weighted_columns(ui, PANE_WEIGHTS, PANE_MIN, |[left, right]| {
             card_with_header(
                 left,
-                "Watchlist",
-                app,
-                |ui, app| watch_status(ui, app),
-                |ui, app| self.watchlist(ui, app, cmd_tx, fill),
+                "Watchlists",
+                &mut (&mut *app, &mut *self),
+                |ui, (app, tab)| {
+                    tab.list_menu(ui, app, cmd_tx);
+                    watch_status(ui, app);
+                },
+                |ui, (app, tab)| tab.watchlist(ui, app, cmd_tx, fill),
             );
+            let filter = self.activity_filter;
             card_with_header(
                 right,
                 "Activity",
-                app,
-                |ui, app| {
-                    let unread = app.watch.unread_alerts();
+                &mut (&mut *app, &mut self.activity_filter),
+                |ui, (app, chosen)| {
+                    filter_menu(ui, app, chosen);
+                    let shown = shown_by(app, filter);
+                    let unread = app.watch.unread_alerts_where(&shown);
                     if unread > 0
                         && ui
                             .small_button(format!("Mark all read ({unread})"))
                             .clicked()
                     {
-                        app.watch.mark_all_read();
+                        app.watch.mark_read_where(&shown);
                     }
                 },
-                |ui, app| activity(ui, app, fill),
+                |ui, (app, _)| activity(ui, app, filter, fill),
             );
         });
     }
 
     fn watchlist(&mut self, ui: &mut Ui, app: &mut App, cmd_tx: &CommandSender, fill: bool) {
-        let network = network(app);
+        let network = app.network_name();
+        let Some(list) = current(&app.watch.lists, self.selected).cloned() else {
+            return;
+        };
         // Add or look up an address, or find a labelled one.
         let mut submitted = false;
         let mut field: Option<egui::Response> = None;
@@ -91,27 +136,22 @@ impl MonitoringTab {
             let is_address = looks_like_address(&self.input);
             let validity = is_address.then(|| validate_address(&self.input, &network));
             let valid = matches!(validity, Some(Ok(())));
-            let watched = valid
-                && app
-                    .watch
-                    .list
-                    .entries
-                    .iter()
-                    .any(|e| e.address == self.input.trim() && e.network == network);
+            let watched = valid && list.entry(self.input.trim(), &network).is_some();
+            let already = format!("Already on {}", list.name);
             // Enter adds (as the hint under the table says), or shows an address that is
             // already watched.
             if ui
                 .add_enabled(valid && !watched, primary_button("Watch"))
-                .on_hover_text("Add to the watchlist (Enter)")
+                .on_hover_text(format!("Add to {} (Enter)", list.name))
                 .on_disabled_hover_text(match validity {
                     Some(Err(ref why)) => why.as_str(),
-                    _ if watched => "Already on the watchlist",
+                    _ if watched => already.as_str(),
                     _ => "Paste a Kaspa address",
                 })
                 .clicked()
                 || (submitted && valid && !watched)
             {
-                self.add(ui.ctx(), app, cmd_tx, &network);
+                self.add(ui.ctx(), &list, cmd_tx, &network);
             }
             if ui
                 .add_enabled(valid, egui::Button::new("Info"))
@@ -127,17 +167,6 @@ impl MonitoringTab {
                 self.notice = Some((why, true, ui.input(|i| i.time)));
             }
         });
-        if let Some((text, is_error, since)) = self.notice.clone() {
-            let now = ui.input(|i| i.time);
-            if now - since > NOTICE_SECS {
-                self.notice = None;
-            } else {
-                let color = if is_error { theme::ERROR } else { theme::OK };
-                ui.label(RichText::new(text).color(color));
-                ui.ctx()
-                    .request_repaint_after(std::time::Duration::from_secs_f64(NOTICE_SECS));
-            }
-        }
         // Label matches, when the field isn't an address; Enter takes the first.
         if let Some(field) = field
             && !looks_like_address(&self.input)
@@ -155,14 +184,7 @@ impl MonitoringTab {
         }
         ui.add_space(4.0);
 
-        let entries: Vec<WatchEntry> = app
-            .watch
-            .list
-            .entries
-            .iter()
-            .filter(|e| e.network == network)
-            .cloned()
-            .collect();
+        let entries: Vec<&WatchEntry> = list.on_network(&network).collect();
         let now = x4kas_core::format::now_ms();
         // Half the width fits the essentials; pending and the alert rules are in
         // the info pane.
@@ -176,7 +198,7 @@ impl MonitoringTab {
                     .iter()
                     .find(|ev| ev.address == e.address)
                     .map(|ev| ev.time_ms)
-                    .or(e.last_activity_ms)
+                    .max(app.watch.lists.last_activity(&e.address, &network))
                     .map(ago);
                 // Net of the events seen in the last 24h (since this session started).
                 let day: i128 = app
@@ -205,53 +227,195 @@ impl MonitoringTab {
             "watchlist",
             ["Address", "Balance (KAS)", "24h change", "Last activity"],
             rows,
-            "No watched addresses yet. Paste one above and press Watch.",
+            "No addresses on this list yet. Paste one above and press Watch.",
             address,
             Some(request_address),
             |_, _| {},
             height,
         );
         ui.add_space(2.0);
-        ui.label(
-            RichText::new("Click an address for its info, history and alert settings.")
-                .weak()
-                .small(),
-        );
+        // The notice (added, already on the list, invalid) takes the hint's line for a
+        // few seconds, so nothing above it moves.
+        let now = ui.input(|i| i.time);
+        if self
+            .notice
+            .as_ref()
+            .is_some_and(|(_, _, since)| now - since > NOTICE_SECS)
+        {
+            self.notice = None;
+        }
+        match &self.notice {
+            Some((text, is_error, _)) => {
+                let color = if *is_error { theme::ERROR } else { theme::OK };
+                ui.label(RichText::new(text).color(color).small());
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_secs_f64(NOTICE_SECS));
+            }
+            None => {
+                ui.label(
+                    RichText::new("Click an address for its info, history and alert settings.")
+                        .weak()
+                        .small(),
+                );
+            }
+        }
     }
 
-    fn add(&mut self, ctx: &egui::Context, app: &mut App, cmd_tx: &CommandSender, network: &str) {
+    fn add(
+        &mut self,
+        ctx: &egui::Context,
+        list: &Watchlist,
+        cmd_tx: &CommandSender,
+        network: &str,
+    ) {
         let addr = self.input.trim();
         if addr.is_empty() {
             return;
         }
         let now = ctx.input(|i| i.time);
-        let mut list = app.watch.list.clone();
-        if list
-            .entries
-            .iter()
-            .any(|e| e.address == addr && e.network == network)
-        {
-            self.notice = Some(("Already on the watchlist".to_string(), false, now));
+        if list.entry(addr, network).is_some() {
+            self.notice = Some((format!("Already on {}", list.name), false, now));
         } else {
-            list.entries.push(WatchEntry::new(addr, network));
-            let _ = cmd_tx.send(UiCommand::WatchSet(list));
+            let _ = cmd_tx.send(UiCommand::WatchEdit(WatchEdit::Put {
+                list: list.id,
+                entry: WatchEntry::new(addr, network),
+            }));
             self.notice = Some((
-                format!("Added {} to the watchlist", shorten_middle(addr, 20)),
+                format!("Added {} to {}", shorten_middle(addr, 20), list.name),
                 false,
                 now,
             ));
         }
         self.input.clear();
     }
+
+    /// The list menu in the Watchlist card's header: the list on show (a click picks
+    /// another), then New, Rename and Delete; the delete asks once more in place.
+    fn list_menu(&mut self, ui: &mut Ui, app: &App, cmd_tx: &CommandSender) {
+        let lists = &app.watch.lists;
+        let Some(shown) = current(lists, self.selected) else {
+            return;
+        };
+        let network = app.network_name();
+        let count = |l: &Watchlist| l.on_network(&network).count();
+        let now = ui.input(|i| i.time);
+        if self
+            .confirm_delete
+            .is_some_and(|(_, at)| now - at >= CONFIRM_SECS)
+        {
+            self.confirm_delete = None;
+        }
+        let button = Button::new(format!("{} ▾", shown.name)).small();
+        let config = MenuConfig::new().close_behavior(PopupCloseBehavior::CloseOnClickOutside);
+        let (response, _) = MenuButton::from_button(button).config(config).ui(ui, |ui| {
+            for list in &lists.lists {
+                let n = count(list);
+                let label = ui.selectable_label(list.id == shown.id, &list.name);
+                let label = label.on_hover_text(match n {
+                    1 => "1 address".to_string(),
+                    _ => format!("{n} addresses"),
+                });
+                if label.clicked() {
+                    self.selected = Some(list.id);
+                    ui.close();
+                }
+            }
+            ui.separator();
+            if ui.button("New list…").clicked() {
+                dialogs::request_list_name(ui.ctx(), None);
+                ui.close();
+            }
+            if ui.button(format!("Rename {}…", shown.name)).clicked() {
+                dialogs::request_list_name(ui.ctx(), Some(shown.id));
+                ui.close();
+            }
+            ui.separator();
+            let last = lists.lists.len() == 1;
+            let armed = self
+                .confirm_delete
+                .is_some_and(|(id, at)| id == shown.id && now - at < CONFIRM_SECS);
+            // An empty list has nothing to lose: it goes on the first click.
+            let empty = shown.entries.is_empty();
+            if armed || (empty && !last) {
+                let n = shown.entries.len();
+                let text = if empty {
+                    format!("Delete {}", shown.name)
+                } else {
+                    format!(
+                        "Delete {} and its {n} address{}",
+                        shown.name,
+                        if n == 1 { "" } else { "es" }
+                    )
+                };
+                if ui
+                    .add(
+                        Button::new(RichText::new(text).color(theme::ERROR))
+                            .wrap_mode(egui::TextWrapMode::Extend),
+                    )
+                    .on_hover_text("Their alert rules go too; their events stay listed")
+                    .clicked()
+                {
+                    let _ =
+                        cmd_tx.send(UiCommand::WatchEdit(WatchEdit::DeleteList { id: shown.id }));
+                    self.confirm_delete = None;
+                    self.selected = None;
+                    ui.close();
+                }
+            } else if ui
+                .add_enabled(!last, Button::new(format!("Delete {}…", shown.name)))
+                .on_hover_text("Asks once more")
+                .on_disabled_hover_text("The last watchlist stays: there is always one to add to")
+                .clicked()
+            {
+                self.confirm_delete = Some((shown.id, now));
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_secs_f64(CONFIRM_SECS));
+            }
+        });
+        response.on_hover_text("The watchlist on show, which Watch adds to");
+    }
 }
 
-/// The connected network, or the saved one before connecting.
-pub fn network(app: &App) -> String {
-    app.node
-        .server_info
-        .as_ref()
-        .map(|s| s.network_id.clone())
-        .unwrap_or_else(|| "mainnet".to_string())
+/// The Activity card's filter: every list's events, or one list's.
+fn filter_menu(ui: &mut Ui, app: &App, chosen: &mut Option<ListId>) {
+    let lists = &app.watch.lists;
+    if lists.lists.len() < 2 && chosen.is_none() {
+        return;
+    }
+    let text = chosen
+        .and_then(|id| lists.get(id))
+        .map_or("All lists".to_string(), |l| l.name.clone());
+    // Drawn as the list menu in the Watchlists header is, so the two headers match.
+    let button = Button::new(format!("{text} ▾")).small();
+    let (response, _) = MenuButton::from_button(button).ui(ui, |ui| {
+        if ui.selectable_label(chosen.is_none(), "All lists").clicked() {
+            *chosen = None;
+            ui.close();
+        }
+        for list in &lists.lists {
+            if ui
+                .selectable_label(*chosen == Some(list.id), &list.name)
+                .clicked()
+            {
+                *chosen = Some(list.id);
+                ui.close();
+            }
+        }
+    });
+    response.on_hover_text("Show the events of the addresses on one watchlist");
+}
+
+/// Whether an event is one Activity shows with `filter`: an address on the list now.
+fn shown_by(app: &App, filter: Option<ListId>) -> impl Fn(&AddressEvent) -> bool + 'static {
+    let network = app.network_name();
+    let on_list: Option<std::collections::HashSet<String>> = filter.map(|id| {
+        app.watch
+            .lists
+            .get(id)
+            .map(|l| l.on_network(&network).map(|e| e.address.clone()).collect())
+            .unwrap_or_default()
+    });
+    move |e| on_list.as_ref().is_none_or(|set| set.contains(&e.address))
 }
 
 /// Whether `s` is shaped like an address rather than a label search; whether it is one
@@ -327,12 +491,19 @@ fn watch_status(ui: &mut Ui, app: &App) {
 /// Confirmed balance changes, newest first. An event that tripped the address's alert
 /// rules leads with a dot: filled while unread, a ring once marked read (a click
 /// toggles it; the rules it tripped are in its hover).
-fn activity(ui: &mut Ui, app: &mut App, fill: bool) {
-    let rows = app
+fn activity(ui: &mut Ui, app: &mut App, filter: Option<ListId>, fill: bool) {
+    let shown = shown_by(app, filter);
+    // The events on show with their index in `app.watch.events`, for the read marks.
+    let events: Vec<(usize, &AddressEvent)> = app
         .watch
         .events
         .iter()
-        .map(|e| {
+        .enumerate()
+        .filter(|(_, e)| shown(e))
+        .collect();
+    let rows = events
+        .iter()
+        .map(|(_, e)| {
             let sign = match e.kind {
                 EventKind::Received => "+",
                 EventKind::Sent => "-",
@@ -350,11 +521,9 @@ fn activity(ui: &mut Ui, app: &mut App, fill: bool) {
         })
         .collect();
     // Per row: `None` without an alert, else whether it is read and the hover text.
-    let dots: Vec<Option<(bool, String)>> = app
-        .watch
-        .events
+    let dots: Vec<Option<(bool, String)>> = events
         .iter()
-        .map(|e| {
+        .map(|(_, e)| {
             (!e.alerts.is_empty()).then(|| {
                 let mut text = e.alerts.join("\n");
                 text.push_str(if e.read {
@@ -366,6 +535,7 @@ fn activity(ui: &mut Ui, app: &mut App, fill: bool) {
             })
         })
         .collect();
+    let indices: Vec<usize> = events.iter().map(|(i, _)| *i).collect();
     let mut toggled = Vec::new();
     let height = table_height(ui, fill);
     wide_table_with_lead(
@@ -373,12 +543,16 @@ fn activity(ui: &mut Ui, app: &mut App, fill: bool) {
         "activity",
         ["Address", "Amount (KAS)", "", "When"],
         rows,
-        "No confirmed activity yet",
+        if filter.is_some() {
+            "No confirmed activity on this list yet"
+        } else {
+            "No confirmed activity yet"
+        },
         address,
         Some(request_address),
         |ui, index| {
             if alert_dot(ui, dots[index].as_ref()) {
-                toggled.push(index);
+                toggled.push(indices[index]);
             }
         },
         height,

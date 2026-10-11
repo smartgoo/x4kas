@@ -527,6 +527,8 @@ pub fn wide_table_with_lead<const N: usize>(
         let first = (ui.available_width() - rest).max(0.0);
         let ctx = ui.ctx().clone();
         let layer = ui.layer_id();
+        // The empty message runs across the whole row, not just the first column.
+        let row_right = ui.available_rect_before_wrap().right();
         let bounce_id = ui.id().with("overscroll");
         overscroll_unwind(ui, bounce_id);
         let mut table = TableBuilder::new(ui)
@@ -554,7 +556,18 @@ pub fn wide_table_with_lead<const N: usize>(
         let output = table.body(|mut body| {
             if rows.is_empty() {
                 body.row(row_height, |mut row| {
-                    row.col(|ui| placeholder(ui, empty));
+                    row.col(|ui| {
+                        let cell = ui.max_rect();
+                        let mut clip = ui.clip_rect();
+                        clip.max.x = row_right;
+                        ui.painter().with_clip_rect(clip).text(
+                            cell.left_center(),
+                            egui::Align2::LEFT_CENTER,
+                            empty,
+                            egui::TextStyle::Body.resolve(ui.style()),
+                            ui.visuals().weak_text_color(),
+                        );
+                    });
                     for _ in 1..N {
                         row.col(|_| {});
                     }

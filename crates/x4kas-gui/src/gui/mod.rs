@@ -159,6 +159,11 @@ struct Prefs {
     /// The Query tab's saved queries pane is open.
     #[serde(default = "yes")]
     query_sidebar_open: bool,
+    /// The watchlist the Monitoring tab shows, and the one its Activity filter picks.
+    #[serde(default)]
+    watchlist: Option<x4kas_core::watch::ListId>,
+    #[serde(default)]
+    activity_list: Option<x4kas_core::watch::ListId>,
 }
 
 fn yes() -> bool {
@@ -202,6 +207,7 @@ impl GuiApp {
         let mut explorer = ExplorerUi::default();
         let mut flow_window = FlowWindowUi::default();
         let mut query = QueryTab::default();
+        let mut monitoring = MonitoringTab::default();
         if let Some(prefs) = storage.and_then(|s| eframe::get_value::<Prefs>(s, PREFS_KEY)) {
             let mut state = app.blocking_write();
             state.active_tab = prefs.active_tab;
@@ -213,6 +219,8 @@ impl GuiApp {
             explorer.recents_open = prefs.recents_open;
             flow_window.show_amounts = prefs.flow_amounts;
             query.sidebar_open = prefs.query_sidebar_open;
+            monitoring.selected = prefs.watchlist;
+            monitoring.activity_filter = prefs.activity_list;
         }
         Self {
             app,
@@ -224,7 +232,7 @@ impl GuiApp {
             show_help: false,
             connection,
             terminal: TerminalPane::new(),
-            monitoring: MonitoringTab::default(),
+            monitoring,
             explorer,
             settings: SettingsPage::default(),
             pane: InfoPane::default(),
@@ -329,6 +337,8 @@ impl eframe::App for GuiApp {
             recents_open: self.explorer.recents_open,
             flow_amounts: self.flow_window.show_amounts,
             query_sidebar_open: self.query.sidebar_open,
+            watchlist: self.monitoring.selected,
+            activity_list: self.monitoring.activity_filter,
         };
         eframe::set_value(storage, PREFS_KEY, &prefs);
     }
@@ -458,7 +468,8 @@ impl eframe::App for GuiApp {
             .show(ctx, &mut app, &self.cmd_tx, esc == Some(EscTarget::Sankey));
         // The label and watchlist dialogs, asked for by the action bar; above the flow
         // window, which can be open underneath.
-        self.dialogs.take_requests(ctx, &app);
+        let target = self.monitoring.target_list(&app);
+        self.dialogs.take_requests(ctx, &app, target);
         self.dialogs
             .show(ctx, &app, &self.cmd_tx, esc == Some(EscTarget::Dialog));
         // Watchlist alerts pop up over any tab.

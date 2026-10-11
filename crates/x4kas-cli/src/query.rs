@@ -28,7 +28,7 @@ use x4kas_core::query::fields::{self, Cost, FieldKind};
 use x4kas_core::query::saved::{QueryWatch, SavedQueries, SavedQuery, presets};
 use x4kas_core::query::watch::POLL;
 use x4kas_core::query::{Entity, Query, QueryError, TimeRange, text};
-use x4kas_core::watch::Watchlist;
+use x4kas_core::watch::Watchlists;
 
 use crate::index::{progress_line, start_pipeline, stop_pipeline};
 
@@ -244,7 +244,7 @@ fn run_offline(network: &str, cmd: QueryCommand) -> Result<()> {
                 );
             }
             let labels = LabelBook::load();
-            let watchlist = Watchlist::load().unwrap_or_default();
+            let watchlist = Watchlists::load().unwrap_or_default();
             let inputs = Inputs {
                 store: &store,
                 labels: &labels,

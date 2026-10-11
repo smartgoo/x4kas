@@ -19,7 +19,7 @@ Two binaries are provided to support different modes of interaction:
 - **Explorer**: tabbed block, transaction, address and protocol pages, plus an info pane that opens from any link
 - **Address index**: local index of the chain with balances, history, counterparties, ownership clustering and peel chains
 - **Queries**: query builder and text language over transactions, blocks, payouts and addresses, with saved queries and alerts
-- **Watchlist**: real-time address monitoring with alert rules
+- **Watchlists**: named lists of addresses monitored in real time, with alert rules per list
 - **RPC console**: 36 read-only node RPC methods with a JSON viewer
 - **Export**: CSV/JSON for transactions, flows, blocks and query results
 - **CLI**: `x4kas-cli` for headless RPC, indexing, queries, address lookups and watching
@@ -93,8 +93,14 @@ x4kas-cli query run "tx last 1d where fee > 1 KAS order by fee desc limit 20"
 x4kas-cli query fields tx
 x4kas-cli query save big-fees "tx last 1h where fee > 1 KAS" --watch
 
-# Live address watching (JSON lines)
+# Watchlists
+x4kas-cli watchlist create Exchanges
+x4kas-cli watchlist add Exchanges kaspa:qq...
+x4kas-cli watchlist ls
+
+# Live address watching (JSON lines): addresses, one list, or every list
 x4kas-cli watch kaspa:qq...
+x4kas-cli watch --list Exchanges
 
 # Labels
 x4kas-cli labels set kaspa:qq... "My wallet"

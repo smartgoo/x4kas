@@ -531,8 +531,6 @@ impl FlowWindowUi {
             return;
         };
         let labelled = app.labels.user_labels().contains_key(&addr);
-        let watched = app.watch.entry(&addr).is_some();
-        let mut unwatch = false;
         let shown = egui::Popup::menu(canvas)
             .id(ui.id().with("flow_node_menu"))
             .open_memory(open)
@@ -553,39 +551,10 @@ impl FlowWindowUi {
                     ui.close();
                 }
                 ui.separator();
-                if watched {
-                    if ui
-                        .button("Edit watchlist settings")
-                        .on_hover_text("Alerts on or off, and the rules that raise them")
-                        .clicked()
-                    {
-                        dialogs::request_watch(ui.ctx(), &addr);
-                        ui.close();
-                    }
-                    if ui
-                        .button("Remove from watchlist")
-                        .on_hover_text("Stop following this address; its events stay listed")
-                        .clicked()
-                    {
-                        unwatch = true;
-                        ui.close();
-                    }
-                } else if ui
-                    .button("Add to watchlist")
-                    .on_hover_text("Follow its balance and get alerts on activity")
-                    .clicked()
-                {
-                    dialogs::request_watch(ui.ctx(), &addr);
-                    ui.close();
-                }
+                super::actions::watch_items(ui, app, &addr, cmd_tx);
             });
         if shown.is_none() {
             self.menu_node = None;
-        }
-        if unwatch {
-            let mut list = app.watch.list.clone();
-            list.entries.retain(|e| e.address != addr);
-            let _ = cmd_tx.send(UiCommand::WatchSet(list));
         }
     }
 

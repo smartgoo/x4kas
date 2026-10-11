@@ -7,6 +7,7 @@ mod labels;
 mod query;
 mod rpc;
 mod watch;
+mod watchlist;
 
 use std::time::Duration;
 
@@ -19,6 +20,7 @@ use crate::labels::LabelsCommand;
 use crate::query::QueryCommand;
 use crate::rpc::RpcCall;
 use crate::watch::WatchArgs;
+use crate::watchlist::WatchlistCommand;
 
 #[derive(Parser, Debug, Clone)]
 #[command(
@@ -62,6 +64,11 @@ pub enum Command {
     },
     /// Follow addresses live: one JSON line per balance change and alert, until Ctrl+C
     Watch(WatchArgs),
+    /// The named watchlists: list, create, rename, delete, add, remove and move addresses
+    Watchlist {
+        #[command(subcommand)]
+        cmd: WatchlistCommand,
+    },
     /// Address labels: yours and the public api.kaspa.org list
     Labels {
         #[command(subcommand)]
@@ -85,6 +92,7 @@ async fn main() -> Result<()> {
         Command::Address { cmd } => address::run(&args.network, cmd),
         Command::Index { cmd } => index::run(url, &args.network, cmd).await,
         Command::Watch(watch_args) => watch::run(url, &args.network, watch_args).await,
+        Command::Watchlist { cmd } => watchlist::run(&args.network, cmd),
         Command::Labels { cmd } => labels::run(cmd).await,
         Command::Query { cmd } => query::run(url, &args.network, cmd).await,
     }
@@ -100,6 +108,38 @@ mod tests {
         assert_eq!(args.url, None);
         assert_eq!(args.network, "mainnet");
         assert_eq!(args.timeout, 20);
+    }
+
+    #[test]
+    fn watch_and_watchlist_args() {
+        let args = Args::parse_from(["x4kas-cli", "watch", "--list", "A", "--list", "B"]);
+        let Command::Watch(watch) = args.command else {
+            panic!("not watch");
+        };
+        assert_eq!(watch.lists, vec!["A", "B"]);
+        assert!(watch.addresses.is_empty());
+        let args = Args::parse_from([
+            "x4kas-cli",
+            "watchlist",
+            "add",
+            "Cold",
+            "kaspa:a",
+            "kaspa:b",
+        ]);
+        assert!(matches!(
+            args.command,
+            Command::Watchlist {
+                cmd: WatchlistCommand::Add { ref list, ref addresses }
+            } if list == "Cold" && addresses.len() == 2
+        ));
+        assert!(Args::try_parse_from(["x4kas-cli", "watchlist", "add", "Cold"]).is_err());
+        let args = Args::parse_from(["x4kas-cli", "watchlist", "move", "kaspa:a", "A", "B"]);
+        assert!(matches!(
+            args.command,
+            Command::Watchlist {
+                cmd: WatchlistCommand::Move { .. }
+            }
+        ));
     }
 
     #[test]

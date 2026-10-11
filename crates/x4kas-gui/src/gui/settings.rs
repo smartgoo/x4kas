@@ -7,7 +7,6 @@
 use eframe::egui::{self, RichText, TextEdit, Ui};
 use egui_extras::{Column, TableBuilder};
 
-use super::monitoring::network;
 use super::theme;
 use super::widgets::{
     CARD_GAP, address_bare, card, card_with_header, edit_label_cell, kv_grid, kv_with, label_cell,
@@ -185,7 +184,7 @@ impl SettingsPage {
             let problem = if self.new_address.trim().is_empty() {
                 Some("Paste an address".to_string())
             } else {
-                match validate_address(&self.new_address, &network(app)) {
+                match validate_address(&self.new_address, &app.network_name()) {
                     Ok(()) if self.new_name.trim().is_empty() => Some("Enter a label".to_string()),
                     Ok(()) => None,
                     Err(why) => Some(why),

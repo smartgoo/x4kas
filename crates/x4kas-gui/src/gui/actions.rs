@@ -23,6 +23,7 @@ use x4kas_core::format::{
 use x4kas_core::index::export::ExportFormat;
 use x4kas_core::index::parse_hex;
 use x4kas_core::query::Query;
+use x4kas_core::watch::{ListId, WatchEdit};
 
 /// Draw the bar for `page`, if it is a page with actions (an address, a block or a
 /// transaction), with a rule under it and the gap to the first card.
@@ -166,6 +167,74 @@ pub fn bar(ui: &mut Ui, app: &mut App, page: &ExplorerPage, cmd_tx: &CommandSend
     ui.add_space(CARD_GAP);
 }
 
+/// The watchlist items of an address's menus (the action bar's Watchlist menu, the flow
+/// graph's node menu), so they never differ: per list it is on, its settings and its
+/// removal, then adding it to a list it isn't on. Worded without the list's name while
+/// there is only one.
+pub(super) fn watch_items(ui: &mut Ui, app: &App, addr: &str, cmd_tx: &CommandSender) {
+    let network = app.network_name();
+    let lists = &app.watch.lists;
+    let memberships = lists.memberships(addr, &network);
+    let single = lists.lists.len() == 1;
+    let edit = |ui: &mut Ui, list: ListId, text: &str| {
+        if ui
+            .button(text)
+            .on_hover_text("Alerts on or off, the rules that raise them, or another list")
+            .clicked()
+        {
+            dialogs::request_watch(ui.ctx(), addr, Some(list));
+            ui.close();
+        }
+    };
+    let remove = |ui: &mut Ui, list: ListId, text: &str| {
+        if ui
+            .button(text)
+            .on_hover_text("Stop following it on this list; its rules there go too")
+            .clicked()
+        {
+            let _ = cmd_tx.send(UiCommand::WatchEdit(WatchEdit::Remove {
+                list,
+                address: addr.to_string(),
+                network: network.clone(),
+            }));
+            ui.close();
+        }
+    };
+    if single {
+        for (list, _) in &memberships {
+            edit(ui, list.id, "Edit watch settings…");
+            remove(ui, list.id, "Remove from watchlist");
+        }
+    } else {
+        // A submenu per list it is on: the items stay two per list however many lists
+        // there are, and removing takes a deliberate step into the list's own menu.
+        for (list, _) in &memberships {
+            ui.menu_button(&list.name, |ui| {
+                edit(ui, list.id, "Edit settings…");
+                remove(ui, list.id, &format!("Remove from {}", list.name));
+            });
+        }
+        if memberships.len() < lists.lists.len() {
+            ui.separator();
+        }
+    }
+    if memberships.len() < lists.lists.len() {
+        let text = if memberships.is_empty() {
+            "Add to watchlist…"
+        } else {
+            "Add to another list…"
+        };
+        if ui
+            .button(text)
+            .on_hover_text("Follow its balance and get alerts on activity")
+            .clicked()
+        {
+            dialogs::request_watch(ui.ctx(), addr, None);
+            ui.close();
+        }
+    }
+}
+
 /// The address's own actions: the Add menu (a label; the watchlist while it isn't on
 /// it), the Watchlist menu once it is (its settings, removal) and export.
 fn address_actions(ui: &mut Ui, app: &mut App, addr: &str, cmd_tx: &CommandSender) {
@@ -173,7 +242,15 @@ fn address_actions(ui: &mut Ui, app: &mut App, addr: &str, cmd_tx: &CommandSende
     // (once watched, the Watchlist menu takes over). The items say add or edit by what
     // it has; the button says "Add…" until everything in it is an edit.
     let labelled = app.labels.user_labels().contains_key(addr);
-    let watched = app.watch.entry(addr).is_some();
+    let network = app.network_name();
+    let on: Vec<String> = app
+        .watch
+        .lists
+        .memberships(addr, &network)
+        .iter()
+        .map(|(list, _)| list.name.clone())
+        .collect();
+    let watched = !on.is_empty();
     let menu = if labelled && watched {
         "Edit ▾"
     } else {
@@ -191,11 +268,11 @@ fn address_actions(ui: &mut Ui, app: &mut App, addr: &str, cmd_tx: &CommandSende
         }
         if !watched
             && ui
-                .button("Add to watchlist")
+                .button("Add to watchlist…")
                 .on_hover_text("Follow its balance and get alerts on activity")
                 .clicked()
         {
-            dialogs::request_watch(ui.ctx(), addr);
+            dialogs::request_watch(ui.ctx(), addr, None);
             ui.close();
         }
     });
@@ -206,31 +283,9 @@ fn address_actions(ui: &mut Ui, app: &mut App, addr: &str, cmd_tx: &CommandSende
     });
     if watched {
         ui.separator();
-        let mut remove = false;
-        let (response, _) = MenuButton::from_button(action_button("Watchlist ▾")).ui(ui, |ui| {
-            if ui
-                .button("Edit settings")
-                .on_hover_text("Alerts on or off, and the rules that raise them")
-                .clicked()
-            {
-                dialogs::request_watch(ui.ctx(), addr);
-                ui.close();
-            }
-            if ui
-                .button("Remove")
-                .on_hover_text("Stop following this address; its events stay listed")
-                .clicked()
-            {
-                remove = true;
-                ui.close();
-            }
-        });
-        response.on_hover_text("This address is on the watchlist");
-        if remove {
-            let mut list = app.watch.list.clone();
-            list.entries.retain(|e| e.address != addr);
-            let _ = cmd_tx.send(UiCommand::WatchSet(list));
-        }
+        let (response, _) = MenuButton::from_button(action_button("Watchlist ▾"))
+            .ui(ui, |ui| watch_items(ui, app, addr, cmd_tx));
+        response.on_hover_text(format!("On {}", on.join(", ")));
     }
     ui.separator();
     // Export needs the page: its transactions come from the index, so there is

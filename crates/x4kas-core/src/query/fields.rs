@@ -54,6 +54,7 @@ pub enum FieldId {
     TxSelfTransfer,
     TxDistinctAddresses,
     TxIsWatched,
+    TxWatchlist,
     // --- Blocks ---
     BlockHash,
     BlockTime,
@@ -107,6 +108,7 @@ pub enum FieldId {
     AddrClusterLabel,
     AddrPeerCount,
     AddrIsWatched,
+    AddrWatchlist,
     AddrBalance,
 }
 
@@ -577,7 +579,18 @@ pub static CATALOG: &[FieldSpec] = &[
         Bool,
         Lookup,
         "Parties",
-        "Any address touched is on the watchlist."
+        "Any address touched is on a watchlist."
+    ),
+    field!(
+        TxWatchlist,
+        "watchlist",
+        "Watchlist",
+        Transactions,
+        Text,
+        Lookup,
+        "Parties",
+        "The watchlists any address touched is on.",
+        multi
     ),
     // --- Transactions: scripts ---
     field!(
@@ -1241,7 +1254,18 @@ pub static CATALOG: &[FieldSpec] = &[
         Bool,
         Lookup,
         "Owner",
-        "On the watchlist."
+        "On a watchlist."
+    ),
+    field!(
+        AddrWatchlist,
+        "watchlist",
+        "Watchlist",
+        Addresses,
+        Text,
+        Lookup,
+        "Owner",
+        "The watchlists the address is on.",
+        multi
     ),
     field!(
         AddrBalance,
